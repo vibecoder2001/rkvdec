@@ -13,6 +13,7 @@
 
 /* Provided by device.c */
 extern void RkMppGetPublic(_In_ WDFDEVICE Device, _Out_ RKMPP_DEVICE_PUBLIC *Out);
+extern void RkMppGetFaultState(_In_ WDFDEVICE Device, _Out_ RKMPP_FAULT_STATE *Out);
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RkMppEvtIoDeviceControl;
 
@@ -151,6 +152,37 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         status = RkMppJobWait(WdfIoQueueGetDevice(Queue),
                               in->JobId, in->TimeoutMs, out);
         if (NT_SUCCESS(status)) info = sizeof(*out);
+        break;
+    }
+
+    /* ---- INJECT_IOMMU_FAULT ----------------------------------------- */
+    case IOCTL_RKMPP_INJECT_IOMMU_FAULT: {
+        if (OutputBufferLength < sizeof(RKMPP_FAULT_RESULT)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        RKMPP_FAULT_RESULT *out;
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
+                                                (PVOID*)&out, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        /* Phase 3a scaffolding: the actual fault injection (writing a bad iova
+         * to a codec register and asserting the kick bit) requires the real
+         * hardware-kick path that lands in Phase 3b.  Until then, this IOCTL
+         * just reports whatever fault state has been recorded by the registered
+         * callback (typically nothing, unless something else triggered an
+         * IOMMU fault — which is itself a useful diagnostic).
+         *
+         * TODO (Phase 3b): submit a job that programs RKVDEC_DMA_SRC with
+         * iova=0xDEADB000 and asserts the start bit, then poll the
+         * FaultTriggered flag for up to 100ms. */
+        RKMPP_FAULT_STATE fs;
+        RkMppGetFaultState(device, &fs);
+        out->Triggered = (UINT32)fs.Triggered;
+        out->StatusReg = (UINT32)fs.StatusReg;
+        out->FaultIova = (UINT64)fs.FaultIova;
+        info   = sizeof(*out);
+        status = STATUS_SUCCESS;
         break;
     }
 

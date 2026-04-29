@@ -88,73 +88,91 @@ int wmain()
         return rc;
     }
 
-    /* 1. ALLOC scratch (4 KiB). */
-    RKMPP_ALLOC_BUFFER_IN  ain{};
-    RKMPP_ALLOC_BUFFER_OUT aout{};
-    ain.StructSize = sizeof(ain);
-    ain.Size       = 4096;
-    ain.Usage      = RkMppBufferUsageScratch;
-    DWORD got = 0;
-    if (!DeviceIoControl(h, IOCTL_RKMPP_ALLOC_BUFFER, &ain, sizeof(ain),
-                         &aout, sizeof(aout), &got, nullptr))
+    /* Phase 3a-debug: REVISION read is intentionally skipped in the driver
+     * because reading codec MMIO during PrepareHardware was SErroring on
+     * this firmware.  Just print whatever caps reports. */
     {
-        std::fprintf(stderr, "ALLOC failed: %lu\n", GetLastError());
-        CloseHandle(h);
-        return 3;
+        RKMPP_CAPS caps{};
+        DWORD got = 0;
+        if (DeviceIoControl(h, IOCTL_RKMPP_GET_CAPS, nullptr, 0,
+                            &caps, sizeof(caps), &got, nullptr))
+        {
+            std::printf("caps: HID=RKCP%04x UID=%u rev=0x%08x codecs=0x%08x\n",
+                        caps.Hid, caps.Uid, caps.RevisionWord, caps.SupportedCodecs);
+        }
     }
-    std::printf("allocated scratch handle=0x%llx iova=0x%llx userVa=%p\n",
-                (unsigned long long)aout.BufferHandle,
-                (unsigned long long)aout.Iova, aout.UserVa);
 
-    /* 2. Write magic pattern. */
+    /* Phase 3a: 100-iteration alloc/submit/wait/reread/free loop. Each
+     * iteration exercises the buffer pool, IOMMU MapMdl (with real paging
+     * enabled now), the job queue, and software-completion DPC.  Phase 3b
+     * replaces software completion with hardware kick. */
+    constexpr int kIterations = 100;
     constexpr uint32_t kPattern = 0xC0DECAFEu;
-    *static_cast<volatile uint32_t*>(aout.UserVa) = kPattern;
+    DWORD got = 0;
 
-    /* 3. SUBMIT no-op job. */
-    RKMPP_SUBMIT_JOB_IN  sin{};
-    RKMPP_SUBMIT_JOB_OUT sout{};
-    BuildNoopJob(aout.BufferHandle, &sin);
-    if (!DeviceIoControl(h, IOCTL_RKMPP_SUBMIT_JOB, &sin, sizeof(sin),
-                         &sout, sizeof(sout), &got, nullptr))
-    {
-        std::fprintf(stderr, "SUBMIT failed: %lu\n", GetLastError());
-        CloseHandle(h);
-        return 4;
+    for (int iter = 0; iter < kIterations; iter++) {
+        RKMPP_ALLOC_BUFFER_IN  ain{};
+        RKMPP_ALLOC_BUFFER_OUT aout{};
+        ain.StructSize = sizeof(ain);
+        ain.Size       = 4096;
+        ain.Usage      = RkMppBufferUsageScratch;
+        if (!DeviceIoControl(h, IOCTL_RKMPP_ALLOC_BUFFER, &ain, sizeof(ain),
+                             &aout, sizeof(aout), &got, nullptr))
+        {
+            std::fprintf(stderr, "iter %d: ALLOC failed: %lu\n",
+                         iter, GetLastError());
+            CloseHandle(h);
+            return 3;
+        }
+
+        *static_cast<volatile uint32_t*>(aout.UserVa) = kPattern ^ (uint32_t)iter;
+
+        RKMPP_SUBMIT_JOB_IN  sin{};
+        RKMPP_SUBMIT_JOB_OUT sout{};
+        BuildNoopJob(aout.BufferHandle, &sin);
+        if (!DeviceIoControl(h, IOCTL_RKMPP_SUBMIT_JOB, &sin, sizeof(sin),
+                             &sout, sizeof(sout), &got, nullptr))
+        {
+            std::fprintf(stderr, "iter %d: SUBMIT failed: %lu\n",
+                         iter, GetLastError());
+            CloseHandle(h);
+            return 4;
+        }
+
+        RKMPP_WAIT_JOB_IN  win{};
+        RKMPP_WAIT_JOB_OUT wout{};
+        win.JobId = sout.JobId;
+        win.TimeoutMs = 1000;
+        if (!DeviceIoControl(h, IOCTL_RKMPP_WAIT_JOB, &win, sizeof(win),
+                             &wout, sizeof(wout), &got, nullptr))
+        {
+            std::fprintf(stderr, "iter %d: WAIT failed: %lu\n",
+                         iter, GetLastError());
+            CloseHandle(h);
+            return 5;
+        }
+
+        uint32_t reread = *static_cast<volatile uint32_t*>(aout.UserVa);
+        if (reread != (kPattern ^ (uint32_t)iter)) {
+            std::fprintf(stderr, "iter %d: pattern corrupted: 0x%08x\n",
+                         iter, reread);
+            CloseHandle(h);
+            return 6;
+        }
+
+        RKMPP_FREE_BUFFER_IN fin{};
+        fin.BufferHandle = aout.BufferHandle;
+        if (!DeviceIoControl(h, IOCTL_RKMPP_FREE_BUFFER, &fin, sizeof(fin),
+                             nullptr, 0, &got, nullptr))
+        {
+            std::fprintf(stderr, "iter %d: FREE failed: %lu\n",
+                         iter, GetLastError());
+            CloseHandle(h);
+            return 8;
+        }
     }
 
-    /* 4. WAIT. */
-    RKMPP_WAIT_JOB_IN  win{};
-    RKMPP_WAIT_JOB_OUT wout{};
-    win.JobId = sout.JobId;
-    win.TimeoutMs = 1000;
-    if (!DeviceIoControl(h, IOCTL_RKMPP_WAIT_JOB, &win, sizeof(win),
-                         &wout, sizeof(wout), &got, nullptr))
-    {
-        std::fprintf(stderr, "WAIT failed: %lu\n", GetLastError());
-        CloseHandle(h);
-        return 5;
-    }
-    std::printf("job %llu completed status=0x%08lx\n",
-                (unsigned long long)sout.JobId, (unsigned long)wout.Status);
-
-    /* 5. Verify pattern. */
-    uint32_t reread = *static_cast<volatile uint32_t*>(aout.UserVa);
-    if (reread != kPattern) {
-        std::fprintf(stderr, "pattern corrupted: 0x%08x != 0x%08x\n", reread, kPattern);
-        CloseHandle(h);
-        return 6;
-    }
-    std::printf("scratch pattern preserved\n");
-
-    /* 6. FREE. */
-    RKMPP_FREE_BUFFER_IN fin{};
-    fin.BufferHandle = aout.BufferHandle;
-    if (!DeviceIoControl(h, IOCTL_RKMPP_FREE_BUFFER, &fin, sizeof(fin),
-                         nullptr, 0, &got, nullptr))
-    {
-        std::fprintf(stderr, "FREE failed: %lu\n", GetLastError());
-    }
-
+    std::printf("rkmpp_smoke: %d iterations OK\n", kIterations);
     CloseHandle(h);
     return 0;
 }

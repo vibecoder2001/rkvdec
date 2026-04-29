@@ -223,9 +223,9 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
 
     KeReleaseSpinLock(&q->Lock, oldIrql);
 
-    /* Drop the CCU cluster refcount for the completed job.
-     * We drop here (in DPC), not in WaitJob, so the refcount is balanced
-     * even if user mode never calls WaitJob. */
+    /* Phase 3a: matching DropCluster for the per-job RaiseCluster taken in
+     * RkMppJobSubmit.  Done from DPC context (here) so the refcount stays
+     * balanced even if user mode never calls WaitJob. */
     PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
     if (ccu && ccu->DropCluster) {
         ccu->DropCluster(ccu->Header.Context);
@@ -278,9 +278,11 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     /* Assign a unique job ID atomically. */
     job->Id = (UINT64)InterlockedIncrement64(&q->NextId);
 
-    /* Raise the CCU cluster refcount before queuing.  Dropped in
-     * RkMppJobComplete (DPC context) to avoid a leak if WaitJob is
-     * never called. */
+    /* Phase 3a: raise the cluster refcount before queuing.  Dropped in
+     * RkMppJobComplete (DPC context) regardless of whether WaitJob is
+     * ever called, so refcount can't leak.  RaiseCluster is itself
+     * refcounted in rkmpp_ccu, so this composes safely with the
+     * device-lifetime raise taken in PrepareHardware. */
     PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
     if (ccu && ccu->RaiseCluster) {
         NTSTATUS s = ccu->RaiseCluster(ccu->Header.Context);

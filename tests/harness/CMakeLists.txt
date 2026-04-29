@@ -19,3 +19,4 @@ message(STATUS "rkmpp_harness: target=${CMAKE_VS_PLATFORM_NAME} host=${CMAKE_HOS
 
 add_subdirectory(rkmpp_caps_dump)
 add_subdirectory(rkmpp_smoke)
+add_subdirectory(rkmpp_iommu_fault)

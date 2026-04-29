@@ -1,0 +1,52 @@
+;
+; rkiommu.inx — Rockchip RK3588 IOMMU driver
+; Matches RKCP3570 (rockchip,iommu-v2, 11 instances by _UID)
+;     and RKCP3571 (rockchip,iommu-av1d).
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; will be stamped by stampinf
+CatalogFile = rkiommu.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13   ; driver store
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rkiommu.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%rkiommu.DeviceDesc% = rkiommu_Inst, ACPI\RKCP3570
+%rkiommu.DeviceDesc% = rkiommu_Inst, ACPI\RKCP3571
+
+[rkiommu_Inst.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rkiommu.sys
+
+[rkiommu_Inst.NT.Services]
+AddService = rkiommu, %SPSVCINST_ASSOCSERVICE%, rkiommu_Service_Inst
+
+[rkiommu_Service_Inst]
+DisplayName    = %rkiommu.SVCDESC%
+ServiceType    = 1   ; SERVICE_KERNEL_DRIVER
+StartType      = 3   ; SERVICE_DEMAND_START
+ErrorControl   = 1
+ServiceBinary  = %13%\rkiommu.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "Rockchip Windows Drivers Project"
+DiskName               = "rkiommu Installation Disk"
+rkiommu.DeviceDesc     = "Rockchip RK3588 IOMMU"
+rkiommu.SVCDESC        = "rkiommu Service"

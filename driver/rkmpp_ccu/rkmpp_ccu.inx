@@ -1,0 +1,54 @@
+;
+; rkmpp_ccu.inx — Rockchip RK3588 MPP cluster control unit driver
+; Matches RKCP3501 (vpu-jpege CCU), RKCP3502 (rkv-encoder-v2 CCU),
+;     and RKCP3503 (rkv-decoder-v2 CCU). Phase 1 only meaningfully
+;     attaches; cluster raise/drop lands in Phase 2.
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; will be stamped by stampinf
+CatalogFile = rkmpp_ccu.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13   ; driver store
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rkmpp_ccu.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%rkmpp_ccu.DeviceDesc% = rkmpp_ccu_Inst, ACPI\RKCP3501
+%rkmpp_ccu.DeviceDesc% = rkmpp_ccu_Inst, ACPI\RKCP3502
+%rkmpp_ccu.DeviceDesc% = rkmpp_ccu_Inst, ACPI\RKCP3503
+
+[rkmpp_ccu_Inst.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rkmpp_ccu.sys
+
+[rkmpp_ccu_Inst.NT.Services]
+AddService = rkmpp_ccu, %SPSVCINST_ASSOCSERVICE%, rkmpp_ccu_Service_Inst
+
+[rkmpp_ccu_Service_Inst]
+DisplayName    = %rkmpp_ccu.SVCDESC%
+ServiceType    = 1   ; SERVICE_KERNEL_DRIVER
+StartType      = 3   ; SERVICE_DEMAND_START
+ErrorControl   = 1
+ServiceBinary  = %13%\rkmpp_ccu.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "Rockchip Windows Drivers Project"
+DiskName               = "rkmpp_ccu Installation Disk"
+rkmpp_ccu.DeviceDesc   = "Rockchip RK3588 MPP cluster control unit"
+rkmpp_ccu.SVCDESC      = "rkmpp_ccu Service"

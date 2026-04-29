@@ -1,0 +1,28 @@
+# Build outputs
+build/
+out/
+**/Debug/
+**/Release/
+**/ARM64/
+**/*.user
+**/*.suo
+*.aps
+*.tlog
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.dll
+*.sys
+*.cat
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+# IDE
+.vs/
+.vscode/
+*.code-workspace

@@ -1,0 +1,11 @@
+add_executable(rkmpp_smoke main.cpp)
+target_include_directories(rkmpp_smoke PRIVATE ${CMAKE_SOURCE_DIR}/../../shared)
+target_link_libraries(rkmpp_smoke PRIVATE setupapi cfgmgr32)
+
+if(RKMPP_HARNESS_TESTS)
+    add_executable(rkmpp_smoke_test test_main.cpp main.cpp)
+    target_compile_definitions(rkmpp_smoke_test PRIVATE RKMPP_SMOKE_TEST)
+    target_include_directories(rkmpp_smoke_test PRIVATE ${CMAKE_SOURCE_DIR}/../../shared)
+    target_link_libraries(rkmpp_smoke_test PRIVATE setupapi cfgmgr32)
+    add_test(NAME rkmpp_smoke_test COMMAND rkmpp_smoke_test)
+endif()

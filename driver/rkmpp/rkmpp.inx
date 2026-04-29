@@ -1,0 +1,60 @@
+;
+; rkmpp.inx — Rockchip RK3588 MPP codec core driver
+; Matches all eight codec-engine HIDs: RKCP3510 (vpu-jpegd), RKCP3511 (vpu-jpege-v2),
+;     RKCP3512 (vpu-jpege-v2-core1), RKCP3520 (avs-plus), RKCP3521 (avs-plus-core),
+;     RKCP3540 (rk-hega), RKCP3550 (rkv-decoder-v2), RKCP3560 (rkv-encoder-v2).
+; Phase 1: probe, map MMIO, read REVISION register; codec dispatch lands in later phases.
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Media
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; will be stamped by stampinf
+CatalogFile = rkmpp.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13   ; driver store
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rkmpp.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3510
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3511
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3512
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3520
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3521
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3540
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3550
+%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3560
+
+[rkmpp_Inst.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rkmpp.sys
+
+[rkmpp_Inst.NT.Services]
+AddService = rkmpp, %SPSVCINST_ASSOCSERVICE%, rkmpp_Service_Inst
+
+[rkmpp_Service_Inst]
+DisplayName    = %rkmpp.SVCDESC%
+ServiceType    = 1   ; SERVICE_KERNEL_DRIVER
+StartType      = 3   ; SERVICE_DEMAND_START
+ErrorControl   = 1
+ServiceBinary  = %13%\rkmpp.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "Rockchip Windows Drivers Project"
+DiskName               = "rkmpp Installation Disk"
+rkmpp.DeviceDesc       = "Rockchip RK3588 MPP codec core"
+rkmpp.SVCDESC          = "rkmpp Service"

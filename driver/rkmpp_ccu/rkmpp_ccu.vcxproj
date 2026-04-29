@@ -45,6 +45,7 @@
     <ClCompile Include="ccu.c" />
     <ClCompile Include="driver.c" />
     <ClCompile Include="ifc.c" />
+    <ClCompile Include="pmu.c" />
     <Inf Include="rkmpp_ccu.inx" />
   </ItemGroup>
   <ItemGroup>

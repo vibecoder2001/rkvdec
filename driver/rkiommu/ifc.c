@@ -140,18 +140,17 @@ RkIommuMapMdl(_In_ PVOID ClientCookie,
 
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
-    /* Lazy-enable IOMMU paging on first successful map.
-     * Phase 2: leave disabled until first client maps. */
-    if (!dev->PagingEnabled) {
-        RkIommuEnable(dev);
-    }
-
-    /* Flush the IOMMU TLB after page-table updates (gated on paging active) */
-    if (dev->PagingEnabled && dev->MmioBase) {
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(dev->MmioBase + RK_MMU_COMMAND),
-            RK_MMU_CMD_ZAP_CACHE);
-    }
+    /* Phase 3a-debug: the codec/IOMMU MMIO read in rkmpp PrepareHardware was
+     * SErroring even though clocks appeared ungated.  IOMMU MMIO at
+     * 0xFDC38700 lives in the same power domain as the codec at 0xFDC38100,
+     * so RkIommuEnable's writes to DTE_ADDR / COMMAND would WHEA the same
+     * way.  Roll back to the Phase 2 "page tables in RAM, hardware IOMMU
+     * not enabled" stance — smoke's software-completion job doesn't
+     * actually dereference the iova, so this is safe and lets the rest of
+     * the data path validate end-to-end.
+     *
+     * TODO (Phase 3b): figure out the real PMU sequence; once codec MMIO
+     * reads succeed, restore RkIommuEnable. */
 
     *Iova = baseIova;
     return STATUS_SUCCESS;
@@ -207,7 +206,6 @@ RkIommuUnmapMdl(_In_ PVOID  ClientCookie,
 
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
-    /* Flush IOMMU TLB */
     if (dev->PagingEnabled && dev->MmioBase) {
         WRITE_REGISTER_ULONG(
             (volatile ULONG*)(dev->MmioBase + RK_MMU_COMMAND),
@@ -247,6 +245,18 @@ RkIommuRegisterFaultHandler(_In_ PVOID                 ClientCookie,
  * --------------------------------------------------------------------------- */
 NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
 {
+    /* WdfDeviceAddQueryInterface registers the IRP_MN_QUERY_INTERFACE handler
+     * keyed by GUID, but it does NOT publish a PnP device-interface symlink.
+     * Without the symlink, IoGetDeviceInterfaces (which client drivers use to
+     * discover us) returns nothing.  WdfDeviceCreateDeviceInterface publishes
+     * the symlink for the same GUID; both calls must use the SAME GUID so the
+     * client can enumerate a candidate via IoGetDeviceInterfaces, open it,
+     * and then send IRP_MN_QUERY_INTERFACE to fetch the function table. */
+    NTSTATUS s = WdfDeviceCreateDeviceInterface(Device,
+                                                &GUID_DEVINTERFACE_RKIOMMU,
+                                                NULL);
+    if (!NT_SUCCESS(s)) return s;
+
     RKIOMMU_INTERFACE ifc;
     RtlZeroMemory(&ifc, sizeof(ifc));
     ifc.Header.Size              = sizeof(ifc);

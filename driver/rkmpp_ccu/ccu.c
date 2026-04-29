@@ -1,98 +1,140 @@
 /* driver/rkmpp_ccu/ccu.c — RKCP3503 (RDCC) clock/reset/power.
  *
+ * IMPORTANT TOPOLOGY NOTE
+ *
+ * RDCC at 0xfdc30000 (the MMIO range exposed by the RKCP3503 ACPI device)
+ * is the rkv-decoder Cluster *Coordinator* (task arbitration / reset
+ * orchestration), NOT the clock control unit.  Clock gating for the
+ * RVD0/RVD1 cores lives in the system CRU at 0xfd7c0000 — a region the
+ * firmware does NOT expose as an ACPI device.  Linux gets at it via the
+ * generic clock framework; on Windows we have no such abstraction, so
+ * this driver maps the system CRU directly by hardcoded physical address
+ * (in driver.c::RkMppCcuEvtPrepareHardware) and uses that mapping for
+ * RaiseCluster / DropCluster / *CoreReset.
+ *
+ * Two MMIO ranges are therefore in play:
+ *   g_rdcc_mmio  = ACPI _CRS for RDCC, currently unused (Phase 3 task arb)
+ *   g_cru_mmio   = direct map of system CRU at 0xfd7c0000 (this file)
+ *
  * Register offsets sourced from rockchip-linux BSP kernel,
- * commit 44d4aaaa9843057b32946f595948387db152be01 at
+ *   commit 44d4aaaa9843057b32946f595948387db152be01
  *   drivers/clk/rockchip/clk-rk3588.c
- * Header values (reset IDs) from:
  *   include/dt-bindings/clock/rk3588-cru.h
- * (via memory: linux_rkvdec_source_refs.md)
  *
- * CRU base (from rk3588s.dtsi):  0xfd7c0000, size 0x5c000
- * Register offset formulas (from clk.h / softrst.c):
+ * CRU base (from rk3588s.dtsi):  0xfd7c0000, size 0x5c000.
+ * Register offset formulas:
  *   RK3588_CLKGATE_CON(n) = n*4 + 0x800
- *   RK3588_SOFTRST_CON(n) = n*4 + 0xa00  (16 resets/reg, HIWORD_MASK)
+ *   RK3588_SOFTRST_CON(n) = n*4 + 0xa00  (16 resets/reg)
  *
- * Clock-gate register CLKGATE_CON(40) = offset 0x8A0 (from CRU base):
+ * Clock-gate register CLKGATE_CON(40) = 0x8A0:
  *   bit 0  hclk_rkvdec0_root
  *   bit 1  aclk_rkvdec0_root
- *   bit 2  aclk_rkvdec_ccu       <- CCU bus clock
- *   bit 7  clk_rkvdec0_ca
- *   bit 8  clk_rkvdec0_hevc_ca
- *   bit 9  clk_rkvdec0_core
+ *   bit 2  aclk_rkvdec_ccu
  *
- * Clock-gate register CLKGATE_CON(41) = offset 0x8A4:
- *   bit 0  hclk_rkvdec1_root
- *   bit 1  aclk_rkvdec1_root
- *   bit 6  clk_rkvdec1_ca
- *   bit 7  clk_rkvdec1_hevc_ca
- *   bit 8  clk_rkvdec1_core
+ * Soft-reset register SOFTRST_CON(40) = 0xAA0:
+ *   bit 9  SRST_RKVDEC0_CORE
  *
- * Soft-reset register SOFTRST_CON(40) = offset 0xAA0 (16 resets/reg):
- *   reset_id 640..655 -> CON(40), bits 0..15
- *   SRST_A_RKVDEC_CCU = 642 -> bit 2
- *   SRST_H_RKVDEC0    = 643 -> bit 3
- *   SRST_A_RKVDEC0    = 644 -> bit 4
- *   SRST_RKVDEC0_CORE = 649 -> bit 9
+ * HIWORD-MASK convention
  *
- * Soft-reset register SOFTRST_CON(41) = offset 0xAA4:
- *   reset_id 656..671 -> CON(41), bits 0..15
- *   SRST_H_RKVDEC1    = 658 -> bit 2
- *   SRST_A_RKVDEC1    = 659 -> bit 3
- *   SRST_RKVDEC1_CORE = 664 -> bit 8
+ * RK3588 CRU CON-registers use the standard Rockchip hi-word-mask format:
+ *   - Upper 16 bits are a write-enable mask (bit N set in the upper half
+ *     means "update bit N in the lower half"; bit N clear means "leave
+ *     bit N alone").
+ *   - Lower 16 bits are the value bits.
+ *   - Reads return only the lower 16 bits as live state; the upper half
+ *     reads as zero, so plain read-modify-write does NOT work — we MUST
+ *     write an explicit mask in the upper half.
  *
- * v1 single-instance note:
- *   For v1 we only service RKCP3503 (rkv-decoder-v2 CCU).  The RDCC_REGS
- *   struct covers rkvdec0 (CON 40).  Extending to rkvdec1 (CON 41) and the
- *   full clock tree is left for v2.
+ * To set bits M to value V (where V uses bits 0..15):
+ *   write (M << 16) | V
  *
- * Rockchip HIWORD_MASK write convention:
- *   Upper 16 bits of each write are a "write-enable" mask; set bit N in both
- *   halves to change bit N, or set bit N only in the upper half to leave it
- *   unchanged.  READ_REGISTER_ULONG returns the full 32-bit value; only the
- *   lower 16 bits carry live state.  We use plain read-modify-write here
- *   because the HIWORD_MASK convention requires bit-precise upper-half masks
- *   which are harder to express cleanly — and at kernel IRQL the register
- *   window is fully owned by this driver, so RMW is safe.
- *
- * Rockchip clock-gate polarity: 1 = GATED (stopped), 0 = UNGATED (running).
- *   RaiseCluster clears gate bits; DropCluster sets them.
- * Rockchip soft-reset polarity:  1 = RESET ASSERTED, 0 = DEASSERTED.
+ * Polarity:
+ *   Clock gate: 1 = GATED (stopped), 0 = UNGATED (running).
+ *   Soft reset: 1 = ASSERTED, 0 = DEASSERTED.
  */
 #include <ntddk.h>
 #include <wdf.h>
 #include "../../shared/rkmpp_ccu_ifc.h"
+#include "pmu.h"
 
-/* CRU register offsets from the CRU MMIO base (0xfd7c0000).
- * All offsets are byte offsets; registers are 32-bit.
+/* CRU register offsets relative to g_cru_mmio (which maps 0xfd7c0000+). */
+/* CLKGATE_CON(40) bits we ungate:
+ *   0 hclk_rkvdec0_root  7 clk_rkvdec0_ca
+ *   1 aclk_rkvdec0_root  8 clk_rkvdec0_hevc_ca
+ *   2 aclk_rkvdec_ccu    9 clk_rkvdec0_core
+ *
+ * CLKGATE_CON(41) bits we ungate:
+ *   0 hclk_rkvdec1_root  7 clk_rkvdec1_hevc_ca
+ *   1 aclk_rkvdec1_root  8 clk_rkvdec1_core
+ *   6 clk_rkvdec1_ca
+ *
+ * Phase 2 ungated only the bus-roots (bits 0,1,2 of CON(40)) which left the
+ * codec core clocks gated — codec MMIO reads SError'd on first hardware run.
  */
-#define RDCC_CRU_CLKGATE_CON40   0x8A0u  /* CLKGATE_CON(40): rkvdec0 + CCU */
-#define RDCC_CRU_SOFTRST_CON40   0xAA0u  /* SOFTRST_CON(40): rkvdec0 resets */
+#define RDCC_CRU_CLKGATE_CON40   0x8A0u
+#define RDCC_CRU_CLKGATE_CON41   0x8A4u
+#define RDCC_CRU_CLKGATE_CON44   0x8B0u  /* VDPU root clocks: aclk/aclk_low/hclk */
+#define RDCC_CRU_SOFTRST_CON40   0xAA0u
+#define RDCC_CRU_SOFTRST_CON41   0xAA4u
 
 typedef struct _RDCC_REGS {
-    ULONG ClkGate;        /* CRU clock-gate register offset (from CRU base) */
-    ULONG ClkGateMask;    /* bits we own in ClkGate (1 = may gate, 0 = leave) */
-    ULONG SoftReset;      /* CRU soft-reset register offset (from CRU base)  */
-    ULONG SoftResetMask;  /* bits we own in SoftReset */
+    ULONG ClkGateCon44;     /* VDPU root clocks (must be on before PD_VDPU) */
+    ULONG ClkGateCon44Mask;
+    ULONG ClkGateCon40;
+    ULONG ClkGateCon40Mask;
+    ULONG ClkGateCon41;
+    ULONG ClkGateCon41Mask;
+    ULONG SoftRstCon40;
+    ULONG SoftRstCon40Mask;
+    ULONG SoftRstCon41;
+    ULONG SoftRstCon41Mask;
 } RDCC_REGS;
 
+/* Clock + reset masks per linux-rockchip clk-rk3588.c gate descriptor table.
+ *
+ * CON(44) bits 0,1,2 are ACLK_VDPU_ROOT / ACLK_VDPU_LOW_ROOT / HCLK_VDPU_ROOT.
+ * These must be ungated BEFORE the PD_VDPU bus-idle handshake — without them
+ * the bus has no clock and ack never propagates.
+ *
+ * AssertCoreReset / DeassertCoreReset (hang-recovery ifc) toggle only the
+ * CORE bit (CON40 bit 9, CON41 bit 8). */
 static const RDCC_REGS g_rdcc = {
-    /* CLKGATE_CON(40) offset 0x8A0:
-     *   bit 0 hclk_rkvdec0_root, bit 1 aclk_rkvdec0_root, bit 2 aclk_rkvdec_ccu
-     *   Gate all three to fully idle the cluster.
-     */
-    .ClkGate       = RDCC_CRU_CLKGATE_CON40,
-    .ClkGateMask   = 0x00000007u,  /* bits 0+1+2 */
-
-    /* SOFTRST_CON(40) offset 0xAA0:
-     *   bit 9 SRST_RKVDEC0_CORE (reset_id 649)
-     *   Assert/deassert only the core reset for v1.
-     */
-    .SoftReset     = RDCC_CRU_SOFTRST_CON40,
-    .SoftResetMask = 0x00000200u,  /* bit 9 */
+    .ClkGateCon44     = RDCC_CRU_CLKGATE_CON44,
+    .ClkGateCon44Mask = 0x00000007u,  /* VDPU root: aclk(0), aclk_low(1), hclk(2) */
+    .ClkGateCon40     = RDCC_CRU_CLKGATE_CON40,
+    .ClkGateCon40Mask = 0x000003FFu,  /* bits 0..4,7,8,9 = 0x39F; mask 0x3FF
+                                       * also covers 5,6 to be safe         */
+    .ClkGateCon41     = RDCC_CRU_CLKGATE_CON41,
+    .ClkGateCon41Mask = 0x000001CFu,  /* bits 0..3,6,7,8                    */
+    .SoftRstCon40     = RDCC_CRU_SOFTRST_CON40,
+    .SoftRstCon40Mask = 0x000003FCu,  /* bits 2..9 — CCU + rkvdec0 group    */
+    .SoftRstCon41     = RDCC_CRU_SOFTRST_CON41,
+    .SoftRstCon41Mask = 0x000001FCu,  /* bits 2..8 — rkvdec1 group          */
 };
 
+/* Single-bit masks for the CORE reset (used by AssertCoreReset /
+ * DeassertCoreReset hang-recovery ifc — they toggle only the core, not
+ * the bus/cabac/HEVC resets that are part of the bring-up bundle). */
+#define RDCC_CON40_CORE_RESET_BIT  (1u << 9)
+#define RDCC_CON41_CORE_RESET_BIT  (1u << 8)
+
+/* Defined in driver.c.  g_rdcc_mmio is the ACPI MMIO (Phase 3 task arb).
+ * g_cru_mmio is a direct physical-address map of the system CRU; we use
+ * that for clock and reset control in Phase 2. */
 extern volatile UCHAR *g_rdcc_mmio;
+extern volatile UCHAR *g_cru_mmio;
 extern LONG            g_raise_refcount;
+
+/* Hi-word-mask write helper.  Bits set in `mask` (lower 16) get updated to
+ * the corresponding bit in `value`; other bits are unaffected.  The upper
+ * 16 bits of the actual MMIO write are the mask itself. */
+static FORCEINLINE void
+RkCcuHiwordWrite(_In_ volatile UCHAR *base, _In_ ULONG offset,
+                 _In_ ULONG mask, _In_ ULONG value)
+{
+    ULONG word = (mask << 16) | (value & mask);
+    WRITE_REGISTER_ULONG((volatile ULONG*)(base + offset), word);
+}
 
 NTSTATUS RkMppCcuQueryVersion(_Out_ PUINT32 v)
 {
@@ -103,56 +145,145 @@ NTSTATUS RkMppCcuQueryVersion(_Out_ PUINT32 v)
 NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
-    if (!g_rdcc_mmio) return STATUS_DEVICE_NOT_READY;
-    if (InterlockedIncrement(&g_raise_refcount) == 1) {
-        /* Clear gate bits → ungate (clock running). */
-        ULONG v = READ_REGISTER_ULONG(
-            (volatile ULONG*)(g_rdcc_mmio + g_rdcc.ClkGate));
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(g_rdcc_mmio + g_rdcc.ClkGate),
-            v & ~g_rdcc.ClkGateMask);
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    if (InterlockedIncrement(&g_raise_refcount) != 1) return STATUS_SUCCESS;
+
+    /* Linux pm_domains.c per-domain sequence:
+     *   ungate the PD's clocks → bus-idle deassert → PMU power-on.
+     * The bus-idle ack only updates when the bus's own clocks are running,
+     * so clocks come BEFORE the PMU handshake.  We unfold per-domain order:
+     *
+     *   PD_VCODEC      (no clocks, no idle)
+     *   ungate VDPU root clocks (CON44 b0..2)
+     *   PD_VDPU        (idle handshake + pwr)
+     *   ungate rkvdec0 cluster clocks (CON40 mask 0x3FF)
+     *   PD_RKVDEC0     (idle handshake + pwr)
+     *   ungate rkvdec1 cluster clocks (CON41 mask 0x1CF)
+     *   PD_RKVDEC1     (idle handshake + pwr)
+     *   deassert resets
+     */
+    NTSTATUS s = RkMppPmuPowerOn(&g_pdVcodec);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: PD_VCODEC power-on failed 0x%08x\n", s);
+        InterlockedDecrement(&g_raise_refcount);
+        return s;
     }
+
+    /* Ungate VDPU root clocks BEFORE PD_VDPU's bus-idle handshake. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44, g_rdcc.ClkGateCon44Mask, 0);
+
+    s = RkMppPmuPowerOn(&g_pdVdpu);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: PD_VDPU power-on failed 0x%08x\n", s);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
+                         g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
+        RkMppPmuPowerOff(&g_pdVcodec);
+        InterlockedDecrement(&g_raise_refcount);
+        return s;
+    }
+
+    /* Ungate rkvdec0 cluster clocks BEFORE PD_RKVDEC0 handshake. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40, g_rdcc.ClkGateCon40Mask, 0);
+
+    s = RkMppPmuPowerOn(&g_pdRkvdec0);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: PD_RKVDEC0 power-on failed 0x%08x\n", s);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
+                         g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
+        RkMppPmuPowerOff(&g_pdVdpu);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
+                         g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
+        RkMppPmuPowerOff(&g_pdVcodec);
+        InterlockedDecrement(&g_raise_refcount);
+        return s;
+    }
+
+    /* Ungate rkvdec1 cluster clocks BEFORE PD_RKVDEC1 handshake. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41, g_rdcc.ClkGateCon41Mask, 0);
+
+    s = RkMppPmuPowerOn(&g_pdRkvdec1);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: PD_RKVDEC1 power-on failed 0x%08x\n", s);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
+                         g_rdcc.ClkGateCon41Mask, g_rdcc.ClkGateCon41Mask);
+        RkMppPmuPowerOff(&g_pdRkvdec0);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
+                         g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
+        RkMppPmuPowerOff(&g_pdVdpu);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
+                         g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
+        RkMppPmuPowerOff(&g_pdVcodec);
+        InterlockedDecrement(&g_raise_refcount);
+        return s;
+    }
+
+    /* Deassert all rkvdec0/1 resets (CCU + bus + cabac + HEVC + core).
+     * UEFI may have left some asserted; deasserting already-deasserted bits
+     * is a no-op so we can do this unconditionally. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40, g_rdcc.SoftRstCon40Mask, 0);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41, g_rdcc.SoftRstCon41Mask, 0);
+
+    /* Codec MMIO at 0xFDC30000 / 0xFDC38xxx / 0xFDC48xxx is now reachable. */
     return STATUS_SUCCESS;
 }
 
 NTSTATUS RkMppCcuDropCluster(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
-    if (!g_rdcc_mmio) return STATUS_SUCCESS;
-    if (InterlockedDecrement(&g_raise_refcount) == 0) {
-        /* Set gate bits → gate (clock stopped). */
-        ULONG v = READ_REGISTER_ULONG(
-            (volatile ULONG*)(g_rdcc_mmio + g_rdcc.ClkGate));
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(g_rdcc_mmio + g_rdcc.ClkGate),
-            v | g_rdcc.ClkGateMask);
-    }
+    if (!g_cru_mmio) return STATUS_SUCCESS;
+    if (InterlockedDecrement(&g_raise_refcount) != 0) return STATUS_SUCCESS;
+
+    /* Reverse of RaiseCluster, child-first:
+     *   reassert resets → power off PD_RKVDEC1 → gate rkvdec1 clocks
+     *   → power off PD_RKVDEC0 → gate rkvdec0 clocks
+     *   → power off PD_VDPU → gate VDPU root clocks
+     *   → power off PD_VCODEC */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
+                     g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41,
+                     g_rdcc.SoftRstCon41Mask, g_rdcc.SoftRstCon41Mask);
+
+    RkMppPmuPowerOff(&g_pdRkvdec1);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
+                     g_rdcc.ClkGateCon41Mask, g_rdcc.ClkGateCon41Mask);
+
+    RkMppPmuPowerOff(&g_pdRkvdec0);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
+                     g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
+
+    RkMppPmuPowerOff(&g_pdVdpu);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
+                     g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
+
+    RkMppPmuPowerOff(&g_pdVcodec);
     return STATUS_SUCCESS;
 }
 
+/* Hang-recovery reset toggles for the RVD0 core only.  RaiseCluster
+ * deasserts the full reset bundle on bring-up; these helpers target
+ * just the CORE bit (CON40 bit 9) so a stuck job can be killed without
+ * teardown of bus/cabac/HEVC clocks.  RVD1 needs a per-core ifc
+ * extension (Phase 3b later task). */
 NTSTATUS RkMppCcuAssertCoreReset(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
-    if (!g_rdcc_mmio) return STATUS_DEVICE_NOT_READY;
-    /* Set reset bits → assert reset (core held in reset). */
-    ULONG v = READ_REGISTER_ULONG(
-        (volatile ULONG*)(g_rdcc_mmio + g_rdcc.SoftReset));
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(g_rdcc_mmio + g_rdcc.SoftReset),
-        v | g_rdcc.SoftResetMask);
-    KeStallExecutionProcessor(20);  /* 20 µs — hardware must latch the reset */
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
+                     RDCC_CON40_CORE_RESET_BIT, RDCC_CON40_CORE_RESET_BIT);
+    KeStallExecutionProcessor(20);  /* 20 µs — hardware latches the reset */
     return STATUS_SUCCESS;
 }
 
 NTSTATUS RkMppCcuDeassertCoreReset(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
-    if (!g_rdcc_mmio) return STATUS_DEVICE_NOT_READY;
-    /* Clear reset bits → deassert (core running). */
-    ULONG v = READ_REGISTER_ULONG(
-        (volatile ULONG*)(g_rdcc_mmio + g_rdcc.SoftReset));
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(g_rdcc_mmio + g_rdcc.SoftReset),
-        v & ~g_rdcc.SoftResetMask);
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
+                     RDCC_CON40_CORE_RESET_BIT, 0);
+    KeStallExecutionProcessor(20);
     return STATUS_SUCCESS;
 }

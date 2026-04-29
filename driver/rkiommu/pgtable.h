@@ -43,6 +43,9 @@
 #define RK_MMU_CMD_ZAP_CACHE        4u
 #define RK_MMU_CMD_PAGE_FAULT_DONE  5u
 #define RK_MMU_CMD_FORCE_RESET      6u
+/* BSP reset command — alias used by Phase 3a RkIommuEnable.
+ * Value 0x01 matches the Linux rockchip-iommu driver. */
+#define RK_MMU_CMD_RESET            0x01u
 
 /* Interrupt flags */
 #define RK_MMU_IRQ_PAGE_FAULT   0x01u

@@ -119,3 +119,14 @@ typedef struct _RKMPP_WAIT_JOB_OUT {
     UINT32   HardwareStatus;
     UINT64   ElapsedQpc;
 } RKMPP_WAIT_JOB_OUT;
+
+/* ---- Phase 3a: IOMMU fault injection scaffold ---- */
+
+#define IOCTL_RKMPP_INJECT_IOMMU_FAULT \
+    CTL_CODE(FILE_DEVICE_RKMPP, 0x8FE, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+typedef struct _RKMPP_FAULT_RESULT {
+    UINT32  Triggered;     /* 0 = no fault observed within timeout; 1 = observed */
+    UINT32  StatusReg;     /* IOMMU INT_STATUS at fault time */
+    UINT64  FaultIova;     /* iova captured by the IOMMU at fault time */
+} RKMPP_FAULT_RESULT;

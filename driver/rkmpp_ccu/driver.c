@@ -13,13 +13,34 @@
 #include <wdf.h>
 
 #include "../../shared/rkmpp_ccu_ifc.h"
+#include "pmu.h"
 
-/* Globals consumed by ccu.c. */
+/* Globals consumed by ccu.c.
+ *
+ * g_rdcc_mmio  — ACPI _CRS for RKCP3503 (RDCC cluster coordinator at
+ *                0xfdc30000, len 0x100).  Reserved for Phase 3 task
+ *                arbitration; not used in Phase 2.
+ * g_cru_mmio   — direct physical-address map of the system CRU at
+ *                0xfd7c0000.  Owns the clock-gate and soft-reset
+ *                registers for the rkvdec cluster.  Mapped here because
+ *                the firmware does not expose the CRU as an ACPI device.
+ */
 volatile UCHAR *g_rdcc_mmio     = NULL;
+volatile UCHAR *g_cru_mmio      = NULL;
+volatile UCHAR *g_pmu_mmio      = NULL;
 LONG            g_raise_refcount = 0;
 
 /* MMIO mapping bookkeeping — kept here so ReleaseHardware can unmap. */
 static SIZE_T   g_rdcc_mmio_len = 0;
+static SIZE_T   g_cru_mmio_len  = 0;
+static SIZE_T   g_pmu_mmio_len  = 0;
+
+/* System CRU physical base + length we map.  The full CRU is ~0x5c000;
+ * we map just one page covering the rkvdec gate (0x8A0) and reset
+ * (0xAA0) registers.  See ccu.c for the offsets and rationale.
+ */
+#define RKMPP_CCU_CRU_PHYS_BASE   0xFD7C0000ULL
+#define RKMPP_CCU_CRU_MAP_LENGTH  0x1000u
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD        RkMppCcuEvtDeviceAdd;
@@ -95,16 +116,58 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
             if (!base) return STATUS_INSUFFICIENT_RESOURCES;
 
             if (hid == 0x3503) {
-                /* RKCP3503 — this is the RDCC CRU window we operate on. */
+                /* RKCP3503 — RDCC cluster-coordinator MMIO (Phase 3 task
+                 * arbitration).  We don't touch it in Phase 2 but keep the
+                 * mapping live so the address space is reserved. */
                 g_rdcc_mmio     = (volatile UCHAR*)base;
                 g_rdcc_mmio_len = d->u.Memory.Length;
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                           "rkmpp_ccu: RDCC CRU mapped @ %p len 0x%Ix\n",
+                           "rkmpp_ccu: RDCC coord mapped @ %p len 0x%Ix\n",
                            base, g_rdcc_mmio_len);
+
+                /* Also map the system CRU (not exposed via ACPI) so we can
+                 * gate clocks and assert resets for the rkvdec cluster. */
+                PHYSICAL_ADDRESS cruPhys;
+                cruPhys.QuadPart = RKMPP_CCU_CRU_PHYS_BASE;
+                PVOID cruVa = MmMapIoSpaceEx(cruPhys,
+                                             RKMPP_CCU_CRU_MAP_LENGTH,
+                                             PAGE_READWRITE | PAGE_NOCACHE);
+                if (!cruVa) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "rkmpp_ccu: CRU map failed @ 0x%llx\n",
+                               cruPhys.QuadPart);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                g_cru_mmio     = (volatile UCHAR*)cruVa;
+                g_cru_mmio_len = RKMPP_CCU_CRU_MAP_LENGTH;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                           "rkmpp_ccu: system CRU mapped @ %p (phys 0x%llx)\n",
+                           cruVa, (unsigned long long)cruPhys.QuadPart);
+
+                /* Map the PMU (not exposed via ACPI) for power-domain control. */
+                PHYSICAL_ADDRESS pmuPhys;
+                pmuPhys.QuadPart = RKMPP_PMU_PHYS_BASE;
+                PVOID pmuVa = MmMapIoSpaceEx(pmuPhys,
+                                             RKMPP_PMU_MAP_LENGTH,
+                                             PAGE_READWRITE | PAGE_NOCACHE);
+                if (!pmuVa) {
+                    /* Unwind the CRU map we already took. */
+                    MmUnmapIoSpace((PVOID)g_cru_mmio, g_cru_mmio_len);
+                    g_cru_mmio = NULL; g_cru_mmio_len = 0;
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "rkmpp_ccu: PMU map failed @ 0x%llx\n",
+                               (unsigned long long)pmuPhys.QuadPart);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                g_pmu_mmio     = (volatile UCHAR*)pmuVa;
+                g_pmu_mmio_len = RKMPP_PMU_MAP_LENGTH;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                           "rkmpp_ccu: PMU mapped @ %p (phys 0x%llx)\n",
+                           pmuVa, (unsigned long long)pmuPhys.QuadPart);
             } else {
                 /* RKCP3501/3502 — map succeeds but we don't use it for RDCC.
                  * Unmap immediately; CCU functions will return gracefully via
-                 * the g_rdcc_mmio == NULL guards in ccu.c.
+                 * the g_cru_mmio == NULL guards in ccu.c.
                  */
                 MmUnmapIoSpace(base, d->u.Memory.Length);
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -127,6 +190,16 @@ RkMppCcuEvtReleaseHardware(_In_ WDFDEVICE Device,
     UNREFERENCED_PARAMETER(Device);
     UNREFERENCED_PARAMETER(ResourcesTranslated);
 
+    if (g_pmu_mmio) {
+        MmUnmapIoSpace((PVOID)g_pmu_mmio, g_pmu_mmio_len);
+        g_pmu_mmio     = NULL;
+        g_pmu_mmio_len = 0;
+    }
+    if (g_cru_mmio) {
+        MmUnmapIoSpace((PVOID)g_cru_mmio, g_cru_mmio_len);
+        g_cru_mmio     = NULL;
+        g_cru_mmio_len = 0;
+    }
     if (g_rdcc_mmio) {
         MmUnmapIoSpace((PVOID)g_rdcc_mmio, g_rdcc_mmio_len);
         g_rdcc_mmio     = NULL;

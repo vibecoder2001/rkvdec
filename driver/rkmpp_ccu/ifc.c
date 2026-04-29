@@ -18,6 +18,14 @@ NTSTATUS RkMppCcuDeassertCoreReset(_In_ PVOID   Ctx);
 
 NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device)
 {
+    /* Publish the PnP device-interface symlink so client drivers can find us
+     * via IoGetDeviceInterfaces.  WdfDeviceAddQueryInterface alone is not
+     * enough — it only registers the IRP_MN_QUERY_INTERFACE handler. */
+    NTSTATUS s = WdfDeviceCreateDeviceInterface(Device,
+                                                &GUID_DEVINTERFACE_RKMPP_CCU,
+                                                NULL);
+    if (!NT_SUCCESS(s)) return s;
+
     RKMPP_CCU_INTERFACE ifc;
     RtlZeroMemory(&ifc, sizeof(ifc));
     ifc.Header.Size              = sizeof(ifc);

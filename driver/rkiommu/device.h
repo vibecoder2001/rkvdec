@@ -18,6 +18,11 @@ typedef struct _RKIOMMU_DEVICE {
 
     BOOLEAN             PagingEnabled;  /* TRUE after RkIommuEnable() */
 
+    /* BSP _DSD flags — set in EvtPrepareHardware based on HID/UID. */
+    BOOLEAN             FlagDisableMmuReset;   /* rockchip,disable-mmu-reset */
+    BOOLEAN             FlagEnableCmdRetry;    /* rockchip,enable-cmd-retry  */
+    BOOLEAN             FlagShootdownEntire;   /* rockchip,shootdown-entire  */
+
     /* Registered fault callback (set by client via RegisterFaultHandler) */
     RKIOMMU_FAULT_CALLBACK FaultCb;
     PVOID                  FaultCbCookie;
@@ -40,6 +45,7 @@ NTSTATUS RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit);
 extern LIST_ENTRY  g_deviceList;
 extern KSPIN_LOCK  g_deviceListLock;
 
-/* Enable IOMMU paging on the hardware (lazy, called on first map) */
+/* Enable IOMMU paging on the hardware (lazy, called on first map).
+ * Returns STATUS_SUCCESS on success, STATUS_DEVICE_HARDWARE_ERROR on timeout. */
 _IRQL_requires_max_(DISPATCH_LEVEL)
-VOID RkIommuEnable(_In_ PRKIOMMU_DEVICE Dev);
+NTSTATUS RkIommuEnable(_In_ PRKIOMMU_DEVICE Dev);

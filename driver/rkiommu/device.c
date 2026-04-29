@@ -33,6 +33,7 @@ EVT_WDF_DEVICE_PREPARE_HARDWARE  RkIommuEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE  RkIommuEvtReleaseHardware;
 
 extern NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device);  /* in ifc.c */
+UINT32 RkIommuQueryAcpiUid(_In_ PDEVICE_OBJECT Pdo);  /* below */
 
 /* ---------------------------------------------------------------------------
  * ACPI HID/UID parse
@@ -75,10 +76,10 @@ RkIommuReadAcpiId(_In_ WDFDEVICE Device,
             }
             if (hid) {
                 *Hid = hid;
-                ULONG uid = 0;
-                IoGetDeviceProperty(pdo, DevicePropertyUINumber,
-                                    sizeof(uid), &uid, &size);
-                *Uid = uid;
+                /* IRP_MN_QUERY_ID(BusQueryInstanceID) returns the _UID for
+                 * ACPI devices.  DevicePropertyUINumber is not reliably
+                 * populated by acpi.sys, so we use the IRP path. */
+                *Uid = RkIommuQueryAcpiUid(pdo);
                 return STATUS_SUCCESS;
             }
         }
@@ -90,45 +91,64 @@ RkIommuReadAcpiId(_In_ WDFDEVICE Device,
 /* ---------------------------------------------------------------------------
  * RkIommuEnable — activate IOMMU paging on the hardware.
  *
- * Writes DTE_ADDR, then issues ENABLE_PAGING.  Called lazily by MapMdl on
- * the first successful map so we don't touch hardware before a client is
- * ready.
+ * Phase 3a: real MMIO programming, with three BSP-mandated flags:
+ *   FlagDisableMmuReset   — skip the MMU reset command (RK3588 rkvdec/enc/AV1)
+ *   FlagEnableCmdRetry    — retry ENABLE_PAGING up to 3 times with status poll
+ *   FlagShootdownEntire   — ZAP_CACHE used for TLB flush (set in MapMdl/UnmapMdl)
  *
- * Phase 2: leave disabled until first client maps.
- * Uncomment the body or call this function from MapMdl to activate.
+ * Called lazily by MapMdl on the first successful map.
  * --------------------------------------------------------------------------- */
 _Use_decl_annotations_
-VOID RkIommuEnable(PRKIOMMU_DEVICE Dev)
+NTSTATUS RkIommuEnable(PRKIOMMU_DEVICE Dev)
 {
-    if (Dev->PagingEnabled) return;
-    if (!Dev->MmioBase)     return;
-    if (!Dev->Domain)       return;
+    if (!Dev->MmioBase || !Dev->Domain) return STATUS_DEVICE_NOT_READY;
+    if (Dev->PagingEnabled)             return STATUS_SUCCESS;
 
-    /* Write the page-directory physical address */
+    /* 1. Optionally reset the MMU.  BSP flag says skip on RK3588 rkvdec/rkvenc/AV1. */
+    if (!Dev->FlagDisableMmuReset) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_COMMAND),
+            RK_MMU_CMD_RESET);
+        KeStallExecutionProcessor(50);
+    }
+
+    /* 2. Program the page-directory base. */
     WRITE_REGISTER_ULONG(
         (volatile ULONG*)(Dev->MmioBase + RK_MMU_DTE_ADDR),
         Dev->Domain->PdPhys);
 
-    /* Enable auto-gating */
+    /* 3. Enable auto-gating. */
     WRITE_REGISTER_ULONG(
         (volatile ULONG*)(Dev->MmioBase + RK_MMU_AUTO_GATING),
         1u);
 
-    /* Enable IRQs */
+    /* 4. Enable IRQs. */
     WRITE_REGISTER_ULONG(
         (volatile ULONG*)(Dev->MmioBase + RK_MMU_INT_MASK),
         RK_MMU_IRQ_MASK);
 
-    /* Issue ENABLE_PAGING command */
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(Dev->MmioBase + RK_MMU_COMMAND),
-        RK_MMU_CMD_ENABLE_PAGING);
+    /* 5. Enable paging.  With cmd-retry: write up to 3 times, polling status. */
+    ULONG attempts = Dev->FlagEnableCmdRetry ? 3u : 1u;
+    for (ULONG i = 0; i < attempts; i++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_COMMAND),
+            RK_MMU_CMD_ENABLE_PAGING);
+        ULONG st = READ_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_STATUS));
+        if ((st & RK_MMU_STATUS_PAGING_ENABLED) != 0) {
+            Dev->PagingEnabled = TRUE;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "rkiommu: paging enabled (HID=RKCP%04x UID=%u attempt=%u)\n",
+                       Dev->Hid, Dev->Uid, i + 1u);
+            return STATUS_SUCCESS;
+        }
+        KeStallExecutionProcessor(20);
+    }
 
-    Dev->PagingEnabled = TRUE;
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "rkiommu: RKCP%04x UID=%u paging enabled, DTE_ADDR=0x%08x\n",
-               Dev->Hid, Dev->Uid, Dev->Domain->PdPhys);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+               "rkiommu: paging-enable timeout (HID=RKCP%04x UID=%u)\n",
+               Dev->Hid, Dev->Uid);
+    return STATUS_DEVICE_HARDWARE_ERROR;
 }
 
 /* ---------------------------------------------------------------------------
@@ -148,6 +168,21 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkiommu: failed to read ACPI ID (0x%08x)\n", status);
         return status;
+    }
+
+    /* BSP _DSD flags applied by the firmware.  RKCP3570 UID 7..10 (the
+     * encoder/decoder IOMMUs RE0M, RE1M, RD0M, RD1M) and RKCP3571 (A1MU)
+     * all carry the three flags per the ACPI source; the older block
+     * IOMMUs (VPMU, JDMU, J0..J3MU, IEMU) do not. */
+    if ((ctx->Hid == 0x3570 && ctx->Uid >= 7 && ctx->Uid <= 10) ||
+        ctx->Hid == 0x3571) {
+        ctx->FlagDisableMmuReset = TRUE;
+        ctx->FlagEnableCmdRetry  = TRUE;
+        ctx->FlagShootdownEntire = TRUE;
+    } else {
+        ctx->FlagDisableMmuReset = FALSE;
+        ctx->FlagEnableCmdRetry  = FALSE;
+        ctx->FlagShootdownEntire = FALSE;
     }
 
     /* Map the first MMIO resource */
@@ -266,7 +301,16 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     RtlZeroMemory(ctx, sizeof(*ctx));
     InitializeListHead(&ctx->ListEntry);
 
-    /* Create the interrupt object (ISR + DPC wired in fault.c) */
+    /* Phase 3a-debug: SKIP WdfInterruptCreate.  Hypothesis: an unexpected
+     * IOMMU IRQ is firing ~100ms after rkmpp's RaiseCluster, the ISR runs
+     * at DIRQL, touches MMIO that's not actually reachable for some reason,
+     * and SErrors → WHEA before any DPC can log.  Dropping the IRQ wiring
+     * means hardware faults silently for now (no fault dispatch), but
+     * Phase 2 ran fine without ISRs and we don't need real fault recovery
+     * until Phase 3b's hardware kick path lands.
+     *
+     * If rkmpp now reaches STEP 71 (REVISION read OK), this is the source. */
+#if 0
     WDF_INTERRUPT_CONFIG intCfg;
     WDF_INTERRUPT_CONFIG_INIT(&intCfg, RkIommuEvtIsr, RkIommuEvtDpc);
 
@@ -278,9 +322,79 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
                    "rkiommu: WdfInterruptCreate failed (0x%08x)\n", status);
         return status;
     }
+#endif
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "rkiommu: device created\n");
 
     return RkIommuRegisterIfc(device);
+}
+
+/* IRP_MN_QUERY_ID(BusQueryInstanceID) helper.  Sends a synchronous IRP up
+ * the device's PnP stack to retrieve the per-enumerator instance ID and
+ * parses it as a decimal integer.  For ACPI devices this returns _UID. */
+typedef struct _RKIOMMU_QID_CTX { KEVENT Done; NTSTATUS Status; } RKIOMMU_QID_CTX;
+
+_Use_decl_annotations_
+static IO_COMPLETION_ROUTINE RkIommuQidCompletion;
+static NTSTATUS RkIommuQidCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    RKIOMMU_QID_CTX *c = (RKIOMMU_QID_CTX *)Ctx;
+    NT_ASSERT(c != NULL);
+    _Analysis_assume_(c != NULL);
+    c->Status = Irp->IoStatus.Status;
+    KeSetEvent(&c->Done, IO_NO_INCREMENT, FALSE);
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+UINT32 RkIommuQueryAcpiUid(_In_ PDEVICE_OBJECT Pdo)
+{
+    PDEVICE_OBJECT topDev = IoGetAttachedDeviceReference(Pdo);
+    if (!topDev) return 0;
+
+    PIRP irp = IoAllocateIrp(topDev->StackSize, FALSE);
+    if (!irp) {
+        ObDereferenceObject(topDev);
+        return 0;
+    }
+
+    RKIOMMU_QID_CTX ctx;
+    KeInitializeEvent(&ctx.Done, NotificationEvent, FALSE);
+    ctx.Status = STATUS_NOT_SUPPORTED;
+
+    irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+    IoSetCompletionRoutine(irp, RkIommuQidCompletion, &ctx, TRUE, TRUE, TRUE);
+
+    PIO_STACK_LOCATION sl = IoGetNextIrpStackLocation(irp);
+    sl->MajorFunction = IRP_MJ_PNP;
+    sl->MinorFunction = IRP_MN_QUERY_ID;
+    sl->Parameters.QueryId.IdType = BusQueryInstanceID;
+
+    NTSTATUS status = IoCallDriver(topDev, irp);
+    if (status == STATUS_PENDING) {
+        KeWaitForSingleObject(&ctx.Done, Executive, KernelMode, FALSE, NULL);
+        status = ctx.Status;
+    }
+
+    UINT32 uid = 0;
+    if (NT_SUCCESS(status)) {
+        PCWSTR instId = (PCWSTR)irp->IoStatus.Information;
+        if (instId) {
+            UNICODE_STRING us;
+            RtlInitUnicodeString(&us, instId);
+            /* acpi.sys formats numeric _UID values as hex without "0x"
+             * prefix.  _UID=10 returns "A", _UID=11 returns "B", etc.
+             * Parse base 16 — single-digit UIDs (0-9) match both bases. */
+            ULONG val = 0;
+            if (NT_SUCCESS(RtlUnicodeStringToInteger(&us, 16, &val))) {
+                uid = val;
+            }
+            ExFreePool((PVOID)instId);
+        }
+    }
+
+    IoFreeIrp(irp);
+    ObDereferenceObject(topDev);
+    return uid;
 }

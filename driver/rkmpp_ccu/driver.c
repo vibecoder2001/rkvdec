@@ -102,7 +102,7 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
     UNREFERENCED_PARAMETER(ResourcesRaw);
 
     UINT32 hid = RkMppCcuReadHid(Device);
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkmpp_ccu: PrepareHardware HID=RKCP%04x\n", hid);
 
     ULONG count = WdfCmResourceListGetCount(ResourcesTranslated);
@@ -121,7 +121,7 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
                  * mapping live so the address space is reserved. */
                 g_rdcc_mmio     = (volatile UCHAR*)base;
                 g_rdcc_mmio_len = d->u.Memory.Length;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                            "rkmpp_ccu: RDCC coord mapped @ %p len 0x%Ix\n",
                            base, g_rdcc_mmio_len);
 
@@ -140,7 +140,7 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
                 }
                 g_cru_mmio     = (volatile UCHAR*)cruVa;
                 g_cru_mmio_len = RKMPP_CCU_CRU_MAP_LENGTH;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                            "rkmpp_ccu: system CRU mapped @ %p (phys 0x%llx)\n",
                            cruVa, (unsigned long long)cruPhys.QuadPart);
 
@@ -161,7 +161,7 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
                 }
                 g_pmu_mmio     = (volatile UCHAR*)pmuVa;
                 g_pmu_mmio_len = RKMPP_PMU_MAP_LENGTH;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                            "rkmpp_ccu: PMU mapped @ %p (phys 0x%llx)\n",
                            pmuVa, (unsigned long long)pmuPhys.QuadPart);
             } else {
@@ -170,7 +170,7 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
                  * the g_cru_mmio == NULL guards in ccu.c.
                  */
                 MmUnmapIoSpace(base, d->u.Memory.Length);
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                            "rkmpp_ccu: HID %04x — RDCC not managed, skipped\n",
                            hid);
             }
@@ -236,7 +236,7 @@ RkMppCcuEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
                                       &device);
     if (!NT_SUCCESS(status)) return status;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkmpp_ccu: device added\n");
 
     return RkMppCcuRegisterIfc(device);

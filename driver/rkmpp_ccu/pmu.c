@@ -146,7 +146,7 @@ NTSTATUS RkMppPmuPowerOn(_In_ const RKMPP_PMU_DOMAIN *D)
     /* Step 2: wait for is-on status. */
     for (ULONG i = 0; i < 10000; i++) {
         if (PmuDomainIsOn(D)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "rkmpp_ccu: PD pwrBit=0x%x powered on after %u µs\n",
                        D->PwrBit, i);
             goto powered_on;
@@ -158,25 +158,64 @@ NTSTATUS RkMppPmuPowerOn(_In_ const RKMPP_PMU_DOMAIN *D)
     return STATUS_DEVICE_HARDWARE_ERROR;
 
 powered_on:
-    /* Step 3: if domain has bus-idle handshake, deassert it now. */
+    /* Step 3: if domain has bus-idle handshake, deassert it now.
+     *
+     * Linux rockchip_pmu_set_idle_request short-circuits when the bus is
+     * already in the target state (is_idle == idle).  Replicate that —
+     * after a stuck previous attempt the PMU may report bus-not-idle even
+     * though req is still asserted, in which case we should NOT issue the
+     * deassert (it'd just stick the ack again). */
     if (D->IdleReqOffset == 0) return STATUS_SUCCESS;
+
+    {
+        ULONG idle_st = READ_REGISTER_ULONG(
+            (volatile ULONG*)(g_pmu_mmio + D->IdleStOffset));
+        if ((idle_st & D->IdleStBit) == 0) {
+            /* Bus already not idle — nothing to do. */
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkmpp_ccu: PD pwrBit=0x%x bus already active\n",
+                       D->PwrBit);
+            return STATUS_SUCCESS;
+        }
+    }
 
     PmuHiwordWrite(D->IdleReqOffset, D->IdleReqBit, 0);
 
-    /* Wait for ack to clear (Linux: target_ack=0 when idle=false). */
-    for (ULONG i = 0; i < 1000; i++) {
+    /* Wait for ack to clear (Linux: target_ack=0 when idle=false).
+     * Linux uses readx_poll_timeout_atomic(... 10000) — a 10 ms budget. */
+    for (ULONG i = 0; i < 10000; i++) {
         ULONG ack = READ_REGISTER_ULONG(
             (volatile ULONG*)(g_pmu_mmio + D->IdleAckOffset));
         if ((ack & D->IdleAckBit) == 0) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "rkmpp_ccu: PD pwrBit=0x%x bus active after %u µs\n",
                        D->PwrBit, i);
             return STATUS_SUCCESS;
         }
         KeStallExecutionProcessor(1);
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-               "rkmpp_ccu: bus-idle-ack timeout (PD pwrBit=0x%x)\n", D->PwrBit);
+
+    /* Diagnostic dump on timeout — read PMU/CRU state so we can see what's
+     * actually happening rather than guessing.  We dump:
+     *   - PMU pwr_gate_con (0x14C), idle_req (0x10C), ack (0x118), idle_st (0x120)
+     *   - PMU repair_status (0x290) and status (0x180)
+     *   - CRU clkgate_con(40)/(41)/(44) (0x8A0/0x8A4/0x8B0)
+     *   - CRU clksel_con(89) (0x4A4)
+     *   - CRU softrst_con(40)/(41) (0xAA0/0xAA4)
+     * The CRU map lives in ccu.c — pmu.c only sees g_pmu_mmio, so we dump
+     * just PMU state here and let the caller log CRU. */
+    {
+        ULONG req = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x10C));
+        ULONG ack = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x118));
+        ULONG ist = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x120));
+        ULONG pwr = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x14C));
+        ULONG sta = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x180));
+        ULONG rep = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x290));
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: bus-idle-ack timeout (PD pwrBit=0x%x) "
+                   "REQ=0x%08x ACK=0x%08x IST=0x%08x PWR=0x%08x STA=0x%08x REP=0x%08x\n",
+                   D->PwrBit, req, ack, ist, pwr, sta, rep);
+    }
     return STATUS_DEVICE_HARDWARE_ERROR;
 }
 
@@ -188,7 +227,7 @@ NTSTATUS RkMppPmuPowerOff(_In_ const RKMPP_PMU_DOMAIN *D)
     if (D->IdleReqOffset != 0) {
         PmuHiwordWrite(D->IdleReqOffset, D->IdleReqBit, D->IdleReqBit);
 
-        for (ULONG i = 0; i < 1000; i++) {
+        for (ULONG i = 0; i < 10000; i++) {
             ULONG ack = READ_REGISTER_ULONG(
                 (volatile ULONG*)(g_pmu_mmio + D->IdleAckOffset));
             if ((ack & D->IdleAckBit) != 0) goto bus_idled;

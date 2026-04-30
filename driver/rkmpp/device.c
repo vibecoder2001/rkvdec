@@ -149,7 +149,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         NTSTATUS intStatus = WdfInterruptCreate(
             Device, &intCfg, &intAttr, &ctx->JobQueue.Interrupt);
         if (!NT_SUCCESS(intStatus)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "rkmpp: WdfInterruptCreate failed 0x%08x\n",
                        intStatus);
             /* Non-fatal in Phase 3a — Phase 3b real-kick path makes it fatal. */
@@ -172,7 +172,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         RkMppCloseIfcs(&ctx->Ifcs);
         return STATUS_REVISION_MISMATCH;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkmpp: ifcs opened (iommu v%u, ccu v%u)\n",
                ctx->Ifcs.Iommu.Header.Version, ctx->Ifcs.Ccu.Header.Version);
 
@@ -223,7 +223,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
             (volatile ULONG*)((PUCHAR)ctx->MmioBase + p->RevisionRegOffset));
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkmpp: HID=RKCP%04x UID=%u rev=0x%08x codecs=0x%08x\n",
                ctx->Hid, ctx->Uid, ctx->RevisionWord, ctx->SupportedCodecs);
     return STATUS_SUCCESS;
@@ -423,7 +423,7 @@ RkMppOnIommuFault(_In_ PVOID   ClientCookie,
     InterlockedExchange((LONG*)&ctx->FaultStatusReg, (LONG)StatusReg);
     InterlockedExchange((LONG*)&ctx->FaultTriggered, 1);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkmpp: IOMMU fault iova=0x%llx status=0x%lx\n",
                (unsigned long long)FaultIova, (unsigned long)StatusReg);
 }

@@ -76,6 +76,27 @@
 #define RDCC_CRU_CLKGATE_CON44   0x8B0u  /* VDPU root clocks: aclk/aclk_low/hclk */
 #define RDCC_CRU_SOFTRST_CON40   0xAA0u
 #define RDCC_CRU_SOFTRST_CON41   0xAA4u
+#define RDCC_CRU_SOFTRST_CON44   0xAB0u  /* VDPU NIU resets at bits 4..6 */
+
+/* CLKSEL_CON(89) = 0x300 + 89*4 = 0x464 — rkvdec0 root clock muxes/dividers.
+ * Per linux-rockchip clk-rk3588.c the COMPOSITE clocks for aclk_rkvdec_ccu,
+ * aclk_rkvdec0_root and hclk_rkvdec0_root all share this register:
+ *
+ *   [15:14] aclk_rkvdec_ccu  mux  (gpll|cpll|aupll|spll)   → 0 = GPLL
+ *   [13:9 ] aclk_rkvdec_ccu  div  (actual_div − 1)          → 1 = /2 (594 MHz)
+ *   [8:7  ] aclk_rkvdec0_root mux (gpll|cpll|aupll|spll)   → 0 = GPLL
+ *   [6:2  ] aclk_rkvdec0_root div (actual_div − 1)          → 1 = /2 (594 MHz)
+ *   [1:0  ] hclk_rkvdec0_root mux (200m|100m|50m|24m)       → 0 = 200 MHz
+ *
+ * Without this, ACLK_RKVDEC_CCU comes out of reset with an unconfigured mux
+ * and the clock never actually ticks even after we ungate the gate bit.  The
+ * rkvdec0 NIU then can't advance its bus-idle FSM and our PMU idle-deassert
+ * never gets an ack.
+ *
+ * Hi-word-mask write: full 16-bit field set, value 0x0204 (bits 9 + 2). */
+#define RDCC_CRU_CLKSEL_CON89    0x464u
+#define RDCC_CRU_CLKSEL_CON89_MASK   0xFFFFu
+#define RDCC_CRU_CLKSEL_CON89_VALUE  0x0204u
 
 typedef struct _RDCC_REGS {
     ULONG ClkGateCon44;     /* VDPU root clocks (must be on before PD_VDPU) */
@@ -88,6 +109,8 @@ typedef struct _RDCC_REGS {
     ULONG SoftRstCon40Mask;
     ULONG SoftRstCon41;
     ULONG SoftRstCon41Mask;
+    ULONG SoftRstCon44;
+    ULONG SoftRstCon44Mask;
 } RDCC_REGS;
 
 /* Clock + reset masks per linux-rockchip clk-rk3588.c gate descriptor table.
@@ -100,7 +123,16 @@ typedef struct _RDCC_REGS {
  * CORE bit (CON40 bit 9, CON41 bit 8). */
 static const RDCC_REGS g_rdcc = {
     .ClkGateCon44     = RDCC_CRU_CLKGATE_CON44,
-    .ClkGateCon44Mask = 0x00000007u,  /* VDPU root: aclk(0), aclk_low(1), hclk(2) */
+    .ClkGateCon44Mask = 0x00000077u,  /* VDPU root  bits 0..2 (aclk/aclk_low/hclk)
+                                       * + VDPU NIU bits 4..6 (aclk/aclk_low/hclk_NIU)
+                                       * The NIU bits sit between PD_VDPU and the
+                                       * downstream PDs (RKVDEC0/1, IEP, RGA, etc.);
+                                       * the rkvdec0 idle-ack travels through the
+                                       * VDPU NIU, so its clocks must run for the
+                                       * handshake FSM to advance.  Per
+                                       * edk2-rk3588 RK3588.h: ACLK_VDPU_NIU_GATE=708,
+                                       * ACLK_VDPU_LOW_NIU_GATE=709, HCLK_VDPU_NIU_GATE=710
+                                       * → CLKGATE_CON(44) bits 4,5,6.            */
     .ClkGateCon40     = RDCC_CRU_CLKGATE_CON40,
     .ClkGateCon40Mask = 0x000003FFu,  /* bits 0..4,7,8,9 = 0x39F; mask 0x3FF
                                        * also covers 5,6 to be safe         */
@@ -110,6 +142,8 @@ static const RDCC_REGS g_rdcc = {
     .SoftRstCon40Mask = 0x000003FCu,  /* bits 2..9 — CCU + rkvdec0 group    */
     .SoftRstCon41     = RDCC_CRU_SOFTRST_CON41,
     .SoftRstCon41Mask = 0x000001FCu,  /* bits 2..8 — rkvdec1 group          */
+    .SoftRstCon44     = RDCC_CRU_SOFTRST_CON44,
+    .SoftRstCon44Mask = 0x00000070u,  /* bits 4..6 — VDPU NIU resets        */
 };
 
 /* Single-bit masks for the CORE reset (used by AssertCoreReset /
@@ -173,6 +207,12 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
     /* Ungate VDPU root clocks BEFORE PD_VDPU's bus-idle handshake. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44, g_rdcc.ClkGateCon44Mask, 0);
 
+    /* Deassert VDPU NIU resets (CON44 bits 4..6).  The VDPU NIU sits between
+     * PD_VDPU and downstream PDs (RKVDEC0/1, IEP, RGA, ...).  UEFI leaves
+     * these asserted; downstream codec MMIO reads SError on a NIU in reset
+     * even after the rkvdec0 NIU is brought up. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44, g_rdcc.SoftRstCon44Mask, 0);
+
     s = RkMppPmuPowerOn(&g_pdVdpu);
     if (!NT_SUCCESS(s)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -184,13 +224,41 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
         return s;
     }
 
+    /* Configure rkvdec0 root clock muxes/dividers BEFORE ungating gates and
+     * before the PD_RKVDEC0 idle handshake.  ACLK_RKVDEC_CCU's COMPOSITE
+     * mux must select a real PLL parent or the clock won't tick — and the
+     * rkvdec0 NIU needs it ticking to ack idle-deassert.
+     *
+     * In practice UEFI leaves these muxes pointing at valid PLL parents
+     * (mux=0 = SPLL/XIN_OSC0 depending on the field), so this write is
+     * defensive. */
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON89,
+                     RDCC_CRU_CLKSEL_CON89_MASK, RDCC_CRU_CLKSEL_CON89_VALUE);
+
     /* Ungate rkvdec0 cluster clocks BEFORE PD_RKVDEC0 handshake. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40, g_rdcc.ClkGateCon40Mask, 0);
 
+    /* CRITICAL: deassert SOFTRST_CON(40) bits 2..9 BEFORE the PD_RKVDEC0
+     * idle handshake.  UEFI leaves the rkvdec_ccu / rkvdec0 / rkvdec0_NIU
+     * resets ASSERTED (we observed SOFTRST_CON40 = 0x000003fc on probe).
+     * A NIU in reset cannot advance its bus-idle FSM, so the PMU
+     * idle-deassert ack stays stuck — exactly what we were timing out on.
+     *
+     * Originally we deasserted these resets at the *end* of RaiseCluster
+     * (after all PD power-ons), but the rkvdec0 power-on never returns
+     * because of this very issue.  Order matters. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40, g_rdcc.SoftRstCon40Mask, 0);
+
     s = RkMppPmuPowerOn(&g_pdRkvdec0);
     if (!NT_SUCCESS(s)) {
+        ULONG g40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8A0));
+        ULONG g44 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8B0));
+        ULONG s89 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x4A4));
+        ULONG r40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0xAA0));
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkmpp_ccu: PD_RKVDEC0 power-on failed 0x%08x\n", s);
+                   "rkmpp_ccu: PD_RKVDEC0 power-on failed 0x%08x "
+                   "CLKGATE40=0x%08x CLKGATE44=0x%08x CLKSEL89=0x%08x SOFTRST40=0x%08x\n",
+                   s, g40, g44, s89, r40);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                          g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
         RkMppPmuPowerOff(&g_pdVdpu);
@@ -203,6 +271,9 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
 
     /* Ungate rkvdec1 cluster clocks BEFORE PD_RKVDEC1 handshake. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41, g_rdcc.ClkGateCon41Mask, 0);
+
+    /* Same reset-before-handshake fix for rkvdec1 group (CON41 bits 2..8). */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41, g_rdcc.SoftRstCon41Mask, 0);
 
     s = RkMppPmuPowerOn(&g_pdRkvdec1);
     if (!NT_SUCCESS(s)) {
@@ -221,11 +292,8 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
         return s;
     }
 
-    /* Deassert all rkvdec0/1 resets (CCU + bus + cabac + HEVC + core).
-     * UEFI may have left some asserted; deasserting already-deasserted bits
-     * is a no-op so we can do this unconditionally. */
-    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40, g_rdcc.SoftRstCon40Mask, 0);
-    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41, g_rdcc.SoftRstCon41Mask, 0);
+    /* Resets were deasserted earlier (before each PD's idle handshake) —
+     * the NIU has to be out of reset for the PMU bus-idle ack to fire. */
 
     /* Codec MMIO at 0xFDC30000 / 0xFDC38xxx / 0xFDC48xxx is now reachable. */
     return STATUS_SUCCESS;
@@ -256,6 +324,8 @@ NTSTATUS RkMppCcuDropCluster(_In_ PVOID Ctx)
                      g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
 
     RkMppPmuPowerOff(&g_pdVdpu);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44,
+                     g_rdcc.SoftRstCon44Mask, g_rdcc.SoftRstCon44Mask);
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
                      g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
 

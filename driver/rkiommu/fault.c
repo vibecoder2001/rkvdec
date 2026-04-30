@@ -83,7 +83,7 @@ VOID RkIommuEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
            (ULONG64)ctx->FaultCtx.FaultIova,
            ctx->FaultCtx.IntStatus);
     } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkiommu: RKCP%04x UID=%u fault IOVA=0x%08x status=0x%08x"
                    " (no client callback registered)\n",
                    ctx->Hid, ctx->Uid,

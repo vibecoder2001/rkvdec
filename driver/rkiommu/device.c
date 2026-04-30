@@ -137,7 +137,7 @@ NTSTATUS RkIommuEnable(PRKIOMMU_DEVICE Dev)
             (volatile ULONG*)(Dev->MmioBase + RK_MMU_STATUS));
         if ((st & RK_MMU_STATUS_PAGING_ENABLED) != 0) {
             Dev->PagingEnabled = TRUE;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "rkiommu: paging enabled (HID=RKCP%04x UID=%u attempt=%u)\n",
                        Dev->Hid, Dev->Uid, i + 1u);
             return STATUS_SUCCESS;
@@ -219,7 +219,7 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
     InsertTailList(&g_deviceList, &ctx->ListEntry);
     KeReleaseSpinLock(&g_deviceListLock, irql);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkiommu: RKCP%04x UID=%u ready, MMIO=%p PdPhys=0x%08x\n",
                ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PdPhys);
 
@@ -324,7 +324,7 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     }
 #endif
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkiommu: device created\n");
 
     return RkIommuRegisterIfc(device);

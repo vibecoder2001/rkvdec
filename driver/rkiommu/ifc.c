@@ -246,6 +246,21 @@ RkIommuSnapshot(_In_ PVOID ProviderContext,
     return STATUS_SUCCESS;
 }
 
+/* FlushTlb — issue ZAP_CACHE to drain stale TLB entries.  Called by
+ * codec drivers right before each kick (matches BSP rkvdec2_run path).
+ */
+static NTSTATUS
+RkIommuFlushTlb(_In_ PVOID ProviderContext)
+{
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+    if (!dev->PagingEnabled)    return STATUS_SUCCESS;
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG*)(dev->MmioBase + RK_MMU_COMMAND),
+        RK_MMU_CMD_ZAP_CACHE);
+    return STATUS_SUCCESS;
+}
+
 /* ---------------------------------------------------------------------------
  * RkIommuRegisterIfc — called from device.c after WdfDeviceCreate
  * --------------------------------------------------------------------------- */
@@ -279,6 +294,7 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.UnmapMdl                 = RkIommuUnmapMdl;
     ifc.RegisterFaultHandler     = RkIommuRegisterFaultHandler;
     ifc.Snapshot                 = RkIommuSnapshot;
+    ifc.FlushTlb                 = RkIommuFlushTlb;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

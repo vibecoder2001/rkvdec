@@ -296,46 +296,45 @@ extern "C"
 uint32_t H264GetRcbBufferSizes(H264RcbInfo info[RKH264_RCB_COUNT],
                                uint32_t width_px, uint32_t height_px)
 {
-    /* The hardware layout has each RCB sub-region pinned to a specific
-     * register (reg133..reg142).  The BSP sums the sizes in a *different*
-     * order than the register order — DBLK first to keep the largest
-     * region aligned.  But what matters for the codec is that
-     * info[i].offset and info[i].size correspond to *the buffer the codec
-     * will read/write at register 133+i*.  Anything else (e.g. assigning
-     * BSP-order offsets to register-order indices) lets the codec scribble
-     * on a sibling region.  Empirically this manifested as a mid-frame
-     * stall around MB row 3 because reg141 (FBC_ROW, 14080 bytes) was
-     * given only the 2176-byte slot reserved for FBC, then overflowed
-     * into FILT_COL and corrupted deblock state.
+    /* RCB sub-region sizes per the rk3588 BSP device tree
+     * `rockchip,rcb-info` property (rk3588s.dtsi rkvdec0 node):
+     *   <136 24576>, <137 49152>, <141 90112>, <140 49152>,
+     *   <139 180224>, <133 49152>, <134 8192>, <135 4352>,
+     *   <138 13056>, <142 291584>
+     * These are FIXED sizes for any H.264 frame at any resolution that
+     * the rk3588 codec supports (up to its rcb-min-width threshold of
+     * 512px).  Our earlier formula (`coeff * frame_dim`) gave roughly
+     * 1/6 of these sizes — codec wrote past the end of each sub-region
+     * after ~16-25% of frame and faulted the IOMMU.
      *
-     * Solution: enumerate in BSP layout order to compute SUMMED offsets
-     * (largest first, just like BSP), but populate info[] by reg_idx so
-     * that info[i] describes the region for register 133+i. */
-    struct RcbDesc { uint32_t reg_idx; uint32_t coeff; uint8_t use_height; };
+     * Order in the DT property is meaningful: it's the LAYOUT ORDER
+     * within the consolidated RCB buffer (largest first by BSP
+     * convention).  We populate info[] by reg_idx so info[i] describes
+     * the region for register 133+i. */
+    (void)width_px; (void)height_px;
+
+    struct RcbDesc { uint32_t reg_idx; uint32_t size; };
     static const RcbDesc kBspOrder[RKH264_RCB_COUNT] = {
-        {139, 22, 0},   /* DBLK_ROW */
-        {133,  6, 0},   /* INTRA_ROW */
-        {134,  1, 0},   /* TRANSD_ROW */
-        {136,  3, 0},   /* STRMD_ROW */
-        {137,  6, 0},   /* INTER_ROW */
-        {140,  6, 0},   /* SAO_ROW */
-        {141, 11, 0},   /* FBC_ROW */
-        {135,  1, 1},   /* TRANSD_COL */
-        {138,  3, 1},   /* INTER_COL */
-        {142, 67, 1},   /* FILT_COL */
+        {136,  24576},  /* STRMD_ROW */
+        {137,  49152},  /* INTER_ROW */
+        {141,  90112},  /* FBC_ROW   */
+        {140,  49152},  /* SAO_ROW   */
+        {139, 180224},  /* DBLK_ROW  (largest contiguous) */
+        {133,  49152},  /* INTRA_ROW */
+        {134,   8192},  /* TRANSD_ROW */
+        {135,   4352},  /* TRANSD_COL */
+        {138,  13056},  /* INTER_COL */
+        {142, 291584},  /* FILT_COL  */
     };
 
     uint32_t offset = 0;
     for (int i = 0; i < RKH264_RCB_COUNT; i++) {
-        uint32_t dim  = kBspOrder[i].use_height ? height_px : width_px;
-        uint32_t size = align_up(dim * kBspOrder[i].coeff, RCB_ALIGN);
-        /* Slot in info[] by register index — register 133 -> info[0],
-         * 134 -> info[1], ..., 142 -> info[9]. */
+        uint32_t size = align_up(kBspOrder[i].size, RCB_ALIGN);
         uint32_t slot = kBspOrder[i].reg_idx - 133u;
         info[slot].reg_idx = kBspOrder[i].reg_idx;
         info[slot].offset  = offset;
         info[slot].size    = size;
         offset += size;
     }
-    return offset;
+    return offset;  /* ~759 KiB total */
 }

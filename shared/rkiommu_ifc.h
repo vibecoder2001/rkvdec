@@ -65,11 +65,15 @@ typedef NTSTATUS (*RKIOMMU_SNAPSHOT)(
     _In_  PVOID                    ProviderContext,
     _Out_ PRKIOMMU_FAULT_SNAPSHOT  Out);
 
+/* Flush the IOMMU's TLB.  BSP calls this before every codec kick (see
+ * rkvdec2_run -> mpp_iommu_flush_tlb).  Required when the codec reuses
+ * the same iovas across multiple decode sessions; without a pre-kick
+ * flush, stale page-table entries cause the codec to read/write from
+ * obsolete physical addresses. */
+typedef NTSTATUS (*RKIOMMU_FLUSH_TLB)(_In_ PVOID ProviderContext);
+
 typedef struct _RKIOMMU_INTERFACE {
     INTERFACE                Header;
-    /* Identifies this specific rkiommu instance.  Filled by the
-     * provider's QueryInterface handler so the consumer can match
-     * against its topology table. */
     UINT32                   Hid;     /* e.g. 0x3570 / 0x3571 */
     UINT32                   Uid;     /* per-HID instance number */
     RKIOMMU_QUERY_VERSION    QueryVersion;
@@ -77,4 +81,5 @@ typedef struct _RKIOMMU_INTERFACE {
     RKIOMMU_UNMAP_MDL        UnmapMdl;
     RKIOMMU_REGISTER_FAULT   RegisterFaultHandler;
     RKIOMMU_SNAPSHOT         Snapshot;
+    RKIOMMU_FLUSH_TLB        FlushTlb;
 } RKIOMMU_INTERFACE, *PRKIOMMU_INTERFACE;

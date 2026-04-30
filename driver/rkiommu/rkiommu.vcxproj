@@ -42,6 +42,7 @@
     </DriverSign>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="cabac_table.c" />
     <ClCompile Include="device.c" />
     <ClCompile Include="driver.c" />
     <ClCompile Include="fault.c" />

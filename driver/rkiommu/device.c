@@ -117,15 +117,35 @@ NTSTATUS RkIommuEnable(PRKIOMMU_DEVICE Dev)
         (volatile ULONG*)(Dev->MmioBase + RK_MMU_DTE_ADDR),
         Dev->Domain->PdPhys);
 
-    /* 3. Enable auto-gating. */
+    /* 3. Zap any stale TLB cache from a previous session. */
     WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(Dev->MmioBase + RK_MMU_AUTO_GATING),
-        1u);
+        (volatile ULONG*)(Dev->MmioBase + RK_MMU_COMMAND),
+        RK_MMU_CMD_ZAP_CACHE);
 
     /* 4. Enable IRQs. */
     WRITE_REGISTER_ULONG(
         (volatile ULONG*)(Dev->MmioBase + RK_MMU_INT_MASK),
         RK_MMU_IRQ_MASK);
+
+    /* 5. AUTO_GATING workaround.  BSP rockchip-iommu.c rk_iommu_enable
+     * (line 1175) does:
+     *   auto_gate = read(AUTO_GATING);
+     *   auto_gate |= DISABLE_FETCH_DTE_TIME_LIMIT;   // BIT(31)
+     *   write(AUTO_GATING, auto_gate);
+     * The comment is "Workaround for iommu blocked, BIT(31) default to 1".
+     * Without this bit set, the IOMMU's DTE-fetch path can stall mid-decode
+     * and the codec gets phantom AXI failures — observed in our build as
+     * IOMMU faults at low iova at the 25% mark of the frame.  Earlier code
+     * here just wrote `1` to AUTO_GATING (= bit 0 only), missing the
+     * documented quirk fix. */
+    {
+        ULONG ag = READ_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_AUTO_GATING));
+        ag |= (1u << 31);   /* DISABLE_FETCH_DTE_TIME_LIMIT */
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_AUTO_GATING),
+            ag);
+    }
 
     /* Diagnostic: read back DTE_ADDR + STATUS + INT_MASK to verify the
      * MMIO writes above actually landed.  If the IOMMU is mis-clocked, the

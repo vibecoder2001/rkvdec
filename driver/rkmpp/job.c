@@ -204,11 +204,19 @@ have_status:
         ULONG rb_err   = RB(0x034);
         ULONG rb_strln = RB(0x040);
         ULONG rb_rlc   = RB(0x200);
+        ULONG rb_decout= RB(0x208);     /* idx 130 DECOUT_BASE */
+        ULONG rb_pps   = RB(0x284);     /* idx 161 PPS_BASE */
+        ULONG rb_rps   = RB(0x28c);     /* idx 163 RPS_BASE */
+        ULONG rb_cab   = RB(0x314);     /* idx 197 CABACTBL_BASE */
+        ULONG rb_scan  = RB(0x2d0);     /* idx 180 SCANLIST_ADDR */
 #undef RB
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "  ctrl readback mode=0x%08x dec_e=0x%08x imp=0x%08x "
-                   "sec=0x%08x err=0x%08x strlen=0x%08x rlc=0x%08x\n",
-                   rb_mode, rb_dec_e, rb_imp, rb_sec, rb_err, rb_strln, rb_rlc);
+                   "sec=0x%08x err=0x%08x strlen=0x%08x rlc=0x%08x\n"
+                   "  addr readback decout=0x%08x pps=0x%08x rps=0x%08x "
+                   "cabac=0x%08x scanlist=0x%08x\n",
+                   rb_mode, rb_dec_e, rb_imp, rb_sec, rb_err, rb_strln, rb_rlc,
+                   rb_decout, rb_pps, rb_rps, rb_cab, rb_scan);
 
         /* Ack pending status bits (write-1-to-clear). */
         if (hwStatus) {
@@ -396,22 +404,30 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                    pre[5], pre[6], pre[7], pre[8], pre[9]);
     }
 
-    /* Configure the rkvdec2 internal AXI read caches.  BSP rkvdec2_run
-     * (mpp_rkvdec2.c:415) writes these BEFORE the kick:
+    /* Configure the rkvdec2 internal AXI read caches.  BSP `rkvdec2_run`
+     * (mpp_rkvdec2.c:344-350) writes these BEFORE the kick:
      *   CACHE_PERMIT_CACHEABLE (bit 0) | READ_ALLOCATE (bit 1) |
-     *   LINE_SIZE_64_BYTES (bit 4) = 0x13
-     * Without this the IP doesn't actually start decoding — manifests
-     * as INT_STATUS=0 forever after dec_e=1, even though kick is
-     * latched. */
-    if (mmioLen >= 0x600) {
+     *   LINE_SIZE_64_BYTES (bit 4) = 0x13.
+     *
+     * The BSP-relative offsets are 0x51c (CACHE0_SIZE) etc., where the
+     * BSP MMIO base is 0xfdc38100 (already past the cluster-link prefix).
+     * Our ACPI MMIO base is 0xfdc38000 (without the prefix), so we must
+     * add RKVDEC2_SWREG_BASE (0x100) to land at the same physical
+     * address.  Earlier code was writing at the un-prefixed offsets,
+     * stomping on swreg slots ~260 instead of the actual cache regs —
+     * codec was running with cache config = whatever those swreg writes
+     * left behind (i.e., not the 0x13 we intended). */
+    if (mmioLen >= RKVDEC2_SWREG_BASE + 0x600) {
         const ULONG cache_cfg = 0x13;
-        WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)mmio + 0x51c), cache_cfg);
-        WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)mmio + 0x55c), cache_cfg);
-        WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)mmio + 0x59c), cache_cfg);
+#define CACHE_OFF(o) ((PUCHAR)mmio + RKVDEC2_SWREG_BASE + (o))
+        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x51c), cache_cfg);
+        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x55c), cache_cfg);
+        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x59c), cache_cfg);
         /* clear caches */
-        WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)mmio + 0x510), 1);
-        WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)mmio + 0x550), 1);
-        WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)mmio + 0x590), 1);
+        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x510), 1);
+        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x550), 1);
+        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x590), 1);
+#undef CACHE_OFF
     }
 
     /* Validate every (shifted) offset is in-range BEFORE issuing any MMIO
@@ -444,6 +460,18 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         WRITE_REGISTER_ULONG(
             (volatile ULONG *)((PUCHAR)mmio + w->Offset + RKVDEC2_SWREG_BASE),
             w->Value);
+    }
+
+    /* Flush the IOMMU's TLB right before the kick — matches BSP
+     * rkvdec2_run -> mpp_iommu_flush_tlb.  Stale TLB entries from a
+     * previous decode session caused the codec to read/write at obsolete
+     * physical addresses (manifested as fault iovas in the 0xae0..0xe00
+     * range). */
+    {
+        PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(Device);
+        if (iommu && iommu->FlushTlb) {
+            iommu->FlushTlb(iommu->Header.Context);
+        }
     }
 
     if (hasKick) {

@@ -96,6 +96,33 @@ NTSTATUS RkIommuDomainCreate(PRKIOMMU_DOMAIN *Domain)
      * IOMMU and let the driver report the bad iova. */
     d->IovaBitmap[0] |= (ULONG_PTR)1;
 
+    /* Don't map iova page 0 — empirically, mapping iova 0 (zero-filled
+     * OR CABAC-loaded) makes the codec abort via INT bit 4 immediately
+     * with dec_e=1 stuck.  Without it the codec progresses ~3-11 MB
+     * rows before IOMMU-faulting at iova 0xae0..0xe00.  Neither is a
+     * win, but the latter is more debuggable. */
+
+    /* Reserve the BSP-prescribed RCB-SRAM IOVA range:
+     *   rk3588s.dtsi rkvdec0 node has
+     *     rockchip,rcb-iova = <0xFFF00000 0x100000>;
+     * BSP also iommu_maps that range to on-chip SRAM for the codec's
+     * internal RCB scratch.  The codec hardware seems to use this iova
+     * internally regardless of what we write to reg133..142.  When our
+     * top-down allocator placed another buffer (e.g. the bitstream) at
+     * 0xFFF00000, the codec stomped it and eventually faulted.  Reserve
+     * the range to keep other allocations away from it.  TODO: also map
+     * 1 MiB of contiguous DRAM to this iova range so codec writes there
+     * succeed silently instead of faulting. */
+    {
+        const ULONG kRcbPage  = 0xFFF00000u / RK_IOMMU_PAGE_SIZE;
+        const ULONG kRcbCount = 0x00100000u / RK_IOMMU_PAGE_SIZE;
+        const ULONG kBpw      = (ULONG)(sizeof(ULONG_PTR) * 8);
+        for (ULONG p = kRcbPage; p < kRcbPage + kRcbCount &&
+                                 p < RK_IOMMU_IOVA_PAGES; p++) {
+            d->IovaBitmap[p / kBpw] |= (ULONG_PTR)1 << (p % kBpw);
+        }
+    }
+
     *Domain = d;
     return STATUS_SUCCESS;
 }
@@ -151,24 +178,30 @@ NTSTATUS RkIommuAllocIova(PRKIOMMU_DOMAIN Domain, ULONG PageCount,
     ULONG run   = 0;    /* current consecutive-clear-bit count */
     ULONG start = 0;    /* bit index where the current run started */
 
-    for (ULONG w = 0; w < totalWords; w++) {
+    /* Scan TOP-DOWN to match BSP's allocation strategy.  BSP gives the
+     * first dma-heap allocation iova ~0xFFDC0000 and walks down from
+     * there.  Our codec was faulting at low iovas in the 0xae0..0xe00
+     * range; it's plausible the codec hardware masks high bits of some
+     * register when the value is in the low-iova range, so allocations
+     * in the high range avoid that quirk. */
+    for (LONG w = (LONG)totalWords - 1; w >= 0; w--) {
         ULONG_PTR word = Domain->IovaBitmap[w];
 
-        for (ULONG b = 0; b < bitsPerWord; b++) {
-            ULONG bitIdx = w * bitsPerWord + b;
+        for (LONG b = (LONG)bitsPerWord - 1; b >= 0; b--) {
+            ULONG bitIdx = (ULONG)w * bitsPerWord + (ULONG)b;
 
             if (!(word & ((ULONG_PTR)1 << b))) {
-                /* This bit is clear (free) */
-                if (run == 0) start = bitIdx;
+                /* free bit — extend the descending run */
+                if (run == 0) start = bitIdx;       /* highest free bit  */
                 run++;
                 if (run == PageCount) {
-                    /* Found a suitable run — mark it as allocated */
-                    for (ULONG k = start; k < start + PageCount; k++) {
+                    ULONG base = bitIdx;            /* lowest bit in run */
+                    for (ULONG k = base; k < base + PageCount; k++) {
                         ULONG kw = k / bitsPerWord;
                         ULONG kb = k % bitsPerWord;
                         Domain->IovaBitmap[kw] |= (ULONG_PTR)1 << kb;
                     }
-                    *OutIova = (ULONG64)start * RK_IOMMU_PAGE_SIZE;
+                    *OutIova = (ULONG64)base * RK_IOMMU_PAGE_SIZE;
                     return STATUS_SUCCESS;
                 }
             } else {

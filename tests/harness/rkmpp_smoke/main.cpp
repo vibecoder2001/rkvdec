@@ -23,11 +23,10 @@ void BuildNoopJob(UINT64 scratchHandle, RKMPP_SUBMIT_JOB_IN *out)
     out->StructSize    = sizeof(*out);
     out->TimeoutMs     = 1000;
 
-    /* Phase 2 software-completion: a single harmless write to a known-unused
-     * scratch offset.  Phase 3 replaces this with the real H.264 register list. */
-    out->RegWriteCount = 1;
-    out->Writes[0].Offset = 0xfff8;
-    out->Writes[0].Value  = 0;
+    /* No register writes — exercises the alloc/submit/wait/free
+     * plumbing without touching codec MMIO.  The kernel completes
+     * empty / no-kick jobs immediately (no dec_e=1 in the list). */
+    out->RegWriteCount = 0;
 
     out->BufRefCount = 1;
     out->BufRefs[0].BufferHandle = scratchHandle;
@@ -100,6 +99,92 @@ int wmain()
             std::printf("caps: HID=RKCP%04x UID=%u rev=0x%08x codecs=0x%08x\n",
                         caps.Hid, caps.Uid, caps.RevisionWord, caps.SupportedCodecs);
         }
+    }
+
+    /* Phase 3b-4: verify iova-handle substitution.  Allocate a buffer,
+     * submit a job with one plain write and one substituted write, peek
+     * the queued job, confirm the substituted value resolves to the
+     * buffer's iova plus the requested offset. */
+    {
+        RKMPP_ALLOC_BUFFER_IN  ain{};
+        RKMPP_ALLOC_BUFFER_OUT aout{};
+        ain.StructSize = sizeof(ain);
+        ain.Size       = 4096;
+        ain.Usage      = RkMppBufferUsageScratch;
+        DWORD got = 0;
+        if (!DeviceIoControl(h, IOCTL_RKMPP_ALLOC_BUFFER, &ain, sizeof(ain),
+                             &aout, sizeof(aout), &got, nullptr))
+        {
+            std::fprintf(stderr, "subst-test ALLOC failed: %lu\n",
+                         GetLastError());
+            CloseHandle(h);
+            return 30;
+        }
+
+        const UINT32 plainValue   = 0xDEADBEEFu;
+        const UINT32 substOffset  = 0x40u;
+        const UINT32 expectedSubst = (UINT32)(aout.Iova + substOffset);
+
+        RKMPP_SUBMIT_JOB_IN  sin{};
+        RKMPP_SUBMIT_JOB_OUT sout{};
+        sin.StructSize    = sizeof(sin);
+        sin.RegWriteCount = 2;
+        sin.TimeoutMs     = 1000;
+        sin.Writes[0].Offset = 0xfff8;
+        sin.Writes[0].Value  = plainValue;
+        sin.Writes[1].Offset = 0xfffc;
+        sin.Writes[1].Value  = 0;            /* must be overwritten */
+        sin.Writes[1].BufferHandle = aout.BufferHandle;
+        sin.Writes[1].IovaOffset   = substOffset;
+
+        if (!DeviceIoControl(h, IOCTL_RKMPP_SUBMIT_JOB, &sin, sizeof(sin),
+                             &sout, sizeof(sout), &got, nullptr))
+        {
+            std::fprintf(stderr, "subst-test SUBMIT failed: %lu\n",
+                         GetLastError());
+            CloseHandle(h);
+            return 31;
+        }
+
+        RKMPP_PEEK_JOB_IN  pin{};
+        RKMPP_PEEK_JOB_OUT pout{};
+        pin.JobId = sout.JobId;
+        if (!DeviceIoControl(h, IOCTL_RKMPP_PEEK_JOB, &pin, sizeof(pin),
+                             &pout, sizeof(pout), &got, nullptr))
+        {
+            std::fprintf(stderr, "subst-test PEEK failed: %lu\n",
+                         GetLastError());
+            CloseHandle(h);
+            return 32;
+        }
+        if (pout.RegWriteCount != 2 ||
+            pout.Writes[0].Value != plainValue ||
+            pout.Writes[1].Value != expectedSubst)
+        {
+            std::fprintf(stderr,
+                "subst-test mismatch: plain=0x%08x (want 0x%08x)  "
+                "subst=0x%08x (want 0x%08x  iova=0x%llx + 0x%x)\n",
+                pout.Writes[0].Value, plainValue,
+                pout.Writes[1].Value, expectedSubst,
+                aout.Iova, substOffset);
+            CloseHandle(h);
+            return 33;
+        }
+        std::printf("subst-test OK: plain=0x%08x  iova-subst=0x%08x\n",
+                    pout.Writes[0].Value, pout.Writes[1].Value);
+
+        /* Drain the job and free the buffer so the iteration loop below
+         * starts from a clean state. */
+        RKMPP_WAIT_JOB_IN  win{};
+        RKMPP_WAIT_JOB_OUT wout{};
+        win.JobId = sout.JobId;
+        win.TimeoutMs = 1000;
+        DeviceIoControl(h, IOCTL_RKMPP_WAIT_JOB, &win, sizeof(win),
+                        &wout, sizeof(wout), &got, nullptr);
+        RKMPP_FREE_BUFFER_IN fin{};
+        fin.BufferHandle = aout.BufferHandle;
+        DeviceIoControl(h, IOCTL_RKMPP_FREE_BUFFER, &fin, sizeof(fin),
+                        nullptr, 0, &got, nullptr);
     }
 
     /* Phase 3a: 100-iteration alloc/submit/wait/reread/free loop. Each

@@ -1,0 +1,3 @@
+add_executable(regbuilder_test regbuilder_test.cpp)
+target_link_libraries(regbuilder_test PRIVATE rkmpp_mft)
+add_test(NAME regbuilder_test COMMAND regbuilder_test)

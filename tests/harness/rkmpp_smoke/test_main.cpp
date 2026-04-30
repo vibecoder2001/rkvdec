@@ -14,7 +14,7 @@ int main()
     BuildNoopJob(0xCAFEBABEDEADBEEFull, &job);
 
     if (job.StructSize != sizeof(job)) return Fail("StructSize wrong");
-    if (job.RegWriteCount == 0)        return Fail("expected >= 1 reg write");
+    if (job.RegWriteCount != 0)        return Fail("expected zero reg writes (Phase 3b no-op)");
     if (job.BufRefCount   != 1)        return Fail("expected 1 buf ref");
     if (job.BufRefs[0].BufferHandle != 0xCAFEBABEDEADBEEFull)
         return Fail("buf ref handle wrong");

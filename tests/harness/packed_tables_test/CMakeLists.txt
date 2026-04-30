@@ -1,0 +1,3 @@
+add_executable(packed_tables_test packed_tables_test.cpp)
+target_link_libraries(packed_tables_test PRIVATE rkmpp_mft)
+add_test(NAME packed_tables_test COMMAND packed_tables_test)

@@ -17,6 +17,15 @@ option(RKMPP_HARNESS_TESTS "Build the host-runnable unit tests" ${_default_tests
 
 message(STATUS "rkmpp_harness: target=${CMAKE_VS_PLATFORM_NAME} host=${CMAKE_HOST_SYSTEM_PROCESSOR} tests=${RKMPP_HARNESS_TESTS}")
 
+# Pull in the user-mode helper library (parser_glue, regbuilder, …).
+add_subdirectory(${CMAKE_SOURCE_DIR}/../../mft ${CMAKE_BINARY_DIR}/mft)
+
 add_subdirectory(rkmpp_caps_dump)
 add_subdirectory(rkmpp_smoke)
 add_subdirectory(rkmpp_iommu_fault)
+add_subdirectory(parser_test)
+add_subdirectory(regbuilder_test)
+add_subdirectory(packed_tables_test)
+add_subdirectory(dpb_test)
+add_subdirectory(rkmpp_decode)
+add_subdirectory(mp4_extract)

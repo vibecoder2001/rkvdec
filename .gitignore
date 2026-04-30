@@ -26,3 +26,7 @@ Makefile
 .vs/
 .vscode/
 *.code-workspace
+# Test fixtures generated locally — may have copyright issues
+tests/data/*.h264
+tests/data/*.yuv
+tests/data/*.mp4

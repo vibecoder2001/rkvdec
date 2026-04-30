@@ -127,6 +127,23 @@ NTSTATUS RkIommuEnable(PRKIOMMU_DEVICE Dev)
         (volatile ULONG*)(Dev->MmioBase + RK_MMU_INT_MASK),
         RK_MMU_IRQ_MASK);
 
+    /* Diagnostic: read back DTE_ADDR + STATUS + INT_MASK to verify the
+     * MMIO writes above actually landed.  If the IOMMU is mis-clocked, the
+     * read returns 0xFFFFFFFF or stale; if DTE_ADDR readback != PdPhys,
+     * the IOMMU isn't in our page table. */
+    {
+        ULONG dteRb  = READ_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_DTE_ADDR));
+        ULONG statRb = READ_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_STATUS));
+        ULONG maskRb = READ_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + RK_MMU_INT_MASK));
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkiommu: pre-enable readback HID=RKCP%04x UID=%u "
+                   "DTE_ADDR=0x%08x (want 0x%08x) STATUS=0x%08x INT_MASK=0x%08x\n",
+                   Dev->Hid, Dev->Uid, dteRb, Dev->Domain->PdPhys, statRb, maskRb);
+    }
+
     /* 5. Enable paging.  With cmd-retry: write up to 3 times, polling status. */
     ULONG attempts = Dev->FlagEnableCmdRetry ? 3u : 1u;
     for (ULONG i = 0; i < attempts; i++) {
@@ -247,15 +264,16 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
     InitializeListHead(&ctx->ListEntry);
     KeReleaseSpinLock(&g_deviceListLock, irql);
 
-    /* Disable IOMMU if it was enabled */
-    if (ctx->PagingEnabled && ctx->MmioBase) {
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(ctx->MmioBase + RK_MMU_INT_MASK), 0u);
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(ctx->MmioBase + RK_MMU_COMMAND),
-            RK_MMU_CMD_DISABLE_PAGING);
-        ctx->PagingEnabled = FALSE;
-    }
+    /* Do NOT touch MMIO here.  By the time EvtReleaseHardware runs (driver
+     * uninstall, surprise-removal, sleep), the codec power-domain that gates
+     * this IOMMU's MMIO may already have been torn down by the rkmpp / ccu
+     * stack — touching the registers in that window trips a synchronous
+     * external abort and bugcheck 0x124 (WHEA_UNCORRECTABLE_ERROR, sub 0x12).
+     *
+     * The page-table RAM is freed by RkIommuDomainDestroy below, and the
+     * IOMMU hardware state is reset by RkIommuEnable on the next load, so
+     * skipping the disable-paging / int-mask writes here costs nothing. */
+    ctx->PagingEnabled = FALSE;
 
     if (ctx->Domain) {
         RkIommuDomainDestroy(ctx->Domain);
@@ -301,16 +319,31 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     RtlZeroMemory(ctx, sizeof(*ctx));
     InitializeListHead(&ctx->ListEntry);
 
-    /* Phase 3a-debug: SKIP WdfInterruptCreate.  Hypothesis: an unexpected
-     * IOMMU IRQ is firing ~100ms after rkmpp's RaiseCluster, the ISR runs
-     * at DIRQL, touches MMIO that's not actually reachable for some reason,
-     * and SErrors → WHEA before any DPC can log.  Dropping the IRQ wiring
-     * means hardware faults silently for now (no fault dispatch), but
-     * Phase 2 ran fine without ISRs and we don't need real fault recovery
-     * until Phase 3b's hardware kick path lands.
+    /* Read ACPI _HID/_UID up front so RkIommuRegisterIfc below publishes
+     * the correct (Hid, Uid) in the in-kernel interface struct.  WDF
+     * snapshots the interface contents at AddQueryInterface time, so
+     * filling these in later (e.g. from EvtPrepareHardware) is too late —
+     * consumers would see Hid=0/Uid=0 and the topology match in
+     * rkmpp/ifc_client.c would never succeed. */
+    {
+        NTSTATUS sId = RkIommuReadAcpiId(device, &ctx->Hid, &ctx->Uid);
+        if (!NT_SUCCESS(sId)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkiommu: early ACPI ID read failed (0x%08x)\n", sId);
+            return sId;
+        }
+    }
+
+    /* Wire the IOMMU fault interrupt.  Phase 3a saw spurious WHEA-ing on
+     * IRQ entry, but that was a symptom of the broader codec MMIO gating
+     * issue (the ISR touched not-yet-clocked MMIO).  With Phase 3b's
+     * cluster bring-up landed (REVISION reads cleanly), the path is safe.
      *
-     * If rkmpp now reaches STEP 71 (REVISION read OK), this is the source. */
-#if 0
+     * Note: per the BSP DSD `rockchip,master-handle-irq = 1`, RD0M/RD1M's
+     * fault interrupts are routed to the master rkvdec core's IRQ rather
+     * than the IOMMU's own line.  The vector here may therefore never
+     * fire for those instances; that's expected, not a bug.  Other IOMMU
+     * UIDs (VPMU, JDMU, ...) follow the standard path. */
     WDF_INTERRUPT_CONFIG intCfg;
     WDF_INTERRUPT_CONFIG_INIT(&intCfg, RkIommuEvtIsr, RkIommuEvtDpc);
 
@@ -320,9 +353,10 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkiommu: WdfInterruptCreate failed (0x%08x)\n", status);
-        return status;
+        /* Non-fatal: many of our IOMMU instances will never fire an IRQ
+         * (master-handle-irq), so refusing to load on this would deny
+         * service for the working ones.  Continue without an ISR. */
     }
-#endif
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkiommu: device created\n");

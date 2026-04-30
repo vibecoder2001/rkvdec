@@ -58,3 +58,11 @@ NTSTATUS RkMppBufFree(_In_ WDFFILEOBJECT File, _In_ UINT64 Cookie);
 
 /* Free every buffer on the file-object's list (called from EvtFileCleanup). */
 VOID RkMppBufFreeAll(_In_ WDFFILEOBJECT File);
+
+/* Look up a buffer by cookie within the file's allocation list and return
+ * its iova + size.  STATUS_NOT_FOUND if the cookie is unknown.  Used by
+ * RkMppJobSubmit for register-list iova substitution. */
+NTSTATUS RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
+                            _In_ UINT64 Cookie,
+                            _Out_ UINT64 *OutIova,
+                            _Out_ ULONG  *OutSize);

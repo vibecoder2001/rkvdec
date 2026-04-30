@@ -65,27 +65,21 @@ static NTSTATUS RkIommuQueryVersion(_Out_ PUINT32 Version)
  * convention but we map the translation directly into PTE flags).
  * --------------------------------------------------------------------------- */
 static NTSTATUS
-RkIommuMapMdl(_In_ PVOID ClientCookie,
+RkIommuMapMdl(_In_ PVOID ProviderContext,
               _In_ PMDL  Mdl,
               _In_ ULONG Role,
               _Out_ PULONG64 Iova)
 {
-    UNREFERENCED_PARAMETER(ClientCookie);
-    /* v1 topology shortcut: ClientCookie is ignored; we use only one IOMMU.
-     * TODO (Phase 3): translate ClientCookie → (Hid, Uid) → IOMMU instance. */
-
-    /* We need the IOMMU device.  With one device, get it from the global list. */
-    KIRQL irql;
-    KeAcquireSpinLock(&g_deviceListLock, &irql);
-    if (IsListEmpty(&g_deviceList)) {
-        KeReleaseSpinLock(&g_deviceListLock, irql);
-        return STATUS_DEVICE_NOT_READY;
-    }
-    PRKIOMMU_DEVICE dev = CONTAINING_RECORD(
-        g_deviceList.Flink, RKIOMMU_DEVICE, ListEntry);
-    KeReleaseSpinLock(&g_deviceListLock, irql);
-
+    /* The first parameter is the per-instance Header.Context the consumer
+     * received in its queried RKIOMMU_INTERFACE.  Consumers MUST pass
+     * `iommu->Header.Context` (not their own device object) so we resolve
+     * back to the specific iommu instance the interface was queried on.
+     * Topology routing depends on this — picking g_deviceList.Flink would
+     * always land in VPMU (UID=0). */
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev) return STATUS_DEVICE_NOT_READY;
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
+    KIRQL irql;
 
     /* Count the pages in the MDL */
     ULONG pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
@@ -140,17 +134,23 @@ RkIommuMapMdl(_In_ PVOID ClientCookie,
 
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
-    /* Phase 3a-debug: the codec/IOMMU MMIO read in rkmpp PrepareHardware was
-     * SErroring even though clocks appeared ungated.  IOMMU MMIO at
-     * 0xFDC38700 lives in the same power domain as the codec at 0xFDC38100,
-     * so RkIommuEnable's writes to DTE_ADDR / COMMAND would WHEA the same
-     * way.  Roll back to the Phase 2 "page tables in RAM, hardware IOMMU
-     * not enabled" stance — smoke's software-completion job doesn't
-     * actually dereference the iova, so this is safe and lets the rest of
-     * the data path validate end-to-end.
-     *
-     * TODO (Phase 3b): figure out the real PMU sequence; once codec MMIO
-     * reads succeed, restore RkIommuEnable. */
+    /* Lazy-enable IOMMU paging on the first MapMdl that places real
+     * data into the address space.  Phase 3a temporarily skipped this
+     * because IOMMU MMIO would WHEA on read before the codec PD was
+     * brought up; Phase 3b's cluster bring-up (0e9ec1e and friends)
+     * fixed that, so the IOMMU at 0xFDC38700 is now reachable.  Without
+     * this call, page tables exist in RAM but the IOMMU hardware never
+     * gets DTE_ADDR / ENABLE_PAGING — rkvdec2 issues AXI reads at our
+     * iovas that no one translates, decode silently never starts. */
+    NTSTATUS enableStatus = RkIommuEnable(dev);
+    if (!NT_SUCCESS(enableStatus)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkiommu: enable failed 0x%08x for first MapMdl\n",
+                   enableStatus);
+        /* Don't roll back the page tables — the consumer can still try
+         * to use the iova if it has its own translation, and the next
+         * MapMdl will retry RkIommuEnable. */
+    }
 
     *Iova = baseIova;
     return STATUS_SUCCESS;
@@ -160,24 +160,14 @@ RkIommuMapMdl(_In_ PVOID ClientCookie,
  * UnmapMdl
  * --------------------------------------------------------------------------- */
 static NTSTATUS
-RkIommuUnmapMdl(_In_ PVOID  ClientCookie,
+RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
                 _In_ ULONG64 Iova)
 {
-    UNREFERENCED_PARAMETER(ClientCookie);
-    /* v1 topology shortcut: same as MapMdl — ignore ClientCookie.
-     * TODO (Phase 3): translate ClientCookie → correct IOMMU instance. */
-
-    KIRQL irql;
-    KeAcquireSpinLock(&g_deviceListLock, &irql);
-    if (IsListEmpty(&g_deviceList)) {
-        KeReleaseSpinLock(&g_deviceListLock, irql);
-        return STATUS_DEVICE_NOT_READY;
-    }
-    PRKIOMMU_DEVICE dev = CONTAINING_RECORD(
-        g_deviceList.Flink, RKIOMMU_DEVICE, ListEntry);
-    KeReleaseSpinLock(&g_deviceListLock, irql);
-
+    /* See RkIommuMapMdl: the consumer passes its iommu->Header.Context. */
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev) return STATUS_DEVICE_NOT_READY;
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
+    KIRQL irql;
 
     /* Determine how many pages are mapped at this IOVA.
      * We stored the page count in the IOVA allocator bitmap; we reconstruct
@@ -219,24 +209,40 @@ RkIommuUnmapMdl(_In_ PVOID  ClientCookie,
  * RegisterFaultHandler
  * --------------------------------------------------------------------------- */
 static NTSTATUS
-RkIommuRegisterFaultHandler(_In_ PVOID                 ClientCookie,
+RkIommuRegisterFaultHandler(_In_ PVOID                 ProviderContext,
+                             _In_ PVOID                 ConsumerContext,
                              _In_ RKIOMMU_FAULT_CALLBACK Callback)
 {
-    /* v1 topology shortcut: register callback on the single IOMMU instance.
-     * TODO (Phase 3): route to the IOMMU that owns this client. */
-
-    KIRQL irql;
-    KeAcquireSpinLock(&g_deviceListLock, &irql);
-    if (IsListEmpty(&g_deviceList)) {
-        KeReleaseSpinLock(&g_deviceListLock, irql);
-        return STATUS_DEVICE_NOT_READY;
-    }
-    PRKIOMMU_DEVICE dev = CONTAINING_RECORD(
-        g_deviceList.Flink, RKIOMMU_DEVICE, ListEntry);
-    KeReleaseSpinLock(&g_deviceListLock, irql);
+    /* ProviderContext = iommu->Header.Context (routes us to the right
+     * iommu instance).  ConsumerContext is opaque — stored verbatim and
+     * handed back to Callback when the IOMMU faults. */
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev) return STATUS_DEVICE_NOT_READY;
 
     dev->FaultCb       = Callback;
-    dev->FaultCbCookie = ClientCookie;
+    dev->FaultCbCookie = ConsumerContext;
+    return STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
+ * Snapshot — read-only sample of fault-related MMIO for post-kick diag.
+ * --------------------------------------------------------------------------- */
+static NTSTATUS
+RkIommuSnapshot(_In_ PVOID ProviderContext,
+                _Out_ PRKIOMMU_FAULT_SNAPSHOT Out)
+{
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+    Out->Status        = READ_REGISTER_ULONG(
+        (volatile ULONG*)(dev->MmioBase + RK_MMU_STATUS));
+    Out->IntRawStat    = READ_REGISTER_ULONG(
+        (volatile ULONG*)(dev->MmioBase + RK_MMU_INT_RAWSTAT));
+    Out->IntStatus     = READ_REGISTER_ULONG(
+        (volatile ULONG*)(dev->MmioBase + RK_MMU_INT_STATUS));
+    Out->PageFaultAddr = READ_REGISTER_ULONG(
+        (volatile ULONG*)(dev->MmioBase + RK_MMU_PAGE_FAULT_ADDR));
+    Out->DteAddr       = READ_REGISTER_ULONG(
+        (volatile ULONG*)(dev->MmioBase + RK_MMU_DTE_ADDR));
     return STATUS_SUCCESS;
 }
 
@@ -257,6 +263,8 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
                                                 NULL);
     if (!NT_SUCCESS(s)) return s;
 
+    PRKIOMMU_DEVICE devCtx = RkIommuDeviceGet(Device);
+
     RKIOMMU_INTERFACE ifc;
     RtlZeroMemory(&ifc, sizeof(ifc));
     ifc.Header.Size              = sizeof(ifc);
@@ -264,10 +272,13 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.Header.Context           = WdfDeviceWdmGetDeviceObject(Device);
     ifc.Header.InterfaceReference    = WdfDeviceInterfaceReferenceNoOp;
     ifc.Header.InterfaceDereference  = WdfDeviceInterfaceDereferenceNoOp;
+    ifc.Hid                      = devCtx ? devCtx->Hid : 0;
+    ifc.Uid                      = devCtx ? devCtx->Uid : 0;
     ifc.QueryVersion             = RkIommuQueryVersion;
     ifc.MapMdl                   = RkIommuMapMdl;
     ifc.UnmapMdl                 = RkIommuUnmapMdl;
     ifc.RegisterFaultHandler     = RkIommuRegisterFaultHandler;
+    ifc.Snapshot                 = RkIommuSnapshot;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

@@ -129,7 +129,32 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
                                                 (PVOID*)&out, NULL);
         if (!NT_SUCCESS(status)) break;
-        status = RkMppJobSubmit(WdfIoQueueGetDevice(Queue), in, out);
+        WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+        if (!file) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = RkMppJobSubmit(WdfIoQueueGetDevice(Queue), file, in, out);
+        if (NT_SUCCESS(status)) info = sizeof(*out);
+        break;
+    }
+
+    /* ---- PEEK_JOB ---------------------------------------------------- */
+    case IOCTL_RKMPP_PEEK_JOB: {
+        if (InputBufferLength < sizeof(RKMPP_PEEK_JOB_IN) ||
+            OutputBufferLength < sizeof(RKMPP_PEEK_JOB_OUT)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        RKMPP_PEEK_JOB_IN  *in;
+        RKMPP_PEEK_JOB_OUT *out;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in),
+                                               (PVOID*)&in, NULL);
+        if (!NT_SUCCESS(status)) break;
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
+                                                (PVOID*)&out, NULL);
+        if (!NT_SUCCESS(status)) break;
+        status = RkMppJobPeek(WdfIoQueueGetDevice(Queue), in->JobId, out);
         if (NT_SUCCESS(status)) info = sizeof(*out);
         break;
     }

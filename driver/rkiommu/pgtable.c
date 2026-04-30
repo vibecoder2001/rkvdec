@@ -89,7 +89,11 @@ NTSTATUS RkIommuDomainCreate(PRKIOMMU_DOMAIN *Domain)
     }
     RtlZeroMemory(d->IovaBitmap, bitmapBytes);
 
-    /* Reserve IOVA page 0 (NULL guard): set bit 0 */
+    /* Reserve IOVA page 0 (NULL guard) — restored after system-abrupt-
+     * shutdown.  Letting the bitstream buffer land at iova 0 caused the
+     * codec to AXI-write/read at iova 0..0xFFF in ways that triggered a
+     * critical SError or thermal/power shutdown.  Safer to fault the
+     * IOMMU and let the driver report the bad iova. */
     d->IovaBitmap[0] |= (ULONG_PTR)1;
 
     *Domain = d;

@@ -40,9 +40,17 @@ typedef struct _RKMPP_JOB_QUEUE {
     LIST_ENTRY      Completed;      /* finished, not yet WaitJob'd */
     RKMPP_JOB      *InFlight;       /* currently executing (at most one) */
     volatile LONG64 NextId;         /* next job ID to assign */
-    KDPC            SoftCompleteDpc; /* Phase 2: software-completion DPC */
-    WDFDEVICE       Device;         /* back-pointer for DPC context */
-    WDFINTERRUPT    Interrupt;      /* WDFINTERRUPT for ISR/DPC (Phase 3) */
+    WDFDEVICE       Device;         /* back-pointer for poller context */
+    WDFINTERRUPT    Interrupt;      /* WDFINTERRUPT for ISR/DPC */
+
+    /* Polling-completion thread.  WdfInterruptCreate currently fails for
+     * rkmpp instances (STATUS_WDF_INVALID_INTERRUPT_CONFIG), so we run a
+     * per-device kernel thread that polls INT_STATUS after each kick.
+     * RkMppJobStart signals KickEvent; the thread polls + completes.
+     * On teardown, ExitEvent shuts the thread down. */
+    KEVENT          KickEvent;      /* signalled after register list written */
+    KEVENT          ExitEvent;      /* signalled to terminate poller */
+    PETHREAD        PollerThread;   /* referenced; ObDereferenced on teardown */
 } RKMPP_JOB_QUEUE, *PRKMPP_JOB_QUEUE;
 
 /* -----------------------------------------------------------------------
@@ -52,8 +60,16 @@ typedef struct _RKMPP_JOB_QUEUE {
 /* Initialise the queue; call once during device creation. */
 VOID RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue);
 
-/* IOCTL_RKMPP_SUBMIT_JOB handler. */
+/* Tear down the queue (stop poller thread, wait for it).  Call from
+ * EvtReleaseHardware / EvtDriverContextCleanup. */
+VOID RkMppJobQueueTeardown(_Inout_ RKMPP_JOB_QUEUE *Queue);
+
+/* IOCTL_RKMPP_SUBMIT_JOB handler.  File is required for buffer-handle
+ * resolution: any RKMPP_REG_WRITE with BufferHandle != 0 is rewritten to
+ * the iova of the matching buffer in this file's allocation list before
+ * the job is queued. */
 NTSTATUS RkMppJobSubmit(_In_ WDFDEVICE Device,
+                        _In_ WDFFILEOBJECT File,
                         _In_ const RKMPP_SUBMIT_JOB_IN *In,
                         _Out_ RKMPP_SUBMIT_JOB_OUT *Out);
 
@@ -62,6 +78,13 @@ NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
                       _In_ UINT64 JobId,
                       _In_ UINT32 TimeoutMs,
                       _Out_ RKMPP_WAIT_JOB_OUT *Out);
+
+/* IOCTL_RKMPP_PEEK_JOB handler — return the post-substitution register
+ * list for a queued or completed job.  Used by tests to verify iova
+ * substitution before the real hardware-kick path is in. */
+NTSTATUS RkMppJobPeek(_In_ WDFDEVICE Device,
+                      _In_ UINT64 JobId,
+                      _Out_ RKMPP_PEEK_JOB_OUT *Out);
 
 /* ISR — declared here so device.c can pass it to WdfInterruptCreate. */
 EVT_WDF_INTERRUPT_ISR  RkMppEvtIsr;

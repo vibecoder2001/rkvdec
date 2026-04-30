@@ -44,6 +44,11 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKMPP,
     CTL_CODE(FILE_DEVICE_RKMPP, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define IOCTL_RKMPP_WAIT_JOB \
     CTL_CODE(FILE_DEVICE_RKMPP, 0x804, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+/* PEEK_JOB returns the post-substitution register list for a queued or
+ * completed job — used by tests to verify iova-handle resolution before
+ * the real hardware-kick path is in (Phase 3b Task 11). */
+#define IOCTL_RKMPP_PEEK_JOB \
+    CTL_CODE(FILE_DEVICE_RKMPP, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 typedef enum _RKMPP_BUFFER_USAGE {
     RkMppBufferUsageBitstreamInput = 1,
@@ -77,13 +82,28 @@ typedef struct _RKMPP_FREE_BUFFER_IN {
 } RKMPP_FREE_BUFFER_IN;
 
 /* A register-list entry: write Value to register at Offset (relative to the
- * core's MMIO base). Phase 2 only supports plain writes. Phase 3 will add
- * buffer-handle substitution (so the user-mode register builder can name a
- * buffer by handle and the driver patches its iova in).
+ * core's MMIO base).
+ *
+ *   BufferHandle == 0
+ *     Plain write — Value is stored verbatim.
+ *
+ *   BufferHandle != 0
+ *     iova-substitution write — at submit time the driver looks up the
+ *     iova of the buffer with the given handle (must belong to the same
+ *     file object), adds IovaOffset, and stores the resulting 32-bit
+ *     value in the register list before the kick.  Lets the user-mode
+ *     register builder name a buffer by handle without round-tripping
+ *     the iova through user space.  Value (if any) is overwritten.
+ *
+ *   IovaOffset is in bytes and must be < buffer.SizeRoundedUp; otherwise
+ *   the whole submission is rejected with STATUS_INVALID_PARAMETER.
  */
 typedef struct _RKMPP_REG_WRITE {
     UINT32 Offset;
     UINT32 Value;
+    UINT64 BufferHandle;
+    UINT32 IovaOffset;
+    UINT32 Reserved;
 } RKMPP_REG_WRITE;
 
 #define RKMPP_MAX_REG_WRITES 256
@@ -119,6 +139,16 @@ typedef struct _RKMPP_WAIT_JOB_OUT {
     UINT32   HardwareStatus;
     UINT64   ElapsedQpc;
 } RKMPP_WAIT_JOB_OUT;
+
+typedef struct _RKMPP_PEEK_JOB_IN {
+    UINT64 JobId;
+} RKMPP_PEEK_JOB_IN;
+
+typedef struct _RKMPP_PEEK_JOB_OUT {
+    UINT32          RegWriteCount;
+    UINT32          Reserved;
+    RKMPP_REG_WRITE Writes[RKMPP_MAX_REG_WRITES];
+} RKMPP_PEEK_JOB_OUT;
 
 /* ---- Phase 3a: IOMMU fault injection scaffold ---- */
 

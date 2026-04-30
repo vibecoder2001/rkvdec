@@ -98,6 +98,27 @@
 #define RDCC_CRU_CLKSEL_CON89_MASK   0xFFFFu
 #define RDCC_CRU_CLKSEL_CON89_VALUE  0x0204u
 
+/* CLKSEL_CON(90) = 0x300 + 90*4 = 0x468 — leaf clocks for CABAC and HEVC CABAC.
+ * Per edk2-rk3588 RK3588.h:
+ *   bits  4..0  CLK_RKVDEC0_CA       div  → /8 = 187 MHz   (BSP wants 200 MHz)
+ *   bit      5  CLK_RKVDEC0_CA       mux  → 0 = CPLL (1500 MHz)
+ *   bits 10..6  CLK_RKVDEC0_HEVC_CA  div  → /3 = 333 MHz   (BSP wants 300 MHz)
+ *   bits 12..11 CLK_RKVDEC0_HEVC_CA  mux  → 0 = MATRIX_1000M
+ *
+ * Without explicit rate setup the leaves come up at the 24 MHz reset default,
+ * which is too slow for 200 ms decode budgets and explains "kick succeeds,
+ * INT_STATUS reads 0 forever" on real hardware.  Div field = actual_div - 1. */
+#define RDCC_CRU_CLKSEL_CON90    0x468u
+#define RDCC_CRU_CLKSEL_CON90_MASK   0x1FFFu
+#define RDCC_CRU_CLKSEL_CON90_VALUE  ((7u << 0) | (0u << 5) | (2u << 6) | (0u << 11))
+
+/* CLKSEL_CON(91) = 0x300 + 91*4 = 0x46C — clk_rkvdec0_core.
+ *   bits 4..0  div  → /8 = 187 MHz   (BSP wants 200 MHz)
+ *   bit     5  mux  → 0 = CPLL */
+#define RDCC_CRU_CLKSEL_CON91    0x46Cu
+#define RDCC_CRU_CLKSEL_CON91_MASK   0x3Fu
+#define RDCC_CRU_CLKSEL_CON91_VALUE  ((7u << 0) | (0u << 5))
+
 typedef struct _RDCC_REGS {
     ULONG ClkGateCon44;     /* VDPU root clocks (must be on before PD_VDPU) */
     ULONG ClkGateCon44Mask;
@@ -146,11 +167,25 @@ static const RDCC_REGS g_rdcc = {
     .SoftRstCon44Mask = 0x00000070u,  /* bits 4..6 — VDPU NIU resets        */
 };
 
-/* Single-bit masks for the CORE reset (used by AssertCoreReset /
- * DeassertCoreReset hang-recovery ifc — they toggle only the core, not
- * the bus/cabac/HEVC resets that are part of the bring-up bundle). */
-#define RDCC_CON40_CORE_RESET_BIT  (1u << 9)
-#define RDCC_CON41_CORE_RESET_BIT  (1u << 8)
+/* Per-job reset bundle (used by AssertCoreReset / DeassertCoreReset).
+ * Toggle the codec's *internal* sub-block resets (CABAC engine, HEVC
+ * CABAC, core clock, core FSM) but NOT the AXI/AHB/CCU bus resets.
+ * Resetting the bus drops the IOMMU's page-directory state because
+ * the rkvdec_ccu and rkvdec0_a/h resets sit on the same bus path —
+ * empirically observed: dec_bus_sta IRQ + DTE_ADDR readback=0 after
+ * a wider reset.
+ *
+ * CON40 bit layout (per RK3588 BSP DTS):
+ *   bit 2  rkvdec_ccu_a    — cluster AXI       (DO NOT reset)
+ *   bit 3  rkvdec_ccu_h    — cluster AHB       (DO NOT reset)
+ *   bit 4  rkvdec0_a       — codec AXI         (DO NOT reset)
+ *   bit 5  rkvdec0_h       — codec AHB         (DO NOT reset)
+ *   bit 6  ca_rkvdec0      — CABAC engine      ✓
+ *   bit 7  hevc_ca_rkvdec0 — HEVC CABAC        ✓
+ *   bit 8  rkvdec0_c       — core clock        ✓
+ *   bit 9  rkvdec0_core    — core FSM          ✓ */
+#define RDCC_CON40_CORE_RESET_BIT  0x000003C0u  /* bits 6..9 */
+#define RDCC_CON41_CORE_RESET_BIT  0x000001C0u  /* bits 6..8 (RVD1) */
 
 /* Defined in driver.c.  g_rdcc_mmio is the ACPI MMIO (Phase 3 task arb).
  * g_cru_mmio is a direct physical-address map of the system CRU; we use
@@ -224,16 +259,29 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
         return s;
     }
 
-    /* Configure rkvdec0 root clock muxes/dividers BEFORE ungating gates and
-     * before the PD_RKVDEC0 idle handshake.  ACLK_RKVDEC_CCU's COMPOSITE
-     * mux must select a real PLL parent or the clock won't tick — and the
-     * rkvdec0 NIU needs it ticking to ack idle-deassert.
+    /* Configure rkvdec0 root + leaf clocks BEFORE ungating their gates and
+     * before the PD_RKVDEC0 idle handshake.  Three CLKSEL_CON registers:
      *
-     * In practice UEFI leaves these muxes pointing at valid PLL parents
-     * (mux=0 = SPLL/XIN_OSC0 depending on the field), so this write is
-     * defensive. */
+     *   CON(89): aclk_rkvdec_ccu / aclk_rkvdec0_root / hclk_rkvdec0_root
+     *   CON(90): clk_rkvdec0_ca + clk_rkvdec0_hevc_ca (CABAC + HEVC CABAC)
+     *   CON(91): clk_rkvdec0_core
+     *
+     * ACLK_RKVDEC_CCU's COMPOSITE mux must select a real PLL parent or the
+     * clock won't tick — the rkvdec0 NIU needs it ticking to ack
+     * idle-deassert.
+     *
+     * Leaves (core, ca, hevc_ca) need rate setup too: BSP kernel sets them
+     * to 200/200/300 MHz at probe.  Without that they'd run at 24 MHz OSC
+     * default, fast enough for register access but too slow for an actual
+     * decode within our 200 ms poll budget — the symptom is "kick fires,
+     * INT_STATUS reads 0 forever".  Pick CPLL/8 = 187 MHz for core/ca and
+     * MATRIX_1000M/3 = 333 MHz for hevc_ca; close enough to BSP targets. */
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON89,
                      RDCC_CRU_CLKSEL_CON89_MASK, RDCC_CRU_CLKSEL_CON89_VALUE);
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON90,
+                     RDCC_CRU_CLKSEL_CON90_MASK, RDCC_CRU_CLKSEL_CON90_VALUE);
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON91,
+                     RDCC_CRU_CLKSEL_CON91_MASK, RDCC_CRU_CLKSEL_CON91_VALUE);
 
     /* Ungate rkvdec0 cluster clocks BEFORE PD_RKVDEC0 handshake. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40, g_rdcc.ClkGateCon40Mask, 0);

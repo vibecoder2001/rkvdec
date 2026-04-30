@@ -73,8 +73,7 @@ RkMppBufFreeOne(_In_ PRKMPP_BUFFER Buf, _In_ WDFDEVICE Device)
     if (Buf->Iova) {
         PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(Device);
         if (iommu && iommu->UnmapMdl) {
-            PDEVICE_OBJECT wdmDev = WdfDeviceWdmGetDeviceObject(Device);
-            iommu->UnmapMdl(wdmDev, Buf->Iova);
+            iommu->UnmapMdl(iommu->Header.Context, Buf->Iova);
         }
         Buf->Iova = 0;
     }
@@ -98,6 +97,36 @@ RkMppBufFreeOne(_In_ PRKMPP_BUFFER Buf, _In_ WDFDEVICE Device)
     }
 
     ExFreePoolWithTag(Buf, 'BppR');
+}
+
+/* -----------------------------------------------------------------------
+ * RkMppBufLookupIova — return iova + size for a buffer cookie.  Walks the
+ * file's allocation list under the spinlock; safe at <= DISPATCH_LEVEL.
+ * --------------------------------------------------------------------- */
+NTSTATUS
+RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
+                   _In_ UINT64        Cookie,
+                   _Out_ UINT64      *OutIova,
+                   _Out_ ULONG       *OutSize)
+{
+    PRKMPP_FILE_CTX ctx = RkMppFileGet(File);
+    KIRQL oldIrql;
+    NTSTATUS status = STATUS_NOT_FOUND;
+
+    KeAcquireSpinLock(&ctx->Lock, &oldIrql);
+    for (PLIST_ENTRY entry = ctx->Buffers.Flink;
+         entry != &ctx->Buffers;
+         entry = entry->Flink) {
+        PRKMPP_BUFFER buf = CONTAINING_RECORD(entry, RKMPP_BUFFER, Link);
+        if (buf->Cookie == Cookie) {
+            *OutIova = buf->Iova;
+            *OutSize = buf->Size;
+            status   = STATUS_SUCCESS;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&ctx->Lock, oldIrql);
+    return status;
 }
 
 /* -----------------------------------------------------------------------
@@ -149,8 +178,12 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     }
 
     ULONG64 iova = 0;
-    PDEVICE_OBJECT wdmDev = WdfDeviceWdmGetDeviceObject(Device);
-    status = iommu->MapMdl(wdmDev, mdl, In->Usage, &iova);
+    /* Pass the iommu's per-instance Header.Context so the provider can
+     * resolve to the specific iommu instance we queried (per topology).
+     * Passing our own wdmDev would land all maps in g_deviceList head
+     * (VPMU UID=0). */
+    PVOID provCtx = iommu->Header.Context;
+    status = iommu->MapMdl(provCtx, mdl, In->Usage, &iova);
     if (!NT_SUCCESS(status)) {
         IoFreeMdl(mdl);
         MmFreeContiguousMemory(kernelVa);
@@ -161,7 +194,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     PVOID userVa = MmMapLockedPagesSpecifyCache(
         mdl, UserMode, MmNonCached, NULL, FALSE, NormalPagePriority);
     if (!userVa) {
-        iommu->UnmapMdl(wdmDev, iova);
+        iommu->UnmapMdl(provCtx, iova);
         IoFreeMdl(mdl);
         MmFreeContiguousMemory(kernelVa);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -176,7 +209,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     if (!buf) {
         /* Must unmap in this process context before we return. */
         MmUnmapLockedPages(userVa, mdl);
-        iommu->UnmapMdl(wdmDev, iova);
+        iommu->UnmapMdl(provCtx, iova);
         IoFreeMdl(mdl);
         MmFreeContiguousMemory(kernelVa);
         return STATUS_INSUFFICIENT_RESOURCES;

@@ -39,6 +39,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RKMPP_DEVICE, RkMppDeviceGet);
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE     RkMppEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE     RkMppEvtReleaseHardware;
+EVT_WDF_OBJECT_CONTEXT_CLEANUP      RkMppEvtDeviceContextCleanup;
 EVT_WDF_FILE_CLEANUP                RkMppEvtFileCleanup;
 EVT_WDF_FILE_CLOSE                  RkMppEvtFileClose;
 
@@ -83,6 +84,7 @@ RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
 
     WDF_OBJECT_ATTRIBUTES attr;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, RKMPP_DEVICE);
+    attr.EvtCleanupCallback = RkMppEvtDeviceContextCleanup;
 
     WDFDEVICE device;
     NTSTATUS status = WdfDeviceCreate(&DeviceInit, &attr, &device);
@@ -117,21 +119,61 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     PCM_PARTIAL_RESOURCE_DESCRIPTOR irqRaw   = NULL;
     PCM_PARTIAL_RESOURCE_DESCRIPTOR irqTrans = NULL;
 
+    /* RVD0/RVD1 (RKCP3550) declare TWO memory regions in _CRS:
+     *   link : 0xFDC38000 / 0x100  ← idx 0..63   (common bank + kick)
+     *   regs : 0xFDC38100 / 0x400  ← idx 64..319 (codec params + addrs)
+     *
+     * They are physically contiguous, so we map [min_start, max_end) as
+     * one block — that gets us a single MmioBase whose offsets line up
+     * with the BSP's idx*4 byte offsets (idx 10 = 0x28 lands on the kick
+     * register, idx 224 = 0x380 lands on INT_STATUS, etc.).
+     *
+     * Single-region devices (encoder cores, etc.) take the obvious path. */
+    PHYSICAL_ADDRESS mmioLow  = {0};
+    PHYSICAL_ADDRESS mmioHigh = {0};
+    BOOLEAN          mmioFound = FALSE;
     ULONG count = WdfCmResourceListGetCount(ResourcesTranslated);
     for (ULONG i = 0; i < count; i++) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR d =
             WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
-        if (d->Type == CmResourceTypeMemory && !ctx->MmioBase) {
-            ctx->MmioBase = MmMapIoSpaceEx(d->u.Memory.Start,
-                                           d->u.Memory.Length,
-                                           PAGE_READWRITE | PAGE_NOCACHE);
-            ctx->MmioLength = d->u.Memory.Length;
+        if (d->Type == CmResourceTypeMemory) {
+            PHYSICAL_ADDRESS start = d->u.Memory.Start;
+            PHYSICAL_ADDRESS end;
+            end.QuadPart = start.QuadPart + d->u.Memory.Length;
+            if (!mmioFound) {
+                mmioLow   = start;
+                mmioHigh  = end;
+                mmioFound = TRUE;
+            } else {
+                if (start.QuadPart < mmioLow.QuadPart)  mmioLow  = start;
+                if (end.QuadPart   > mmioHigh.QuadPart) mmioHigh = end;
+            }
         } else if (d->Type == CmResourceTypeInterrupt && !irqTrans) {
             irqTrans = d;
             irqRaw   = WdfCmResourceListGetDescriptor(ResourcesRaw, i);
         }
     }
+    if (!mmioFound) return STATUS_INSUFFICIENT_RESOURCES;
+    ULONG mmioLen = (ULONG)(mmioHigh.QuadPart - mmioLow.QuadPart);
+    /* RVD0/RVD1 (RKCP3550): the ACPI _CRS only declares the lower 0x500
+     * bytes of the IP's register file (link 0x100 + regs 0x400), but the
+     * BSP DTS exposes the full 0x800 — the extra 0x300 holds the rkvdec2
+     * internal cache configuration registers (CACHE0/1/2_SIZE at
+     * 0x51C/0x55C/0x59C, CLR_CACHE0/1/2 at 0x510/0x550/0x590, MAX_READS
+     * at 0x518) which the kernel BSP run path must program before kick.
+     * Force the mapping to the full 0x800 so those writes can land.
+     * Firmware fix is to extend the _CRS — until then this runtime
+     * widening keeps us moving. */
+    if (ctx->Hid == 0x3550 && mmioLen < 0x800) {
+        mmioLen = 0x800;
+    }
+    ctx->MmioBase   = MmMapIoSpaceEx(mmioLow, mmioLen,
+                                     PAGE_READWRITE | PAGE_NOCACHE);
+    ctx->MmioLength = mmioLen;
     if (!ctx->MmioBase) return STATUS_INSUFFICIENT_RESOURCES;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+               "rkmpp: HID=RKCP%04x UID=%u MmioBase=phys 0x%llx len 0x%x\n",
+               ctx->Hid, ctx->Uid, mmioLow.QuadPart, mmioLen);
 
     /* Connect the WDF interrupt with explicit raw + translated descriptors.
      * Phase 3a: ISR/DPC are wired but the hardware kick path (Phase 3b) is
@@ -159,7 +201,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     /* Step 2: open the in-kernel ifcs of rkmpp_ccu.sys and rkiommu.sys.
      * Without them we cannot service a single IOCTL beyond GET_CAPS, so refuse
      * to load (PnP code 31, no bugcheck). */
-    status = RkMppOpenIfcs(Device, &ctx->Ifcs);
+    status = RkMppOpenIfcs(Device, ctx->Hid, ctx->Uid, &ctx->Ifcs);
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp: ccu/iommu ifcs unavailable (0x%08x) — install "
@@ -188,39 +230,58 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         return status;
     }
 
-    /* PHASE3B-PREREQ: codec/IOMMU MMIO at 0xFDC38xxx SErrors on first access
-     * with the current rkmpp_ccu PMU no-op sequence — see Phase 3b plan
-     * Task 2 (DTS-derived bring-up).  These three calls all touch codec
-     * MMIO and stay disabled until the bring-up sequence is correct.  When
-     * Task 3 of Phase 3b lands, restore in this order:
-     *
-     *   1. RegisterFaultHandler (rkiommu callback wiring; no MMIO of its own
-     *      but the IOMMU IRQ fires only after RkIommuEnable runs, so this is
-     *      safe to restore once IOMMU paging is enabled).
-     *   2. DeassertCoreReset (CRU SOFTRST_CON write).
-     *   3. REVISION read (codec MMIO read at 0xFDC38100 + offset 0).
-     */
-#if 0  /* PHASE3B-TODO: restore once codec MMIO bring-up is solved */
-    if (ctx->Ifcs.Iommu.RegisterFaultHandler) {
-        ctx->Ifcs.Iommu.RegisterFaultHandler(
-            WdfDeviceWdmGetDeviceObject(Device),
-            RkMppOnIommuFault);
-    }
-    if (ctx->Hid == 0x3550 && ctx->Uid == 0) {
-        ctx->Ifcs.Ccu.DeassertCoreReset(cookie);
-    }
-#endif
-
-    /* Phase 3b-2c: cluster bring-up confirmed working on real hardware
-     * (PD_VCODEC + PD_VDPU + PD_RKVDEC0 + PD_RKVDEC1 all power on cleanly,
-     * idle handshakes ack, clocks ungated, resets deasserted).  Reading
-     * codec MMIO is now safe — capture the REVISION word as the first
-     * ground-truth hardware ID datapoint. */
+    /* Cluster bring-up confirmed working on real hardware as of Phase 3b
+     * Task 2 — PD_VCODEC + PD_VDPU + PD_RKVDEC0/1 all power on cleanly,
+     * NIU/CCU resets deassert, codec MMIO at 0xFDC38100/0xFDC48100 reads
+     * REVISION = 0x53813f05.  Now the rest of PrepareHardware is safe. */
     const RKMPP_PROFILE *p = RkMppFindProfile(ctx->Hid, ctx->Uid);
     if (p) {
         ctx->SupportedCodecs = p->SupportedCodecs;
+    }
+
+    /* Only touch codec MMIO + IOMMU wiring for devices we actually plan
+     * to drive in this phase (decoders only — RVD0/RVD1).  RaiseCluster
+     * powers the decoder PDs only; encoder/JPEG/IEP cores live in
+     * PD_VENC0/1, etc., which we don't bring up here, so reading their
+     * MMIO would SError.  The non-decoder probes still get a profile
+     * row (SupportedCodecs=0) so subsequent IOCTLs can report
+     * "unsupported"; they just don't get any bring-up activity. */
+    if (p && p->SupportedCodecs != 0) {
+        /* Capture REVISION as ground truth that codec MMIO is alive. */
         ctx->RevisionWord = READ_REGISTER_ULONG(
             (volatile ULONG*)((PUCHAR)ctx->MmioBase + p->RevisionRegOffset));
+
+        /* Wire the IOMMU fault callback.  rkiommu's DPC invokes this when
+         * a translation fault posts; we just stash the fault state for the
+         * IOCTL surface to surface to userspace.  Safe to register before
+         * RkIommuEnable runs — the IRQ stays masked until then.
+         *
+         * Hardening item: this currently registers globally per device
+         * cookie; once we have a job queue, the fault should be attributed
+         * to the in-flight job and trigger AssertCoreReset on its core. */
+        if (ctx->Ifcs.Iommu.RegisterFaultHandler) {
+            ctx->Ifcs.Iommu.RegisterFaultHandler(
+                ctx->Ifcs.Iommu.Header.Context,         /* iommu instance */
+                WdfDeviceWdmGetDeviceObject(Device),    /* our device, for callback */
+                RkMppOnIommuFault);
+        }
+
+        /* Pulse the core reset.  RaiseCluster deasserts the bring-up reset
+         * bundle (NIU + bus + cabac + core), but UEFI leaves the hardware
+         * in an undefined "never reset" state — without a clean
+         * assert→deassert pulse the codec sometimes accepts dec_e=1 yet
+         * never issues AXI traffic (verified via post-kick IOMMU snapshot:
+         * STATUS=idle, INT_RAWSTAT=0, no fault).  Mirror what BSP's
+         * platform-init reset_control_bulk_assert+deassert dance does.
+         *
+         * NOTE: AssertCoreReset currently only targets RVD0 (CON40 bit 9).
+         * Gate this on HID==0x3550 && UID==0 to avoid resetting RVD0 from
+         * RVD1's bring-up.  Per-core reset for RVD1 is a later task. */
+        if (ctx->Hid == 0x3550 && ctx->Uid == 0 &&
+            ctx->Ifcs.Ccu.AssertCoreReset && ctx->Ifcs.Ccu.DeassertCoreReset) {
+            ctx->Ifcs.Ccu.AssertCoreReset(ctx->Ifcs.Ccu.Header.Context);
+            ctx->Ifcs.Ccu.DeassertCoreReset(ctx->Ifcs.Ccu.Header.Context);
+        }
     }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -247,6 +308,18 @@ RkMppEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTransl
         ctx->MmioBase = NULL;
     }
     return STATUS_SUCCESS;
+}
+
+/* Per-device context cleanup — fires when the WDFDEVICE is destroyed
+ * (driver unload or device removal).  Stops the polling-completion
+ * thread and releases its reference. */
+VOID
+RkMppEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet((WDFDEVICE)Device);
+    if (ctx) {
+        RkMppJobQueueTeardown(&ctx->JobQueue);
+    }
 }
 
 /* Reads ACPI _HID and _UID from the device-instance properties.
@@ -451,6 +524,17 @@ RkMppGetMmioBase(_In_ WDFDEVICE Device)
 {
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     return ctx->MmioBase;
+}
+
+/* Accessor used by job.c for offset bounds checking on register writes.
+ * MmioLength is SIZE_T but every codec MMIO range we map is < 4 GiB, so
+ * a ULONG return is fine (bounds-clamped on the off chance). */
+ULONG
+RkMppGetMmioLength(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    if (!ctx) return 0;
+    return (ctx->MmioLength > MAXULONG) ? MAXULONG : (ULONG)ctx->MmioLength;
 }
 
 /* Accessor used by job.c to reach the job queue. */

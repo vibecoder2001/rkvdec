@@ -7,12 +7,13 @@
 
 static const RKMPP_PROFILE g_profiles[] = {
     /* RVD0 / RVD1 — rkv-decoder-v2 cores. v1 only enables H.264.
-     * RKVDEC_REG_HW_ID_INDEX=0 → byte offset 0x0000 per
-     * rockchip-linux/kernel develop-5.10
-     * drivers/video/rockchip/mpp/mpp_rkvdec2.h (c606a84)
-     * mpp_read(mpp, reg_id=0) reads MMIO base+0x0000. */
-    { 0x3550, 0, RKMPP_CODEC_H264, 0x0000 },
-    { 0x3550, 1, RKMPP_CODEC_H264, 0x0000 },
+     * REVISION lives at MMIO base + 0x100.  MmioBase points at the
+     * link region (0xFDC38000) since Phase 3b Task 11; the regs region
+     * starts at offset 0x100, and reg064 (the first word of the H.264
+     * codec-params bank) is the hardware-ID register on rkvdec2.
+     * Empirically returns 0x53813f05 on RK3588. */
+    { 0x3550, 0, RKMPP_CODEC_H264, 0x0100 },
+    { 0x3550, 1, RKMPP_CODEC_H264, 0x0100 },
     /* All other matching HIDs probe but expose no codec capability in Phase 1. */
     { 0x3510, 0, 0, 0x0000 },
     { 0x3511, 0, 0, 0x0000 },

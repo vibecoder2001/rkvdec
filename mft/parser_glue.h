@@ -60,6 +60,14 @@ typedef struct H264ParseResult {
      * supplied via H264ParseAccessUnit; valid until the next parse. */
     const uint8_t *slice_data;
     size_t         slice_data_size;
+
+    /* Persistent POC-type-0 state (spec 8.2.1.1).  Updated each call.
+     * Reset on IDR. */
+    int32_t        prev_pic_order_cnt_msb;
+    int32_t        prev_pic_order_cnt_lsb;
+    /* Persistent POC-type-1 state (8.2.1.2): frame_num_offset. */
+    int32_t        prev_frame_num;
+    int32_t        prev_frame_num_offset;
 } H264ParseResult;
 
 /* Parse one access unit (typically an IDR-only buffer for the first

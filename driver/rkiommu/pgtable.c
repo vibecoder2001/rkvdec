@@ -123,6 +123,12 @@ NTSTATUS RkIommuDomainCreate(PRKIOMMU_DOMAIN *Domain)
         }
     }
 
+    /* Don't map iova page 0 — both zero-fill and CABAC content cause
+     * the codec to abort with INT=0x10 dec_error_sta.  Codec is reading
+     * SPECIFIC data from low iova; we don't know what.  Falling back
+     * to leaving page 0 unmapped (codec faults via IOMMU) and routing
+     * the codec away from low-iova reads via register fixes. */
+
     *Domain = d;
     return STATUS_SUCCESS;
 }
@@ -142,6 +148,12 @@ VOID RkIommuDomainDestroy(PRKIOMMU_DOMAIN Domain)
             Domain->Pts[i]    = NULL;
             Domain->PtPhys[i] = 0;
         }
+    }
+
+    if (Domain->Page0Scratch) {
+        FreePageBelow4G(Domain->Page0Scratch);
+        Domain->Page0Scratch = NULL;
+        Domain->Page0Phys    = 0;
     }
 
     if (Domain->Pd) {

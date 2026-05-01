@@ -59,6 +59,12 @@ typedef struct _RKIOMMU_FAULT_SNAPSHOT {
     ULONG       IntStatus;     /* RK_MMU_INT_STATUS */
     ULONG       PageFaultAddr; /* RK_MMU_PAGE_FAULT_ADDR */
     ULONG       DteAddr;       /* RK_MMU_DTE_ADDR readback */
+    /* MMU#1 (second 0x40 register bank) - all-zero if MmioLength < 0x80. */
+    ULONG       Status1;
+    ULONG       IntRawStat1;
+    ULONG       IntStatus1;
+    ULONG       PageFaultAddr1;
+    ULONG       DteAddr1;
 } RKIOMMU_FAULT_SNAPSHOT, *PRKIOMMU_FAULT_SNAPSHOT;
 
 typedef NTSTATUS (*RKIOMMU_SNAPSHOT)(

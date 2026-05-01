@@ -104,46 +104,68 @@ NTSTATUS RkIommuEnable(PRKIOMMU_DEVICE Dev)
     if (!Dev->MmioBase || !Dev->Domain) return STATUS_DEVICE_NOT_READY;
     if (Dev->PagingEnabled)             return STATUS_SUCCESS;
 
-    /* 1. Optionally reset the MMU.  BSP flag says skip on RK3588 rkvdec/rkvenc/AV1. */
-    if (!Dev->FlagDisableMmuReset) {
+    /* RK3588 rkvdec0_mmu / rkvdec1_mmu have TWO MMU instances per
+     * codec, one for read-port one for write-port.  DT:
+     *   reg = <0x0 0xfdc38700 0x0 0x40>, <0x0 0xfdc38740 0x0 0x40>;
+     * BSP rockchip-iommu.c walks `iommu->num_mmu` and writes EVERY
+     * config register to ALL bases.  We were configuring only the
+     * first — bitstream READS went through MMU#0 and translated
+     * correctly, but DECOUT WRITES went through MMU#1 (paging-disabled
+     * by default) and were silently dropped.  Fix: write the entire
+     * enable sequence to both bases when MmioLength >= 0x80. */
+    /* Configure both MMU instances when present (RK3588 codec MMUs come
+     * in pairs).  Wrap the entire enable sequence in STALL / UN-STALL
+     * commands like BSP rk_iommu_enable does — without stall, the
+     * partially-configured MMU sees in-flight codec AXI traffic and
+     * lands in undefined state (we observed kernel BSOD / SoC abort). */
+    int n_cfg   = (Dev->MmioLength >= 0x80) ? 2 : 1;
+    int n_paged = n_cfg;
+
+    /* STALL all instances before config. */
+    for (int mi = 0; mi < n_cfg; mi++) {
         WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(Dev->MmioBase + RK_MMU_COMMAND),
-            RK_MMU_CMD_RESET);
+            (volatile ULONG*)(Dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_ENABLE_STALL);
         KeStallExecutionProcessor(50);
     }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+               "rkiommu: HID=RKCP%04x UID=%u (MmioLength=0x%x) cfg=%d paged=%d\n",
+               Dev->Hid, Dev->Uid, Dev->MmioLength, n_cfg, n_paged);
 
-    /* 2. Program the page-directory base. */
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(Dev->MmioBase + RK_MMU_DTE_ADDR),
-        Dev->Domain->PdPhys);
+    /* Configure ALL MMU instances (n_mmu) — RK3588 codec MMUs come in
+     * pairs (read-port + write-port).  See comment above for details. */
+    for (int mi = 0; mi < n_cfg; mi++) {
+        volatile UCHAR *base = Dev->MmioBase + (mi * 0x40);
 
-    /* 3. Zap any stale TLB cache from a previous session. */
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(Dev->MmioBase + RK_MMU_COMMAND),
-        RK_MMU_CMD_ZAP_CACHE);
+        /* 1. Optionally reset the MMU. */
+        if (!Dev->FlagDisableMmuReset) {
+            WRITE_REGISTER_ULONG(
+                (volatile ULONG*)(base + RK_MMU_COMMAND),
+                RK_MMU_CMD_RESET);
+            KeStallExecutionProcessor(50);
+        }
 
-    /* 4. Enable IRQs. */
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(Dev->MmioBase + RK_MMU_INT_MASK),
-        RK_MMU_IRQ_MASK);
+        /* 2. Program the page-directory base. */
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(base + RK_MMU_DTE_ADDR),
+            Dev->Domain->PdPhys);
 
-    /* 5. AUTO_GATING workaround.  BSP rockchip-iommu.c rk_iommu_enable
-     * (line 1175) does:
-     *   auto_gate = read(AUTO_GATING);
-     *   auto_gate |= DISABLE_FETCH_DTE_TIME_LIMIT;   // BIT(31)
-     *   write(AUTO_GATING, auto_gate);
-     * The comment is "Workaround for iommu blocked, BIT(31) default to 1".
-     * Without this bit set, the IOMMU's DTE-fetch path can stall mid-decode
-     * and the codec gets phantom AXI failures — observed in our build as
-     * IOMMU faults at low iova at the 25% mark of the frame.  Earlier code
-     * here just wrote `1` to AUTO_GATING (= bit 0 only), missing the
-     * documented quirk fix. */
-    {
+        /* 3. Zap any stale TLB cache from a previous session. */
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(base + RK_MMU_COMMAND),
+            RK_MMU_CMD_ZAP_CACHE);
+
+        /* 4. Enable IRQs. */
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(base + RK_MMU_INT_MASK),
+            RK_MMU_IRQ_MASK);
+
+        /* 5. AUTO_GATING workaround. */
         ULONG ag = READ_REGISTER_ULONG(
-            (volatile ULONG*)(Dev->MmioBase + RK_MMU_AUTO_GATING));
+            (volatile ULONG*)(base + RK_MMU_AUTO_GATING));
         ag |= (1u << 31);   /* DISABLE_FETCH_DTE_TIME_LIMIT */
         WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(Dev->MmioBase + RK_MMU_AUTO_GATING),
+            (volatile ULONG*)(base + RK_MMU_AUTO_GATING),
             ag);
     }
 
@@ -164,24 +186,40 @@ NTSTATUS RkIommuEnable(PRKIOMMU_DEVICE Dev)
                    Dev->Hid, Dev->Uid, dteRb, Dev->Domain->PdPhys, statRb, maskRb);
     }
 
-    /* 5. Enable paging.  With cmd-retry: write up to 3 times, polling status. */
+    /* 6. Enable paging on ALL MMU instances. */
     ULONG attempts = Dev->FlagEnableCmdRetry ? 3u : 1u;
     for (ULONG i = 0; i < attempts; i++) {
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(Dev->MmioBase + RK_MMU_COMMAND),
-            RK_MMU_CMD_ENABLE_PAGING);
-        ULONG st = READ_REGISTER_ULONG(
+        for (int mi = 0; mi < n_paged; mi++) {
+            WRITE_REGISTER_ULONG(
+                (volatile ULONG*)(Dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+                RK_MMU_CMD_ENABLE_PAGING);
+        }
+        ULONG st0 = READ_REGISTER_ULONG(
             (volatile ULONG*)(Dev->MmioBase + RK_MMU_STATUS));
-        if ((st & RK_MMU_STATUS_PAGING_ENABLED) != 0) {
+        ULONG st1 = (n_cfg > 1) ? READ_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + 0x40 + RK_MMU_STATUS)) : 0u;
+        if ((st0 & RK_MMU_STATUS_PAGING_ENABLED)) {
             Dev->PagingEnabled = TRUE;
+            /* UN-STALL all instances to release in-flight AXI traffic. */
+            for (int mi = 0; mi < n_cfg; mi++) {
+                WRITE_REGISTER_ULONG(
+                    (volatile ULONG*)(Dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+                    RK_MMU_CMD_DISABLE_STALL);
+            }
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkiommu: paging enabled (HID=RKCP%04x UID=%u attempt=%u)\n",
-                       Dev->Hid, Dev->Uid, i + 1u);
+                       "rkiommu: paging enabled (HID=RKCP%04x UID=%u attempt=%u st0=0x%x st1=0x%x cfg=%d paged=%d)\n",
+                       Dev->Hid, Dev->Uid, i + 1u, st0, st1, n_cfg, n_paged);
             return STATUS_SUCCESS;
         }
         KeStallExecutionProcessor(20);
     }
 
+    /* Failure path: also UN-STALL so the IOMMU doesn't stay frozen. */
+    for (int mi = 0; mi < n_cfg; mi++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_DISABLE_STALL);
+    }
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                "rkiommu: paging-enable timeout (HID=RKCP%04x UID=%u)\n",
                Dev->Hid, Dev->Uid);
@@ -222,19 +260,37 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
         ctx->FlagShootdownEntire = FALSE;
     }
 
-    /* Map the first MMIO resource */
+    /* RK3588 codec MMUs come in pairs.  ACPI declares two Memory regions
+     *   0xFDC38700/0x40 + 0xFDC38740/0x40
+     * which we want to map as ONE contiguous 0x80 block so num_mmu=2
+     * detection downstream works.  Walk all memory resources, pick the
+     * first one as base, and extend Length by every adjacent region. */
     ULONG count = WdfCmResourceListGetCount(ResourcesTranslated);
+    PHYSICAL_ADDRESS basePhys = {0};
+    ULONG totalLen = 0;
     for (ULONG i = 0; i < count; i++) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR d =
             WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
-        if (d->Type == CmResourceTypeMemory) {
-            ctx->MmioBase = (volatile UCHAR*)MmMapIoSpaceEx(
-                d->u.Memory.Start,
-                d->u.Memory.Length,
-                PAGE_READWRITE | PAGE_NOCACHE);
-            ctx->MmioLength = d->u.Memory.Length;
-            break;
+        if (d->Type != CmResourceTypeMemory) continue;
+        if (totalLen == 0) {
+            basePhys = d->u.Memory.Start;
+            totalLen = d->u.Memory.Length;
+        } else if (d->u.Memory.Start.QuadPart ==
+                   basePhys.QuadPart + totalLen) {
+            totalLen += d->u.Memory.Length;
+        } else {
+            /* Non-adjacent — would need a separate ioremap.  Log a
+             * warning and ignore for now; only the rk3588 paired-MMU
+             * layout matters for our scope. */
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkiommu: non-adjacent mem resource at 0x%llx ignored\n",
+                       d->u.Memory.Start.QuadPart);
         }
+    }
+    if (totalLen) {
+        ctx->MmioBase = (volatile UCHAR*)MmMapIoSpaceEx(
+            basePhys, totalLen, PAGE_READWRITE | PAGE_NOCACHE);
+        ctx->MmioLength = totalLen;
     }
     if (!ctx->MmioBase) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,

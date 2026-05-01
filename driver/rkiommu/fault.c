@@ -34,30 +34,45 @@ BOOLEAN RkIommuEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 
     if (!ctx->MmioBase) return FALSE;
 
-    /* Check masked interrupt status — if zero, not our interrupt */
-    ULONG intStatus = READ_REGISTER_ULONG(
-        (volatile ULONG*)(ctx->MmioBase + RK_MMU_INT_STATUS));
-    if (!(intStatus & RK_MMU_IRQ_MASK)) return FALSE;
+    /* RK3588 codec MMUs come in pairs (read-port + write-port) sharing
+     * one GIC IRQ.  Walk all instances; ack faults on every one with
+     * a non-zero INT_STATUS.  If we only check MMU#0 and #1 has a
+     * fault, the IRQ stays asserted forever → SoC freezes. */
+    int n_mmu = (ctx->MmioLength >= 0x80) ? 2 : 1;
+    BOOLEAN handled = FALSE;
+    ULONG mergedStatus = 0;
+    ULONG faultIova    = 0;
 
-    /* Capture the faulting IOVA */
-    ULONG faultIova = READ_REGISTER_ULONG(
-        (volatile ULONG*)(ctx->MmioBase + RK_MMU_PAGE_FAULT_ADDR));
+    for (int mi = 0; mi < n_mmu; mi++) {
+        volatile UCHAR *base = ctx->MmioBase + (mi * 0x40);
+        ULONG intStatus = READ_REGISTER_ULONG(
+            (volatile ULONG*)(base + RK_MMU_INT_STATUS));
+        if (!(intStatus & RK_MMU_IRQ_MASK)) continue;
 
-    /* Save context for the DPC */
-    ctx->FaultCtx.IntStatus  = intStatus;
-    ctx->FaultCtx.FaultIova  = faultIova;
+        handled = TRUE;
+        mergedStatus |= intStatus;
+        if (mi == 0 || faultIova == 0) {
+            faultIova = READ_REGISTER_ULONG(
+                (volatile ULONG*)(base + RK_MMU_PAGE_FAULT_ADDR));
+        }
 
-    /* Acknowledge (clear) the interrupt */
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(ctx->MmioBase + RK_MMU_INT_CLEAR),
-        intStatus & RK_MMU_IRQ_MASK);
-
-    /* If it was a page fault, issue PAGE_FAULT_DONE so the IOMMU unstalls */
-    if (intStatus & RK_MMU_IRQ_PAGE_FAULT) {
+        if (intStatus & RK_MMU_IRQ_PAGE_FAULT) {
+            WRITE_REGISTER_ULONG(
+                (volatile ULONG*)(base + RK_MMU_COMMAND),
+                RK_MMU_CMD_ZAP_CACHE);
+            WRITE_REGISTER_ULONG(
+                (volatile ULONG*)(base + RK_MMU_COMMAND),
+                RK_MMU_CMD_PAGE_FAULT_DONE);
+        }
         WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(ctx->MmioBase + RK_MMU_COMMAND),
-            RK_MMU_CMD_PAGE_FAULT_DONE);
+            (volatile ULONG*)(base + RK_MMU_INT_CLEAR),
+            intStatus & RK_MMU_IRQ_MASK);
     }
+    if (!handled) return FALSE;
+
+    /* Save merged context for the DPC. */
+    ctx->FaultCtx.IntStatus = mergedStatus;
+    ctx->FaultCtx.FaultIova = faultIova;
 
     /* Queue the DPC to call the client callback at DISPATCH_LEVEL */
     WdfInterruptQueueDpcForIsr(Interrupt);

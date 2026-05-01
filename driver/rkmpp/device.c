@@ -33,9 +33,28 @@ typedef struct _RKMPP_DEVICE {
     volatile LONG          FaultTriggered;   /* set to 1 by the callback */
     volatile LONG          FaultStatusReg;   /* status reg captured */
     volatile LONG64        FaultIova;        /* iova captured */
+
+    /* Per-kick core reset is harmful — BSP only resets after error/timeout
+     * (mpp_common.c:2026: if reset_request > 0 mpp_dev_reset).  We mirror
+     * that: 1 before first kick, set after error, cleared after reset. */
+    volatile LONG          NeedsCoreReset;
 } RKMPP_DEVICE, *PRKMPP_DEVICE;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RKMPP_DEVICE, RkMppDeviceGet);
+
+LONG
+RkMppQueryAndClearNeedsCoreReset(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    return InterlockedExchange(&ctx->NeedsCoreReset, 0);
+}
+
+VOID
+RkMppSetNeedsCoreReset(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    InterlockedExchange(&ctx->NeedsCoreReset, 1);
+}
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE     RkMppEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE     RkMppEvtReleaseHardware;
@@ -110,6 +129,14 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     NTSTATUS status = RkMppReadAcpiId(Device, &ctx->Hid, &ctx->Uid);
     if (!NT_SUCCESS(status)) return status;
+
+    /* First kick after PnP MUST reset: empirically, a fresh PD power-on
+     * leaves the codec FSM in a state where dec_e=1 is accepted but the
+     * core never starts (perf[229] doesn't advance, no AXI traffic).
+     * Confirmed by skip-first-reset test: zero decode progress.
+     * Subsequent kicks only reset after error/timeout (BSP parity via
+     * mpp_common.c:2026 — gates mpp_dev_reset on reset_request > 0). */
+    InterlockedExchange(&ctx->NeedsCoreReset, 1);
 
     /* Step 1: walk resources to capture the MMIO base AND the raw+translated
      * descriptors for the first interrupt.  ARM64 GIC line interrupts require

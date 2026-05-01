@@ -12,8 +12,16 @@ static const RKMPP_PROFILE g_profiles[] = {
      * starts at offset 0x100, and reg064 (the first word of the H.264
      * codec-params bank) is the hardware-ID register on rkvdec2.
      * Empirically returns 0x53813f05 on RK3588. */
-    { 0x3550, 0, RKMPP_CODEC_H264, 0x0100 },
-    { 0x3550, 1, RKMPP_CODEC_H264, 0x0100 },
+    /* RKCP3550 / RVD0 + RVD1: rkv-decoder-v2 cores share the same SWREG
+     * layout for H.264 + HEVC (the BSP's trans_tbl_h264d/h265d carry
+     * different reg-index lists for iova substitution but the underlying
+     * register file is the same; the user-mode regbuilder picks the
+     * codec mode in reg009 + reg012).  rkmpp.sys is codec-agnostic on
+     * the kick path: it copies the user-mode RKMPP_REG_WRITE list to
+     * MMIO verbatim, so the driver doesn't need a per-codec gate.
+     * Advertise both. */
+    { 0x3550, 0, RKMPP_CODEC_H264 | RKMPP_CODEC_HEVC, 0x0100 },
+    { 0x3550, 1, RKMPP_CODEC_H264 | RKMPP_CODEC_HEVC, 0x0100 },
     /* All other matching HIDs probe but expose no codec capability in Phase 1. */
     { 0x3510, 0, 0, 0x0000 },
     { 0x3511, 0, 0, 0x0000 },

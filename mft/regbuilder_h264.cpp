@@ -109,11 +109,12 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
         secondary |= RKVDEC2_COLMV_COMPRESS_EN;
     EMIT_P(RKVDEC2_REG_SECONDARY_EN, secondary);
 
-    /* All four bits are required for the codec to start at all — empirical:
-     * dropping streamd_error / colmv_error / h26x_error left dec_e=1
-     * stuck and the codec never issued an AXI read.  These aren't
-     * "abort on error" gates, they're required setup for the error-
-     * tolerance state machine. */
+    /* reg013 — BSP shim capture for the bframe.h264 stream:
+     *   IDR     : 0x01048201  (bit 24 = cur_pic_is_idr SET)
+     *   non-IDR : 0x00048201  (cur_pic_is_idr CLEAR)
+     * The previously-cargo-culted "bit 1 SET on IDR" came from a kernel-
+     * side dmesg trace where the kernel rewrote the value before MMIO;
+     * the user-mode wire value never sets bit 1. */
     uint32_t error_mode = RKVDEC2_TIMEOUT_MODE |
                           RKVDEC2_H26X_STREAMD_ERROR_MODE |
                           RKVDEC2_COLMV_ERROR_MODE |
@@ -124,13 +125,47 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
 
     EMIT_P(RKVDEC2_REG_FBC_PARAMS,  0);                     /* no FBC for raster output */
     EMIT_P(RKVDEC2_REG_STREAM_MODE, 0);                     /* rlc_mode = 0, full bitstream */
-    EMIT_P(RKVDEC2_REG_STR_LEN,     bufs->bitstream_size);
+    /* reg16 str_len — BSP H.264 HAL writes p_hal->strm_len directly
+     * (hal_h264d_vdpu34x.c:321) without rounding.  Match: caller's
+     * raw slice byte count. */
+    EMIT_P(RKVDEC2_REG_STR_LEN, bufs->bitstream_size);
     EMIT_P(RKVDEC2_REG_SLICE_NUM,   0x3FFF);
     EMIT_P(RKVDEC2_REG_Y_HOR_VIRSTRIDE,  luma_stride / 16);
     EMIT_P(RKVDEC2_REG_UV_HOR_VIRSTRIDE, chroma_stride / 16);
     EMIT_P(RKVDEC2_REG_Y_VIRSTRIDE,      y_size / 16);
-    EMIT_P(RKVDEC2_REG_ERROR_CTRL,
-        RKVDEC2_ERROR_INTRA_MODE | RKVDEC2_ERROR_DEB_EN);
+    /* reg21 (error_ctrl): BSP HAL `set_registers` walks the active ref
+     * list and clears error_intra_mode the moment it finds a valid
+     * ref with a closer frame_num than the current minimum (and the
+     * stream isn't using weighted prediction).  Net result observed
+     * in capture:
+     *   IDR              : 0x6 (intra_mode + deb_en) — no refs, stays 1
+     *   first-P-after-IDR: 0x6 — closest ref distance ties, no clear
+     *   subsequent P / B : 0x4 — closer ref found, intra cleared
+     * Approximate this with a heuristic: keep intra_mode set if there
+     * are <= 1 active short-term refs (the IDR-or-first-P case),
+     * clear it otherwise.  The DPB selection's dpb_entries[] count
+     * gives us the active-ref count without re-walking the DPB. */
+    {
+        uint32_t reg21 = RKVDEC2_ERROR_DEB_EN;
+        /* BSP clears error_intra_mode iff some valid ref has
+         *   0 < FrameNumList[i] < pp->frame_num
+         * i.e. there's at least one non-IDR ref older than current.
+         * IDR-only DPB and first-P-after-IDR (only the IDR is a ref,
+         * fn=0) keep error_intra_mode set.  Mirror that rule directly
+         * so reg21 is bit-exact across the bframe.h264 stream. */
+        bool clear_intra = false;
+        uint16_t cur_fn = parsed->decode.frame_num;
+        for (int i = 0; i < 16; i++) {
+            const auto &d = dec.dpb[i];
+            if (!(d.flags & V4L2_H264_DPB_ENTRY_FLAG_VALID)) continue;
+            if (d.frame_num > 0 && d.frame_num < cur_fn) {
+                clear_intra = true;
+                break;
+            }
+        }
+        if (!clear_intra) reg21 |= RKVDEC2_ERROR_INTRA_MODE;
+        EMIT_P(RKVDEC2_REG_ERROR_CTRL, reg21);
+    }
     /* CABAC error-tolerance range for the bitstream-conformance check.
      * Captured from a live BSP `mpi_dec_test` IOCTL trace on the same
      * RK3588 board running mainline rockchip-linux/mpp:
@@ -148,9 +183,18 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
      * single-slot setup.  poc_only_highbit_flag (bit 10) goes with the
      * reg200..204 high-bit POC bank; we keep all-zero high bits, so
      * there's no need to enable that mode. */
-    EMIT_P(RKVDEC2_REG_FILM_IDX,
-        ((current_pic_index & 0x3FF) << RKVDEC2_FILM_IDX_SHIFT));
-    EMIT_P(RKVDEC2_REG_TIMEOUT_THRESH, 0x3FFFF);  /* BSP value */
+    /* reg028 — BSP shim capture (cmd=0x200 idx 20 in the bframe.h264
+     * log) shows 0x00000000 from user-mode for every AU.  An earlier
+     * kernel-side dmesg trace caught a 0x000b0000 write but that's the
+     * BSP kernel rewriting it before MMIO with sw_film_idx=11; from
+     * user-mode the IOCTL sends 0.  Match the user-mode wire value. */
+    (void)current_pic_index;
+    EMIT_P(RKVDEC2_REG_FILM_IDX, 0u);
+    /* reg032 (timeout_thresh) — BSP shim capture writes 0x0003ffff for
+     * H.264, matching the HEVC HAL.  Earlier "kernel writes 0xefffff"
+     * note was about a kernel-side override not visible at the IOCTL
+     * boundary; the user-mode wire value is 0x3ffff. */
+    EMIT_P(RKVDEC2_REG_TIMEOUT_THRESH, 0x0003ffffu);
 
     /* ---- AXI perf-and-QoS statistic bank ----------------------- *
      * BSP `vdpu34x_setup_statistic` (vdpu34x_com.c) — required.
@@ -170,14 +214,11 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
     EMIT_P(RKVDEC2_REG_WR_WAIT_CYCLE_QOS, 0u);
 
     /* ---- H.264 codec params bank ------------------------------- */
-    /* idx 64 (H264_FLAGS): set LASTPACKET + FIRSTSLICE_FLAG for our
-     * raw single-slice IDR.  BSP's IOCTL trace showed 0 here, but BSP
-     * uses a different framing path (kernel-side slice splitting); for
-     * our raw-NAL flow the codec needs both bits to recognise the slice
-     * boundaries.  Empirically: setting to 0 makes the codec error out
-     * via DEC_ERROR_STA before parsing any bitstream. */
-    EMIT_P(RKVDEC2_REG_H264_FLAGS,
-        RKVDEC2_H26X_STREAM_LASTPACKET | RKVDEC2_H264_FIRSTSLICE_FLAG);
+    /* idx 64 (H264_FLAGS): BSP kernel-side log shows 0 (matches the raw
+     * cmd=0x200 byte).  Our previous "0 causes dec_error" empirical
+     * result was with the bug-stack of pre-kick reset every kick +
+     * scanlist=valid_iova + poc_hi=0.  Re-test 0 with all fixes. */
+    EMIT_P(RKVDEC2_REG_H264_FLAGS, 0u);
     EMIT_P(RKVDEC2_REG_CUR_TOP_POC,   (uint32_t)dec.top_field_order_cnt);
     EMIT_P(RKVDEC2_REG_CUR_BOT_POC,   (uint32_t)dec.bottom_field_order_cnt);
 
@@ -190,11 +231,37 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
         EMIT_P(RKVDEC2_REG_REF_POC_BASE + (i * 2 + 1) * 4,
                (uint32_t)d.bottom_field_order_cnt);
     }
-    /* ref-flag words: leave zero for IDR (no refs in DPB). */
-    EMIT_P(RKVDEC2_REG_REF_FLAGS_BASE + 0 * 4, 0);
-    EMIT_P(RKVDEC2_REG_REF_FLAGS_BASE + 1 * 4, 0);
-    EMIT_P(RKVDEC2_REG_REF_FLAGS_BASE + 2 * 4, 0);
-    EMIT_P(RKVDEC2_REG_REF_FLAGS_BASE + 3 * 4, 0);
+    /* reg99..102 — per-slot ref-info nibble (8 bits per slot, 4 slots
+     * per word, vdpu34x_h264d.h SET_REF_INFO).  Bit layout per slot:
+     *   bit 0 : ref{i}_field           (1 = field, 0 = frame)
+     *   bit 1 : ref{i}_topfield_used   (1 = top field is a ref)
+     *   bit 2 : ref{i}_botfield_used   (1 = bot field is a ref)
+     *   bit 3 : ref{i}_colmv_use_flag  (1 = use colmv from this ref)
+     *   bits 4..7 : reserved / 0
+     * BSP shim capture for an active short-term frame ref shows 0x0e
+     * = bits 1+2+3 (top_used + bot_used + colmv_use), with field=0.
+     * Empty slots are 0. */
+    for (int word = 0; word < 4; word++) {
+        uint32_t v = 0;
+        for (int sub = 0; sub < 4; sub++) {
+            int idx = word * 4 + sub;
+            const v4l2_h264_dpb_entry &e = dec.dpb[idx];
+            if (!(e.flags & V4L2_H264_DPB_ENTRY_FLAG_VALID)) continue;
+            uint32_t nib = 0;
+            /* Frame coded: top_used + bot_used; colmv_use_flag for any
+             * short-term ref that the codec might consult for col-MV
+             * temporal direct prediction.  Field bit stays 0. */
+            if (e.fields & V4L2_H264_TOP_FIELD_REF) nib |= (1u << 1);
+            if (e.fields & V4L2_H264_BOTTOM_FIELD_REF) nib |= (1u << 2);
+            if ((e.fields & V4L2_H264_FRAME_REF) == V4L2_H264_FRAME_REF) {
+                nib |= (1u << 1) | (1u << 2);
+            }
+            if (e.flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE)
+                nib |= (1u << 3);
+            v |= (nib & 0xFFu) << (sub * 8);
+        }
+        EMIT_P(RKVDEC2_REG_REF_FLAGS_BASE + word * 4, v);
+    }
     EMIT_P(RKVDEC2_REG_ERROR_REF_FLAGS, 0);
 
     /* ---- DMA addresses (iova-substituted by kernel) ----------- */
@@ -203,12 +270,12 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
     EMIT_I(RKVDEC2_REG_DECOUT_BASE,     bufs->output_frame, 0);
     if (bufs->colmv_cur)
         EMIT_I(RKVDEC2_REG_COLMV_CUR_BASE, bufs->colmv_cur,  0);
-    /* ERROR_REF_BASE: kept as a separately allocated error_ref buffer.
-     * BSP points this at output_frame but doing the same in our build
-     * caused an abrupt system shutdown — codec may write to the
-     * "ref" address and corrupt buffers it shouldn't. */
+    /* ERROR_REF_BASE: BSP kernel writes this == output_frame iova, but
+     * empirically setting it that way regressed our codec from 50% (with
+     * separate error_ref) back to 25% — codec must do something with it
+     * that we don't replicate.  Keep separate error_ref buffer. */
     if (bufs->error_ref)
-        EMIT_I(RKVDEC2_REG_ERROR_REF_BASE, bufs->error_ref,  0);
+        EMIT_I(RKVDEC2_REG_ERROR_REF_BASE, bufs->error_ref, 0);
 
     /* RCB scratch buffers (133..142). */
     for (int i = 0; i < 10; i++) {
@@ -226,47 +293,39 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
         EMIT_I(RKVDEC2_REG_PPS_BASE,    bufs->pps_table, 0);
     if (bufs->rps_table)
         EMIT_I(RKVDEC2_REG_RPS_BASE,    bufs->rps_table, 0);
-    /* scanlist_addr: ALWAYS emit a real iova because we set
-     * scanlist_addr_valid_en in reg012 unconditionally — the codec
-     * issues an AXI read at SCANLIST_ADDR + internal_offset every
-     * decode regardless of whether the stream has an explicit scaling
-     * matrix (the buffer is filled with the H.264 default flat=16
-     * lists upstream when there's no per-PPS matrix).  Emitting 0
-     * here causes an IOMMU fault at iova ~0xae0 a few hundred bytes
-     * into decode. */
-    if (bufs->scaling_list) {
-        EMIT_I(RKVDEC2_REG_SCANLIST_ADDR, bufs->scaling_list, 0);
-    }
+    /* scanlist_addr: BSP emits 0 explicitly.  We previously thought 0
+     * caused an iova-0xae0 fault, but that was actually a different
+     * bug (write-order/explicit-zeros in the driver's bank-write loop,
+     * since fixed).  Match BSP — verified bit-exact in winreplay. */
+    EMIT_P(RKVDEC2_REG_SCANLIST_ADDR, 0u);
     if (bufs->cabac_init_table)
         EMIT_I(RKVDEC2_REG_CABACTBL_BASE, bufs->cabac_init_table, 0);
 
     /* Reference-frame iovas (164..179) and per-ref colmv (181..196).
-     * Empty ref slots get error_ref (separately-allocated buffer);
-     * BSP uses output_frame for these but that caused system-abrupt-
-     * shutdown in our build — possibly because codec writes to
-     * ref_base[0] and stomps the output it should be writing to. */
+     * BSP kernel writes output_frame here for empty refs but pointing
+     * ours at output_frame regressed us — kept on error_ref buffer. */
     for (int i = 0; i < 16; i++) {
-        uint64_t ref      = bufs->refs[i]      ? bufs->refs[i]
-                                               : bufs->error_ref;
-        uint64_t ref_cmv  = bufs->ref_colmv[i] ? bufs->ref_colmv[i]
-                                               : bufs->colmv_cur;
+        uint64_t ref     = bufs->refs[i]      ? bufs->refs[i]      : bufs->error_ref;
+        uint64_t ref_cmv = bufs->ref_colmv[i] ? bufs->ref_colmv[i] : bufs->colmv_cur;
         if (ref)     EMIT_I(RKVDEC2_REG_REF_BASE_FIRST   + i * 4, ref,     0);
         if (ref_cmv) EMIT_I(RKVDEC2_REG_COLMV_BASE_FIRST + i * 4, ref_cmv, 0);
     }
 
-    /* ---- POC high bits (RK3588 only) -------------------------- */
-    /* Pack 4 bits/ref starting at idx 200; idx 204 holds current pic
-     * high bits. */
+    /* ---- POC high bits (RK3588 only) -------------------------- *
+     * BSP shim capture shows 0x33333333 in reg200..203 ONLY for IDR
+     * pictures (with empty DPB — every slot gets the "no-valid-ref"
+     * sentinel nibble 3 to keep the codec from chasing low iovas).
+     * For non-IDR slices BSP writes 0 because reg99..102 disambiguates
+     * empty vs. valid via the topfield_used/botfield_used bits.  The
+     * earlier "always-0x33" was derived from an IDR-only capture. */
     {
-        uint32_t poc_hi[5] = {0,0,0,0,0};
-        for (int i = 0; i < 16; i++) {
-            uint32_t hi = ((uint32_t)dec.dpb[i].top_field_order_cnt >> 28) & 0xF;
-            poc_hi[i / 4] |= hi << ((i % 4) * 8);
-        }
-        poc_hi[4] = ((uint32_t)dec.top_field_order_cnt >> 28) & 0xF;
-        for (int i = 0; i < 5; i++) {
-            EMIT_P(RKVDEC2_REG_POC_HIGHBIT_FIRST + i * 4, poc_hi[i]);
-        }
+        uint32_t fill = (dec.flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC)
+                          ? 0x33333333u : 0u;
+        EMIT_P(RKVDEC2_REG_POC_HIGHBIT_FIRST + 0 * 4, fill);
+        EMIT_P(RKVDEC2_REG_POC_HIGHBIT_FIRST + 1 * 4, fill);
+        EMIT_P(RKVDEC2_REG_POC_HIGHBIT_FIRST + 2 * 4, fill);
+        EMIT_P(RKVDEC2_REG_POC_HIGHBIT_FIRST + 3 * 4, fill);
+        EMIT_P(RKVDEC2_REG_POC_HIGHBIT_FIRST + 4 * 4, 0u);
     }
 
     /* ---- IRQ enable ------------------------------------------- *

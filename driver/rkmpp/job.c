@@ -20,6 +20,29 @@
 
 extern PRKIOMMU_INTERFACE RkMppGetIommuIfc(_In_ WDFDEVICE Device);
 
+/* Defined in device.c — accessor pair for RKMPP_DEVICE.NeedsCoreReset. */
+extern LONG RkMppQueryAndClearNeedsCoreReset(_In_ WDFDEVICE Device);
+extern VOID RkMppSetNeedsCoreReset(_In_ WDFDEVICE Device);
+
+/* Tracing wrapper for codec MMIO writes — matches BSP's
+ * mpp_dev_debug=DEBUG_SET_REG output format so the two traces can be
+ * diffed directly.  Set to 0 to disable. */
+#define RKMPP_TRACE_WRITES 1
+#if RKMPP_TRACE_WRITES
+#define TRACED_WRITE_ULONG(addr, val)                                     \
+    do {                                                                  \
+        ULONG _v = (val);                                                 \
+        ULONG_PTR _a = (ULONG_PTR)(addr);                                 \
+        ULONG _swreg_off = (ULONG)(_a - (ULONG_PTR)mmio - RKVDEC2_SWREG_BASE);\
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,               \
+                   "rkmpp: write reg[%03d]: %04x: 0x%08x\n",              \
+                   _swreg_off / 4, _swreg_off, _v);                       \
+        WRITE_REGISTER_ULONG((volatile ULONG *)(_a), _v);                 \
+    } while (0)
+#else
+#define TRACED_WRITE_ULONG(addr, val) WRITE_REGISTER_ULONG((volatile ULONG*)(addr), val)
+#endif
+
 /* -----------------------------------------------------------------------
  * INT_STATUS register offset — vdpu34x idx 224.
  * Same word holds enable bits when written and status bits when read;
@@ -209,14 +232,19 @@ have_status:
         ULONG rb_rps   = RB(0x28c);     /* idx 163 RPS_BASE */
         ULONG rb_cab   = RB(0x314);     /* idx 197 CABACTBL_BASE */
         ULONG rb_scan  = RB(0x2d0);     /* idx 180 SCANLIST_ADDR */
+        ULONG rb_pochi0= RB(0x320);     /* idx 200 POC_HIGHBIT[0] */
+        ULONG rb_pochi1= RB(0x324);     /* idx 201 */
+        ULONG rb_pochi4= RB(0x330);     /* idx 204 */
 #undef RB
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "  ctrl readback mode=0x%08x dec_e=0x%08x imp=0x%08x "
                    "sec=0x%08x err=0x%08x strlen=0x%08x rlc=0x%08x\n"
                    "  addr readback decout=0x%08x pps=0x%08x rps=0x%08x "
-                   "cabac=0x%08x scanlist=0x%08x\n",
+                   "cabac=0x%08x scanlist=0x%08x\n"
+                   "  poc_hi readback [0]=0x%08x [1]=0x%08x [4]=0x%08x\n",
                    rb_mode, rb_dec_e, rb_imp, rb_sec, rb_err, rb_strln, rb_rlc,
-                   rb_decout, rb_pps, rb_rps, rb_cab, rb_scan);
+                   rb_decout, rb_pps, rb_rps, rb_cab, rb_scan,
+                   rb_pochi0, rb_pochi1, rb_pochi4);
 
         /* Ack pending status bits (write-1-to-clear). */
         if (hwStatus) {
@@ -245,10 +273,15 @@ have_status:
             RKIOMMU_FAULT_SNAPSHOT snap = {0};
             if (NT_SUCCESS(iommu->Snapshot(iommu->Header.Context, &snap))) {
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "  iommu STATUS=0x%08x INT_RAWSTAT=0x%08x "
+                           "  iommu#0 STATUS=0x%08x INT_RAWSTAT=0x%08x "
                            "INT_STATUS=0x%08x FAULT_ADDR=0x%08x DTE=0x%08x\n",
                            snap.Status, snap.IntRawStat, snap.IntStatus,
                            snap.PageFaultAddr, snap.DteAddr);
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "  iommu#1 STATUS=0x%08x INT_RAWSTAT=0x%08x "
+                           "INT_STATUS=0x%08x FAULT_ADDR=0x%08x DTE=0x%08x\n",
+                           snap.Status1, snap.IntRawStat1, snap.IntStatus1,
+                           snap.PageFaultAddr1, snap.DteAddr1);
             }
         }
 
@@ -361,14 +394,19 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         return;
     }
 
-    /* Per-kick core reset.  Without this, a previous failed/aborted job
-     * can leave the codec FSM in a state where dec_e=1 doesn't actually
-     * start a new decode — empirically observed when run N+1 follows a
-     * run N that timed out: pre-kick perf-reg229 still carries run N's
-     * value, dec_e doesn't self-clear, codec issues no AXI traffic.
-     * The BSP's mpp_rkvdec2.c does the same: per-job assert+deassert of
-     * the codec core reset right before writing the register list. */
-    {
+    /* Conditional core reset.  BSP only resets after error/timeout — see
+     * mpp_common.c:2026 (mpp_dev_reset gated on reset_request > 0).  We do
+     * the same: NeedsCoreReset starts 1 (cleared first kick after PnP),
+     * is set after any kick that errors/times out, and otherwise stays 0
+     * so successful back-to-back kicks don't disturb codec internal state.
+     *
+     * Earlier hypothesis was that per-kick reset was needed to flush stale
+     * FSM after a failed kick — that's still served (RkMppJobComplete sets
+     * the flag on error).  But on the *first* successful decode after a
+     * fresh PnP boot, the codec apparently expects to retain initialisation
+     * state across kicks; resetting clobbers something it relies on, which
+     * manifests as INT=0x10 dec_error_sta partway through frame. */
+    if (RkMppQueryAndClearNeedsCoreReset(Device)) {
         PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
         if (ccu && ccu->AssertCoreReset && ccu->DeassertCoreReset) {
             ccu->AssertCoreReset(ccu->Header.Context);
@@ -420,13 +458,13 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
     if (mmioLen >= RKVDEC2_SWREG_BASE + 0x600) {
         const ULONG cache_cfg = 0x13;
 #define CACHE_OFF(o) ((PUCHAR)mmio + RKVDEC2_SWREG_BASE + (o))
-        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x51c), cache_cfg);
-        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x55c), cache_cfg);
-        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x59c), cache_cfg);
+        TRACED_WRITE_ULONG(CACHE_OFF(0x51c), cache_cfg);
+        TRACED_WRITE_ULONG(CACHE_OFF(0x55c), cache_cfg);
+        TRACED_WRITE_ULONG(CACHE_OFF(0x59c), cache_cfg);
         /* clear caches */
-        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x510), 1);
-        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x550), 1);
-        WRITE_REGISTER_ULONG((volatile ULONG *)CACHE_OFF(0x590), 1);
+        TRACED_WRITE_ULONG(CACHE_OFF(0x510), 1);
+        TRACED_WRITE_ULONG(CACHE_OFF(0x550), 1);
+        TRACED_WRITE_ULONG(CACHE_OFF(0x590), 1);
 #undef CACHE_OFF
     }
 
@@ -452,14 +490,61 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         }
     }
 
-    /* Write the register list to MMIO.  Kernel iova substitution
-     * (Phase 3b Task 4) has already rewritten any entry with
-     * BufferHandle != 0 to its resolved iova at submit time. */
-    for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
-        const RKMPP_REG_WRITE *w = &Job->Writes[i];
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG *)((PUCHAR)mmio + w->Offset + RKVDEC2_SWREG_BASE),
-            w->Value);
+    /* Write the register list to MMIO in BSP-equivalent order.  BSP's
+     * mpp_write_req walks regs[s..e] in strict ascending order and
+     * writes EVERY entry in the bank (including zeros for unset slots).
+     * Our regbuilder produces entries in code-emit order with gaps —
+     * which leaves a different INTERMEDIATE codec state during the
+     * write sequence.  To match BSP exactly:
+     *   1. Build a flat 320-entry array indexed by reg idx.
+     *   2. Mark which entries our regbuilder set; rest default to 0.
+     *   3. For each BSP-bank range, write ALL entries (including zeros)
+     *      in ascending order.
+     * Skip idx 10 (kick) in this pass — it goes last as a separate write. */
+    {
+        static const struct { ULONG first, last; } bank_ranges[6] = {
+            {   8,  32 }, {  64, 112 }, { 128, 142 },
+            { 160, 199 }, { 200, 204 }, { 256, 277 },
+        };
+        ULONG bank_vals[6][80] = {0};
+        BOOLEAN bank_seen[6][80] = {0};
+
+        for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
+            const RKMPP_REG_WRITE *w = &Job->Writes[i];
+            ULONG idx = w->Offset / 4;
+            if (idx == 10) continue;
+            for (int b = 0; b < 6; b++) {
+                if (idx >= bank_ranges[b].first && idx <= bank_ranges[b].last) {
+                    ULONG pos = idx - bank_ranges[b].first;
+                    bank_vals[b][pos] = w->Value;
+                    bank_seen[b][pos] = TRUE;
+                    break;
+                }
+            }
+        }
+        for (int b = 0; b < 6; b++) {
+            ULONG count = bank_ranges[b].last - bank_ranges[b].first + 1;
+            for (ULONG p = 0; p < count; p++) {
+                ULONG idx = bank_ranges[b].first + p;
+                /* Skip idx 10 — BSP's mpp_write_req skips reg_en in the
+                 * bank loop and writes it once at the end as the kick. */
+                if (idx == 10) continue;
+                /* BSP writes every slot in the bank, zeros included. */
+                TRACED_WRITE_ULONG(
+                    ((PUCHAR)mmio + idx * 4 + RKVDEC2_SWREG_BASE),
+                    bank_vals[b][p]);
+            }
+        }
+        /* Now the kick (idx 10) — written last, separately. */
+        for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
+            const RKMPP_REG_WRITE *w = &Job->Writes[i];
+            if (w->Offset / 4 == 10) {
+                TRACED_WRITE_ULONG(
+                    ((PUCHAR)mmio + w->Offset + RKVDEC2_SWREG_BASE),
+                    w->Value);
+                break;
+            }
+        }
     }
 
     /* Flush the IOMMU's TLB right before the kick — matches BSP
@@ -511,6 +596,13 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     job->EndQpc        = KeQueryPerformanceCounter(NULL);
     job->Result        = Result;
     job->HardwareStatus = HardwareStatus;
+
+    /* BSP parity: only request a reset when an error/timeout was observed.
+     * RKVDEC_INT_ERROR_MASK = COLMV_REF_ERR | BUF_EMPTY | TIMEOUT | ERROR_STA
+     * = bits 4,5,6,7.  Plus we treat NTSTATUS failure as an error. */
+    if (!NT_SUCCESS(Result) || (HardwareStatus & 0xF0u)) {
+        RkMppSetNeedsCoreReset(Device);
+    }
 
     /* Move from InFlight to Completed. */
     q->InFlight = NULL;

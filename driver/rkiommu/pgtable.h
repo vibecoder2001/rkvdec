@@ -107,6 +107,11 @@ typedef struct _RKIOMMU_DOMAIN {
     ULONG_PTR       *IovaBitmap;    /* 128 KiB bitmap, non-paged pool */
 
     KSPIN_LOCK       Lock;          /* serializes PT writes + bitmap alloc */
+
+    /* Iova page 0 scratch — phantom-read sink for the codec's speculative
+     * low-iova accesses.  4 KiB zero-filled, freed with domain. */
+    volatile ULONG  *Page0Scratch;
+    ULONG            Page0Phys;
 } RKIOMMU_DOMAIN, *PRKIOMMU_DOMAIN;
 
 /* ---------------------------------------------------------------------------

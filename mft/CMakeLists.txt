@@ -4,8 +4,12 @@
 
 add_library(rkmpp_mft STATIC
     parser_glue.cpp
+    parser_glue_h265.cpp
+    avcc_to_annexb.cpp
     regbuilder_h264.cpp
+    regbuilder_h265.cpp
     h264_packed_tables.cpp
+    h265_packed_tables.cpp
     dpb.cpp
 )
 

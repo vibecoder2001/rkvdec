@@ -28,6 +28,7 @@
 #include <wdf.h>
 
 #include "../../shared/rkiommu_ifc.h"
+#include "../../shared/rkmpp_ioctl.h"  /* RkMppBufferUsage* enum */
 #include "device.h"
 #include "pgtable.h"
 
@@ -87,9 +88,22 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
         MmGetMdlByteCount(Mdl));
     if (pageCount == 0) return STATUS_INVALID_PARAMETER;
 
-    /* Build PTE flags from Role */
-    ULONG pteFlags = RK_PTE_PAGE_READABLE;          /* always readable */
-    if (Role & 2u) pteFlags |= RK_PTE_PAGE_WRITABLE;
+    /* Build PTE flags from Role.
+     *
+     * Role is an enum value (RkMppBufferUsage*), NOT a bitmask:
+     *   1 = BitstreamInput   — read-only (codec reads stream)
+     *   2 = ReferenceFrame   — read+write (codec may use as decode target)
+     *   3 = OutputFrame      — read+write (codec writes decoded pixels)
+     *   4 = Scratch          — read+write (RCB row buffers, colmv, etc)
+     *
+     * Old code did `if (Role & 2u)` which incorrectly treats 4 as read-only:
+     *   4 & 2 == 0 → no WRITABLE flag → RCB write attempts fault on
+     *   the write-port MMU.  Mapping all non-bitstream buffers as
+     *   read+write is functionally equivalent to BSP (which uses
+     *   IOMMU_READ | IOMMU_WRITE for all dma_buf attachments). */
+    ULONG pteFlags = RK_PTE_PAGE_READABLE;
+    if (Role != (ULONG)RkMppBufferUsageBitstreamInput)
+        pteFlags |= RK_PTE_PAGE_WRITABLE;
 
     /* Allocate a contiguous IOVA range */
     ULONG64 baseIova;
@@ -197,9 +211,12 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
     if (dev->PagingEnabled && dev->MmioBase) {
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(dev->MmioBase + RK_MMU_COMMAND),
-            RK_MMU_CMD_ZAP_CACHE);
+        int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
+        for (int mi = 0; mi < n_mmu; mi++) {
+            WRITE_REGISTER_ULONG(
+                (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+                RK_MMU_CMD_ZAP_CACHE);
+        }
     }
 
     return STATUS_SUCCESS;
@@ -243,6 +260,14 @@ RkIommuSnapshot(_In_ PVOID ProviderContext,
         (volatile ULONG*)(dev->MmioBase + RK_MMU_PAGE_FAULT_ADDR));
     Out->DteAddr       = READ_REGISTER_ULONG(
         (volatile ULONG*)(dev->MmioBase + RK_MMU_DTE_ADDR));
+    if (dev->MmioLength >= 0x80) {
+        volatile UCHAR *base1 = dev->MmioBase + 0x40;
+        Out->Status1        = READ_REGISTER_ULONG((volatile ULONG*)(base1 + RK_MMU_STATUS));
+        Out->IntRawStat1    = READ_REGISTER_ULONG((volatile ULONG*)(base1 + RK_MMU_INT_RAWSTAT));
+        Out->IntStatus1     = READ_REGISTER_ULONG((volatile ULONG*)(base1 + RK_MMU_INT_STATUS));
+        Out->PageFaultAddr1 = READ_REGISTER_ULONG((volatile ULONG*)(base1 + RK_MMU_PAGE_FAULT_ADDR));
+        Out->DteAddr1       = READ_REGISTER_ULONG((volatile ULONG*)(base1 + RK_MMU_DTE_ADDR));
+    }
     return STATUS_SUCCESS;
 }
 
@@ -255,9 +280,12 @@ RkIommuFlushTlb(_In_ PVOID ProviderContext)
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
     if (!dev->PagingEnabled)    return STATUS_SUCCESS;
-    WRITE_REGISTER_ULONG(
-        (volatile ULONG*)(dev->MmioBase + RK_MMU_COMMAND),
-        RK_MMU_CMD_ZAP_CACHE);
+    int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
+    for (int mi = 0; mi < n_mmu; mi++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_ZAP_CACHE);
+    }
     return STATUS_SUCCESS;
 }
 

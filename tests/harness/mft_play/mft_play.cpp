@@ -103,11 +103,13 @@ static HRESULT CreateRkmppMft(REFCLSID clsid, IMFTransform **out) {
     return hr;
 }
 
-/* -------- pick the video stream + codec -------- */
+/* -------- pick a stream by major type (video or audio) -------- */
 
-static HRESULT PickVideoStream(IMFPresentationDescriptor *pd,
-                               IMFStreamDescriptor **out_sd,
-                               DWORD *out_index, GUID *out_subtype) {
+static HRESULT PickStreamByMajor(IMFPresentationDescriptor *pd,
+                                 const GUID                &want_major,
+                                 IMFStreamDescriptor       **out_sd,
+                                 DWORD                     *out_index,
+                                 GUID                      *out_subtype) {
     DWORD count = 0;
     HRCK(pd->GetStreamDescriptorCount(&count));
     for (DWORD i = 0; i < count; i++) {
@@ -118,7 +120,7 @@ static HRESULT PickVideoStream(IMFPresentationDescriptor *pd,
         HRESULT hr = sd->GetMediaTypeHandler(&mth);
         GUID major = {};
         if (SUCCEEDED(hr)) hr = mth->GetMajorType(&major);
-        if (FAILED(hr) || major != MFMediaType_Video) {
+        if (FAILED(hr) || major != want_major) {
             if (mth) mth->Release();
             sd->Release();
             continue;
@@ -133,10 +135,22 @@ static HRESULT PickVideoStream(IMFPresentationDescriptor *pd,
         if (!selected) pd->SelectStream(i);
         *out_sd      = sd;
         *out_index   = i;
-        *out_subtype = sub;
+        if (out_subtype) *out_subtype = sub;
         return S_OK;
     }
     return MF_E_NO_MORE_TYPES;
+}
+
+static HRESULT PickVideoStream(IMFPresentationDescriptor *pd,
+                               IMFStreamDescriptor **out_sd,
+                               DWORD *out_index, GUID *out_subtype) {
+    return PickStreamByMajor(pd, MFMediaType_Video, out_sd, out_index, out_subtype);
+}
+
+static HRESULT PickAudioStream(IMFPresentationDescriptor *pd,
+                               IMFStreamDescriptor **out_sd,
+                               DWORD *out_index) {
+    return PickStreamByMajor(pd, MFMediaType_Audio, out_sd, out_index, nullptr);
 }
 
 /* -------- topology builders -------- */
@@ -176,6 +190,24 @@ static HRESULT AddOutputNode(IMFTopology *topo, HWND hwnd,
     HRCK(n->SetUINT32(MF_TOPONODE_NOSHUTDOWN_ON_REMOVE, FALSE));
     HRCK(topo->AddNode(n));
     evr->Release();
+    *out = n;
+    return S_OK;
+}
+
+/* SAR (Streaming Audio Renderer) output node.  We attach the source's
+ * audio stream straight to it; MF's topology resolver inserts the
+ * appropriate audio decoder MFT (AAC/etc.) automatically when the
+ * session is started. */
+static HRESULT AddAudioOutputNode(IMFTopology *topo, IMFTopologyNode **out) {
+    IMFActivate *sar = nullptr;
+    HRCK(MFCreateAudioRendererActivate(&sar));
+    IMFTopologyNode *n = nullptr;
+    HRCK(MFCreateTopologyNode(MF_TOPOLOGY_OUTPUT_NODE, &n));
+    HRCK(n->SetObject(sar));
+    HRCK(n->SetUINT32(MF_TOPONODE_STREAMID, 0));
+    HRCK(n->SetUINT32(MF_TOPONODE_NOSHUTDOWN_ON_REMOVE, FALSE));
+    HRCK(topo->AddNode(n));
+    sar->Release();
     *out = n;
     return S_OK;
 }
@@ -307,9 +339,9 @@ int wmain(int argc, wchar_t **argv) {
     IMFPresentationDescriptor *pd = nullptr;
     HRCK(src->CreatePresentationDescriptor(&pd));
 
-    /* Deselect every stream, then re-select only the video stream we
-     * pick.  Skipping audio keeps the topology resolver from trying to
-     * stand up an audio sink we don't care about. */
+    /* Deselect every stream first so PickStreamByMajor takes ownership
+     * of selection.  We re-select video unconditionally and audio if
+     * present — A/V are both wanted so we can verify sync. */
     DWORD sd_count = 0;
     pd->GetStreamDescriptorCount(&sd_count);
     for (DWORD i = 0; i < sd_count; i++) pd->DeselectStream(i);
@@ -318,6 +350,18 @@ int wmain(int argc, wchar_t **argv) {
     DWORD video_idx = 0;
     GUID  video_sub = {};
     HRCK(PickVideoStream(pd, &sd, &video_idx, &video_sub));
+
+    /* Audio is optional — Annex-B / .h264 / .h265 inputs are video-only
+     * and PickAudioStream returns MF_E_NO_MORE_TYPES.  MP4 / MKV / etc.
+     * carrying both video and audio will hit the audio branch and run
+     * SAR alongside the video pipeline.  Both render against the same
+     * MF presentation clock, so any drift between decoded video PTS
+     * and SAR's playback position will manifest as A/V desync. */
+    IMFStreamDescriptor *audio_sd  = nullptr;
+    DWORD                audio_idx = 0;
+    HRESULT              audio_hr  = PickAudioStream(pd, &audio_sd, &audio_idx);
+    const bool           has_audio = SUCCEEDED(audio_hr);
+    std::printf("audio stream: %s\n", has_audio ? "present" : "none");
 
     REFCLSID clsid = (args.codec == CodecPick::H265
                       || (args.codec == CodecPick::Auto && video_sub == MFVideoFormat_HEVC))
@@ -341,6 +385,19 @@ int wmain(int argc, wchar_t **argv) {
     HRCK(src_node ->ConnectOutput(0, xform_node, 0));
     HRCK(xform_node->ConnectOutput(0, out_node, 0));
 
+    /* Audio branch — source straight into SAR.  We deliberately don't
+     * insert a decoder MFT; MF's topology loader does that for us
+     * during SetTopology resolution based on the audio stream's
+     * subtype (AAC / MP3 / PCM / ...).  This is a partially-resolved
+     * branch, which works because MFCreateMediaSession's default
+     * topology loader fills in missing transforms. */
+    IMFTopologyNode *audio_src_node = nullptr, *audio_out_node = nullptr;
+    if (has_audio) {
+        HRCK(AddSourceNode     (topo, src, pd, audio_sd, &audio_src_node));
+        HRCK(AddAudioOutputNode(topo, &audio_out_node));
+        HRCK(audio_src_node->ConnectOutput(0, audio_out_node, 0));
+    }
+
     /* --- session --- */
     IMFMediaSession *sess = nullptr;
     HRCK(MFCreateMediaSession(nullptr, &sess));
@@ -353,8 +410,11 @@ int wmain(int argc, wchar_t **argv) {
     src_node->Release();
     xform_node->Release();
     out_node->Release();
+    if (audio_src_node) audio_src_node->Release();
+    if (audio_out_node) audio_out_node->Release();
     mft->Release();
     sd->Release();
+    if (audio_sd) audio_sd->Release();
     pd->Release();
     src->Shutdown();
     src->Release();

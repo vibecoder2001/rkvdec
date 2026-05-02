@@ -300,6 +300,59 @@ static int DecodeOne_H264(DecodeEngine *e,
         return Fail("dim mismatch");
     }
 
+    /* MMCO trace — print first ~80 AUs that carry MMCO ops or LT-flagged
+     * IDR.  Gated by RKMPP_DECODE_DEBUG=1 OR the first hits regardless,
+     * so we can see what the stream is doing without re-running. */
+    {
+        static int mmco_au = 0;
+        static int mmco_hits = 0;
+        mmco_au++;
+        bool fire = parsed.adaptive_ref_pic_marking_mode_flag ||
+                    parsed.idr_long_term_reference_flag ||
+                    parsed.ref_pic_list_modification_flag_l0 ||
+                    parsed.ref_pic_list_modification_flag_l1;
+        if (fire && mmco_hits < 80) {
+            std::printf("[MMCO au=%d fn=%u idr=%d nri=%u adaptive=%u idr_lt=%u n_ops=%u",
+                        mmco_au,
+                        parsed.decode.frame_num,
+                        (parsed.decode.flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) ? 1 : 0,
+                        parsed.decode.nal_ref_idc,
+                        parsed.adaptive_ref_pic_marking_mode_flag,
+                        parsed.idr_long_term_reference_flag,
+                        parsed.n_mmco);
+            for (uint32_t i = 0; i < parsed.n_mmco; i++) {
+                const H264Mmco &m = parsed.mmco[i];
+                std::printf(" op%u(d=%u ltp=%u lti=%u maxlt+1=%u)",
+                            m.op,
+                            m.difference_of_pic_nums_minus1,
+                            m.long_term_pic_num,
+                            m.long_term_frame_idx,
+                            m.max_long_term_frame_idx_plus1);
+            }
+            if (parsed.ref_pic_list_modification_flag_l0) {
+                std::printf(" RPLM_L0[");
+                for (uint32_t i = 0; i < parsed.n_rplm_l0; i++)
+                    std::printf("%c%u=%u",
+                                i ? ',' : ' ',
+                                parsed.rplm_l0[i].op,
+                                parsed.rplm_l0[i].value);
+                std::printf("]");
+            }
+            if (parsed.ref_pic_list_modification_flag_l1) {
+                std::printf(" RPLM_L1[");
+                for (uint32_t i = 0; i < parsed.n_rplm_l1; i++)
+                    std::printf("%c%u=%u",
+                                i ? ',' : ' ',
+                                parsed.rplm_l1[i].op,
+                                parsed.rplm_l1[i].value);
+                std::printf("]");
+            }
+            std::printf("]\n");
+            std::fflush(stdout);
+            mmco_hits++;
+        }
+    }
+
     DpbSelection sel{};
     if (Dpb_Select(&e->dpb_h264, &parsed, &sel) != DPB_OK)
         return Fail("Dpb_Select failed");
@@ -442,6 +495,22 @@ static int DecodeOne_H264(DecodeEngine *e,
         out_yuv->resize(bytes);
         std::memcpy(out_yuv->data(), e->pool_output[sel.current_slot].user_va,
                     bytes);
+        /* Localize "garbage YUV" issues: hash the first 4 KiB of the
+         * post-memcpy buffer.  Distinct hashes here but recurring hashes
+         * in the final file = reorder window bug; recurring hashes here
+         * = cache/coherency issue or codec not actually writing. */
+        if (DecodeDebugEnabled()) {
+            static int au_idx = 0;
+            const uint8_t *p = out_yuv->data();
+            uint32_t h = 0x811c9dc5;
+            for (int i = 0; i < 4096 && i < (int)bytes; i++) {
+                h ^= p[i]; h *= 16777619;
+            }
+            std::printf("post-memcpy au=%d slot=%u poc=%d hash=%08x\n",
+                        au_idx++, sel.current_slot,
+                        parsed.decode.top_field_order_cnt, h);
+            std::fflush(stdout);
+        }
     }
 
     Dpb_OnDecodeComplete(&e->dpb_h264);

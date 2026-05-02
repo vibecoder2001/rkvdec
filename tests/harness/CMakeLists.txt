@@ -20,12 +20,25 @@ message(STATUS "rkmpp_harness: target=${CMAKE_VS_PLATFORM_NAME} host=${CMAKE_HOS
 # Pull in the user-mode helper library (parser_glue, regbuilder, …).
 add_subdirectory(${CMAKE_SOURCE_DIR}/../../mft ${CMAKE_BINARY_DIR}/mft)
 
+# decode_engine static lib (parser → dpb → packed_tables → regbuilder
+# wrapped around the rkmpp.sys IOCTL surface).  Must be added before
+# mft/dll so the DLL can link it.
+add_subdirectory(rkmpp_decode)
+
+# IMFTransform DLL (Phase 2B — wired through decode_engine).
+add_subdirectory(${CMAKE_SOURCE_DIR}/../../mft/dll ${CMAKE_BINARY_DIR}/mft_dll)
+
 add_subdirectory(rkmpp_caps_dump)
 add_subdirectory(rkmpp_smoke)
 add_subdirectory(rkmpp_iommu_fault)
 add_subdirectory(parser_test)
+add_subdirectory(avcc_test)
+add_subdirectory(parser_test_h265)
 add_subdirectory(regbuilder_test)
 add_subdirectory(packed_tables_test)
 add_subdirectory(dpb_test)
-add_subdirectory(rkmpp_decode)
 add_subdirectory(mp4_extract)
+add_subdirectory(mft_smoke)
+add_subdirectory(mft_decode)
+add_subdirectory(mft_d3d_smoke)
+add_subdirectory(mft_play)

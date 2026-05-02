@@ -1,0 +1,37 @@
+# Makefile.h264diff — host-side / Linux build of winreplay_h264_diff.
+
+MFT ?= mft
+SHARED ?= shared
+EXTERNAL ?= external
+
+CC      ?= gcc
+CXX     ?= g++
+CFLAGS  ?= -O2 -g -Wall -Wno-unused-parameter -Wno-unused-variable -Wno-sign-compare
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=c++17
+INCS    = -I. -I$(MFT) -I$(SHARED) -I$(EXTERNAL)/v4l2-h264-controls
+LDLIBS  = -lstdc++
+
+CPP_OBJS = \
+    $(MFT)/parser_glue.o \
+    $(MFT)/parser_glue_h265.o \
+    $(MFT)/regbuilder_h264.o \
+    $(MFT)/regbuilder_h265.o \
+    $(MFT)/h264_packed_tables.o \
+    $(MFT)/h265_packed_tables.o \
+    $(MFT)/dpb.o
+
+C_OBJS   = winreplay_h264_diff.o
+
+all: winreplay_h264_diff
+
+winreplay_h264_diff: $(CPP_OBJS) $(C_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(INCS) -c -o $@ $<
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(INCS) -c -o $@ $<
+
+clean:
+	rm -f $(CPP_OBJS) $(C_OBJS) winreplay_h264_diff

@@ -140,6 +140,136 @@ RkMppJobQueueTeardown(_Inout_ RKMPP_JOB_QUEUE *Queue)
 }
 
 /* -----------------------------------------------------------------------
+ * RkMppJobsDrainOwner — drain the queue of jobs belonging to a closing
+ * file-object (process exit / handle close).
+ *
+ * Without this, a process can submit a job and exit before the codec
+ * finishes the kick.  The next IOCTL caller's EvtFileCleanup frees the
+ * file's buffer pool — which includes the bitstream / output / colmv
+ * buffers the in-flight job is still DMA'ing to/from.  IOMMU then
+ * tears down those mappings and the codec writes to garbage iovas
+ * (or page-faults, or wedges the box).
+ *
+ * Strategy:
+ *   1. Under the queue lock, splice the Pending list, removing the
+ *      owner's jobs.  These haven't been kicked yet — just free them.
+ *   2. Splice the Completed list the same way.
+ *   3. If InFlight->Owner == File, wait up to TimeoutMs for completion.
+ *      The poller thread keeps running and will move the job from
+ *      InFlight to Completed once INT_RDY (or timeout) hits.  We then
+ *      remove + free our matched entry from Completed.
+ *
+ * Returns STATUS_SUCCESS regardless; *InFlightTimedOut is TRUE when the
+ * in-flight wait ran out, so the caller (EvtFileCleanup) can decide
+ * whether to force-reset before freeing buffers.
+ * --------------------------------------------------------------------- */
+
+NTSTATUS
+RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
+                    _In_ WDFFILEOBJECT File,
+                    _In_ ULONG TimeoutMs,
+                    _Out_ BOOLEAN *InFlightTimedOut)
+{
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+    KIRQL old;
+    LIST_ENTRY toFree;
+    InitializeListHead(&toFree);
+    *InFlightTimedOut = FALSE;
+
+    /* Phase 1: under-lock walk of Pending + Completed lists.  Also
+     * capture a pointer to the in-flight job (if it's ours) so we know
+     * whether to wait afterwards.  We must NOT touch InFlight under
+     * the lock here — the poller fills/clears it. */
+    KeAcquireSpinLock(&q->Lock, &old);
+
+    PLIST_ENTRY entry = q->Pending.Flink;
+    while (entry != &q->Pending) {
+        RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
+        PLIST_ENTRY next = entry->Flink;
+        if (cand->Owner == File) {
+            RemoveEntryList(entry);
+            InsertTailList(&toFree, entry);
+        }
+        entry = next;
+    }
+
+    entry = q->Completed.Flink;
+    while (entry != &q->Completed) {
+        RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
+        PLIST_ENTRY next = entry->Flink;
+        if (cand->Owner == File) {
+            RemoveEntryList(entry);
+            InsertTailList(&toFree, entry);
+        }
+        entry = next;
+    }
+
+    /* Snapshot in-flight ownership while still under the lock. */
+    RKMPP_JOB *inFlight = q->InFlight;
+    BOOLEAN inFlightIsOurs = (inFlight != NULL && inFlight->Owner == File);
+
+    /* Capture the Done event pointer for the wait below — it's safe to
+     * dereference once we have the spinlock-stable inFlight pointer
+     * because the poller never frees an in-flight job while it's still
+     * marked in-flight; it only moves to Completed (then we'd own it
+     * via the next under-lock walk). */
+    KEVENT *doneEvt = inFlightIsOurs ? &inFlight->Done : NULL;
+
+    KeReleaseSpinLock(&q->Lock, old);
+
+    /* Phase 2: free the pending+completed-of-ours list (no lock). */
+    while (!IsListEmpty(&toFree)) {
+        PLIST_ENTRY e = RemoveHeadList(&toFree);
+        RKMPP_JOB *j = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+        ExFreePoolWithTag(j, 'JppM');
+    }
+
+    /* Phase 3: wait for the in-flight job (if it was ours) to complete
+     * naturally.  Most decode kicks finish in <30ms; a 500ms cap is
+     * generous and keeps process-exit latency bounded. */
+    if (inFlightIsOurs && doneEvt) {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
+        NTSTATUS w = KeWaitForSingleObject(doneEvt, Executive, KernelMode,
+                                           FALSE, &timeout);
+        if (w == STATUS_TIMEOUT) {
+            *InFlightTimedOut = TRUE;
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "rkmpp: file-cleanup in-flight wait timed out\n");
+            /* Don't free the in-flight job here — the poller still owns
+             * it and will eventually move it to Completed.  Leaking the
+             * struct is acceptable; the alternative (freeing while the
+             * poller holds a pointer) is a use-after-free.  In practice
+             * the next decode session triggers a core reset which
+             * unblocks the wedged poll. */
+        } else {
+            /* In-flight completed cleanly.  It's now on the Completed
+             * list — pull it off so it doesn't leak waiting for a
+             * WaitJob caller that's never coming. */
+            KeAcquireSpinLock(&q->Lock, &old);
+            entry = q->Completed.Flink;
+            while (entry != &q->Completed) {
+                RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
+                PLIST_ENTRY next = entry->Flink;
+                if (cand->Owner == File) {
+                    RemoveEntryList(entry);
+                    InsertTailList(&toFree, entry);
+                }
+                entry = next;
+            }
+            KeReleaseSpinLock(&q->Lock, old);
+            while (!IsListEmpty(&toFree)) {
+                PLIST_ENTRY e = RemoveHeadList(&toFree);
+                RKMPP_JOB *j = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+                ExFreePoolWithTag(j, 'JppM');
+            }
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/* -----------------------------------------------------------------------
  * RkMppPollerThread — per-device kernel thread that polls INT_STATUS for
  * job completion.
  *
@@ -659,6 +789,7 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
 
     RtlZeroMemory(job, sizeof(*job));
     KeInitializeEvent(&job->Done, NotificationEvent, FALSE);
+    job->Owner = File;
 
     /* Copy the register-write list, performing iova-handle substitution
      * for any entry with BufferHandle != 0.  Iova is 64-bit but the

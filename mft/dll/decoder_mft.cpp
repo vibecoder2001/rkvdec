@@ -631,7 +631,19 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
     ID3D11Texture2D *texture  = nullptr;
     HRESULT hr = S_OK;
 
-    if (d3d_device_ && width_ && height_) {
+    /* D3D11 output path is currently disabled: it requires a texture
+     * pool with cross-context sync (KeyedMutex / fences) to avoid GPU/
+     * CPU races between our UpdateSubresource and EVR's present.
+     * Without that, real-world streams show green/grayscale patches,
+     * scanline tears, and judder.  We still accept SET_D3D_MANAGER so
+     * EVR doesn't refuse the topology, but always emit a sysmem buffer
+     * — EVR uploads it into its own GPU layout with proper sync.
+     * Re-enable once we wire a proper sample-allocator with fences. */
+    /* D3D11 output path is gated off — see comment above.  Force the
+     * sysmem branch by clearing this on entry; we still hold d3d_device_
+     * elsewhere if we ever re-enable. */
+    ID3D11Device *use_d3d = nullptr;
+    if (use_d3d && width_ && height_) {
         /* D3D11 output path: allocate an NV12 ID3D11Texture2D, copy
          * the engine's NV12 frame into it via Map() (works on WARP and
          * on hypothetical real hardware alike since the decoder still
@@ -666,15 +678,25 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
             if (FAILED(hr)) return hr;
         }
 
-        /* Stage upload via UpdateSubresource; works for both WARP and
-         * real GPUs. NV12 is a planar 4:2:0 format — UpdateSubresource
-         * accepts the full surface as a single call with the Y stride
-         * and a contiguous Y+UV byte buffer. */
+        /* Stage upload via UpdateSubresource.  NV12 in D3D11 has TWO
+         * subresources per array slice: Y at index 0 (width × height,
+         * row pitch = width), UV at index 1 (width × height/2 with
+         * interleaved CbCr, row pitch = width).  Updating only
+         * subresource 0 leaves the UV plane uninitialised → green
+         * frames in EVR (chroma defaults to neutral, but the texture's
+         * uninit memory shows as green/random on real GPUs).
+         *
+         * Source buffer layout: contiguous Y followed by UV at offset
+         * width * height. */
         const UINT row_pitch = width_;
         d3d_context_->UpdateSubresource(texture, 0, nullptr,
                                         frame.yuv.data(),
                                         row_pitch,
                                         row_pitch * height_);
+        d3d_context_->UpdateSubresource(texture, 1, nullptr,
+                                        frame.yuv.data() + (size_t)row_pitch * height_,
+                                        row_pitch,
+                                        row_pitch * (height_ / 2));
 
         hr = MFCreateDXGISurfaceBuffer(IID_ID3D11Texture2D, texture,
                                        0 /* subresource */,
@@ -683,13 +705,19 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
         if (FAILED(hr)) { texture->Release(); return hr; }
         mbuf->SetCurrentLength((DWORD)frame.yuv.size());
     } else {
-        /* System-memory fallback (no SET_D3D_MANAGER): wrap NV12 in a
-         * plain IMFMediaBuffer. */
+        /* System-memory output: plain 1D contiguous buffer with
+         * stride == width.  We previously switched to MFCreate2DMediaBuffer
+         * to give EVR an IMF2DBuffer with explicit pitch — but the 2D
+         * buffer's pitch can be wider than width for hardware alignment,
+         * which silently corrupts byte-by-byte consumers (mft_decode →
+         * file → ffplay/PSNR) that assume packed NV12 at stride=width.
+         * EVR honours MF_MT_DEFAULT_STRIDE on plain media buffers, so
+         * 1D + correct attributes is the safer default; if EVR shows
+         * scanline issues again we can re-introduce 2D for the
+         * SET_D3D_MANAGER path only. */
         hr = MFCreateMemoryBuffer((DWORD)frame.yuv.size(), &mbuf);
         if (FAILED(hr)) return hr;
-
-        BYTE *dst = nullptr;
-        DWORD cap = 0, cur = 0;
+        BYTE *dst = nullptr; DWORD cap = 0, cur = 0;
         hr = mbuf->Lock(&dst, &cap, &cur);
         if (FAILED(hr)) { mbuf->Release(); return hr; }
         std::memcpy(dst, frame.yuv.data(), frame.yuv.size());

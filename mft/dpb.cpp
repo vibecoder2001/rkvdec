@@ -14,6 +14,240 @@ static inline void slot_clear(DpbCtx *ctx, int i) {
     ctx->slots[i].frame_num = 0;
     ctx->slots[i].top_poc    = 0;
     ctx->slots[i].bottom_poc = 0;
+    ctx->slots[i].long_term_frame_idx = 0;
+}
+
+/* Find a short-term ref slot with PicNum == picNumX (frame coding:
+ * PicNum == FrameNumWrap == frame_num for refs since wrap-aware). */
+static int find_short_term_by_pic_num(const DpbCtx *ctx, uint32_t pic_num_x) {
+    for (uint32_t i = 0; i < ctx->pool_size; i++) {
+        if (!ctx->slots[i].in_use) continue;
+        if (!ctx->slots[i].is_ref) continue;
+        if (ctx->slots[i].long_term) continue;
+        if ((uint32_t)ctx->slots[i].frame_num == pic_num_x) return (int)i;
+    }
+    return -1;
+}
+
+/* Find a long-term ref slot with LongTermPicNum == lt_pic_num (frame
+ * coding: LongTermPicNum == LongTermFrameIdx). */
+static int find_long_term_by_lt_pic_num(const DpbCtx *ctx, uint32_t lt_pic_num) {
+    for (uint32_t i = 0; i < ctx->pool_size; i++) {
+        if (!ctx->slots[i].in_use) continue;
+        if (!ctx->slots[i].is_ref) continue;
+        if (!ctx->slots[i].long_term) continue;
+        if ((uint32_t)ctx->slots[i].long_term_frame_idx == lt_pic_num) return (int)i;
+    }
+    return -1;
+}
+
+static int find_long_term_by_frame_idx(const DpbCtx *ctx, uint32_t lt_idx) {
+    for (uint32_t i = 0; i < ctx->pool_size; i++) {
+        if (!ctx->slots[i].in_use) continue;
+        if (!ctx->slots[i].is_ref) continue;
+        if (!ctx->slots[i].long_term) continue;
+        if ((uint32_t)ctx->slots[i].long_term_frame_idx == lt_idx) return (int)i;
+    }
+    return -1;
+}
+
+/* Apply ref_pic_list_modification (spec 8.2.4.3) to one of our
+ * already-derived per-slice lists.  Inputs:
+ *   list[]          : v4l2_h264_reference array, sized 32 (existing slot)
+ *   rplm_ops[]      : parsed (op, value) pairs from slice header
+ *   n_rplm          : count of ops
+ *   compact_fn[]    : map compact slot idx -> short-term ref frame_num
+ *   compact_lt[]    : map compact slot idx -> 1 if long-term, 0 if short
+ *   compact_lt_idx[]: long_term_frame_idx (only valid when compact_lt[i]=1)
+ *   n_compact       : number of compact entries
+ *   curr_pic_num    : current picture's PicNum (frame coding: == frame_num)
+ *   max_pic_num     : MaxFrameNum (PicNum modulus)
+ *   active_count    : num_ref_idx_lX_active_minus1+1; truncate list to this
+ *
+ * The algorithm: for each op {0,1,2}, locate the target ref's compact
+ * idx, then do shift-insert at refIdxLX (= number of ops processed so
+ * far), removing any later duplicate so the list still contains each
+ * ref at most once. */
+static void apply_rplm(struct v4l2_h264_reference *list,
+                       const H264ParseResult       *parsed,
+                       int                          which,    /* 0 = L0, 1 = L1 */
+                       const uint16_t              *compact_fn,
+                       const uint8_t               *compact_lt,
+                       const uint16_t              *compact_lt_idx,
+                       uint32_t                     n_compact,
+                       uint16_t                     curr_pic_num,
+                       uint32_t                     max_pic_num,
+                       uint32_t                     active_count)
+{
+    uint8_t  fl    = (which == 0) ? parsed->ref_pic_list_modification_flag_l0
+                                  : parsed->ref_pic_list_modification_flag_l1;
+    if (!fl) return;
+    uint8_t  n_ops = (which == 0) ? parsed->n_rplm_l0 : parsed->n_rplm_l1;
+    const H264RplmOp *ops = (which == 0) ? parsed->rplm_l0 : parsed->rplm_l1;
+    if (n_ops == 0) return;
+
+    /* picNumLXPred starts at CurrPicNum (spec 8.2.4.3.1). */
+    int32_t  pic_num_pred = (int32_t)curr_pic_num;
+    uint32_t ref_idx_lx   = 0;
+
+    for (uint32_t k = 0; k < n_ops; k++) {
+        uint8_t  op  = ops[k].op;
+        uint32_t val = ops[k].value;
+        int32_t  target_compact_idx = -1;
+
+        if (op == 0 || op == 1) {
+            int32_t pic_num_no_wrap;
+            if (op == 0) {
+                pic_num_no_wrap = pic_num_pred - (int32_t)(val + 1);
+                if (pic_num_no_wrap < 0) pic_num_no_wrap += (int32_t)max_pic_num;
+            } else {
+                pic_num_no_wrap = pic_num_pred + (int32_t)(val + 1);
+                if (pic_num_no_wrap >= (int32_t)max_pic_num)
+                    pic_num_no_wrap -= (int32_t)max_pic_num;
+            }
+            pic_num_pred = pic_num_no_wrap;
+            int32_t pic_num_lx = pic_num_no_wrap;
+            if (pic_num_lx > (int32_t)curr_pic_num)
+                pic_num_lx -= (int32_t)max_pic_num;
+            /* Find compact idx of short-term ref with PicNum == pic_num_lx.
+             * For frame coding PicNum = FrameNumWrap; matching by raw
+             * frame_num works whether the value wrapped or not since the
+             * spec arithmetic above already produced a candidate that
+             * collapses to the same wrap class. */
+            int32_t target_fn = pic_num_lx;
+            if (target_fn < 0) target_fn += (int32_t)max_pic_num;
+            for (uint32_t i = 0; i < n_compact; i++) {
+                if (compact_lt[i]) continue;
+                if ((int32_t)compact_fn[i] == target_fn) {
+                    target_compact_idx = (int32_t)i;
+                    break;
+                }
+            }
+        } else if (op == 2) {
+            /* Long-term modification: val == long_term_pic_num. */
+            for (uint32_t i = 0; i < n_compact; i++) {
+                if (!compact_lt[i]) continue;
+                if ((uint32_t)compact_lt_idx[i] == val) {
+                    target_compact_idx = (int32_t)i;
+                    break;
+                }
+            }
+        } else {
+            /* op 3 = end (already filtered by parser) — break defensively. */
+            break;
+        }
+
+        if (target_compact_idx < 0) {
+            /* Modification points at a ref we don't have.  Best we can do
+             * is leave the list alone and continue — applying nothing
+             * matches the codec's would-be reference fallback. */
+            continue;
+        }
+
+        /* Shift list[ref_idx_lx .. active_count-1] right by 1, then place
+         * the target at list[ref_idx_lx].  Then walk the rest of the
+         * (now-32-deep) list and remove the first later duplicate so each
+         * ref appears at most once. */
+        if (ref_idx_lx < 32) {
+            for (int32_t j = 31; j > (int32_t)ref_idx_lx; j--) {
+                list[j] = list[j - 1];
+            }
+            list[ref_idx_lx].index  = (uint8_t)target_compact_idx;
+            list[ref_idx_lx].fields = V4L2_H264_FRAME_REF;
+            for (uint32_t j = ref_idx_lx + 1; j < 32; j++) {
+                if ((list[j].fields & V4L2_H264_FRAME_REF) &&
+                    list[j].index == (uint8_t)target_compact_idx) {
+                    /* collapse */
+                    for (uint32_t m = j; m + 1 < 32; m++) list[m] = list[m + 1];
+                    list[31].fields = 0;
+                    list[31].index  = 0;
+                    break;
+                }
+            }
+        }
+        ref_idx_lx++;
+        if (ref_idx_lx >= active_count) break;
+    }
+
+    /* Truncate beyond active_count — rest stays valid 0-init or prior. */
+    for (uint32_t i = active_count; i < 32; i++) {
+        list[i].fields = 0;
+        list[i].index  = 0;
+    }
+}
+
+/* Apply the captured MMCO list (spec 8.2.5.4) to ctx after the current
+ * picture has been decoded.  `cur` is the slot holding the current pic. */
+static void apply_mmco_ops(DpbCtx *ctx, int cur) {
+    uint16_t curr_pic_num = ctx->pending_curr_pic_num;
+    for (uint32_t k = 0; k < ctx->pending_n_mmco; k++) {
+        const H264Mmco &m = ctx->pending_mmco[k];
+        switch (m.op) {
+        case 1: { /* mark short-term as unused for reference */
+            uint32_t pic_num_x = (uint32_t)curr_pic_num
+                               - (m.difference_of_pic_nums_minus1 + 1);
+            int idx = find_short_term_by_pic_num(ctx, pic_num_x);
+            if (idx >= 0 && idx != cur) slot_clear(ctx, idx);
+            break;
+        }
+        case 2: { /* mark long-term as unused for reference */
+            int idx = find_long_term_by_lt_pic_num(ctx, m.long_term_pic_num);
+            if (idx >= 0 && idx != cur) slot_clear(ctx, idx);
+            break;
+        }
+        case 3: { /* assign LT idx to a short-term ref */
+            uint32_t pic_num_x = (uint32_t)curr_pic_num
+                               - (m.difference_of_pic_nums_minus1 + 1);
+            /* If any LT ref already holds this idx, drop it. */
+            int prev_lt = find_long_term_by_frame_idx(ctx, m.long_term_frame_idx);
+            if (prev_lt >= 0 && prev_lt != cur) slot_clear(ctx, prev_lt);
+            int idx = find_short_term_by_pic_num(ctx, pic_num_x);
+            if (idx >= 0) {
+                ctx->slots[idx].long_term           = 1;
+                ctx->slots[idx].long_term_frame_idx = (uint16_t)m.long_term_frame_idx;
+            }
+            break;
+        }
+        case 4: { /* set MaxLongTermFrameIdx */
+            int32_t new_max = (int32_t)m.max_long_term_frame_idx_plus1 - 1;
+            ctx->max_long_term_frame_idx = new_max;
+            /* Drop LT refs whose idx exceeds the new max. */
+            for (uint32_t i = 0; i < ctx->pool_size; i++) {
+                if (!ctx->slots[i].in_use) continue;
+                if (!ctx->slots[i].is_ref) continue;
+                if (!ctx->slots[i].long_term) continue;
+                if (new_max < 0 ||
+                    (int32_t)ctx->slots[i].long_term_frame_idx > new_max) {
+                    if ((int)i != cur) slot_clear(ctx, (int)i);
+                }
+            }
+            break;
+        }
+        case 5: { /* mark all as unused for reference */
+            for (uint32_t i = 0; i < ctx->pool_size; i++) {
+                if ((int)i != cur) slot_clear(ctx, (int)i);
+            }
+            ctx->max_long_term_frame_idx = -1;
+            /* Spec 8.2.5.4.5: current pic is treated as having frame_num 0
+             * after MMCO 5; reflect that in slot bookkeeping so subsequent
+             * sliding-window math (none here, but parity) stays sane. */
+            if (cur >= 0) {
+                ctx->slots[cur].frame_num = 0;
+            }
+            break;
+        }
+        case 6: { /* mark current as long-term */
+            int prev_lt = find_long_term_by_frame_idx(ctx, m.long_term_frame_idx);
+            if (prev_lt >= 0 && prev_lt != cur) slot_clear(ctx, prev_lt);
+            if (cur >= 0) {
+                ctx->slots[cur].long_term           = 1;
+                ctx->slots[cur].long_term_frame_idx = (uint16_t)m.long_term_frame_idx;
+            }
+            break;
+        }
+        default: break;
+        }
+    }
 }
 
 static int find_free(const DpbCtx *ctx) {
@@ -24,17 +258,30 @@ static int find_free(const DpbCtx *ctx) {
 }
 
 /* Sliding-window eviction: drop the short-term reference with the
- * oldest frame_num (H.264 8.2.5.3). */
+ * smallest FrameNumWrap (H.264 8.2.5.3 + 8.2.4.1).
+ *
+ * FrameNumWrap = frame_num if frame_num <= CurrPicNum else
+ *                frame_num - MaxFrameNum.
+ *
+ * Using raw frame_num here breaks across frame_num wrap: when CurrPicNum
+ * wraps from MaxFrameNum-1 to 0, every still-live ref has frame_num
+ * larger than CurrPicNum and FrameNumWrap negative, so the just-added
+ * ref (with frame_num=0) ISN'T the smallest under the spec — but it IS
+ * under raw-frame_num comparison, and would get incorrectly evicted. */
 static void evict_oldest_short_term(DpbCtx *ctx) {
     int oldest = -1;
-    uint16_t oldest_fn = 0;
+    int32_t oldest_fnw = 0;
+    int32_t curr_fn    = (int32_t)ctx->curr_pic_num;
+    int32_t max_fn     = (int32_t)(ctx->max_frame_num ? ctx->max_frame_num : 16);
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
         if (!ctx->slots[i].in_use) continue;
         if (!ctx->slots[i].is_ref) continue;
         if (ctx->slots[i].long_term) continue;
-        if (oldest < 0 || ctx->slots[i].frame_num < oldest_fn) {
-            oldest    = (int)i;
-            oldest_fn = ctx->slots[i].frame_num;
+        int32_t fn  = (int32_t)ctx->slots[i].frame_num;
+        int32_t fnw = (fn > curr_fn) ? fn - max_fn : fn;
+        if (oldest < 0 || fnw < oldest_fnw) {
+            oldest      = (int)i;
+            oldest_fnw  = fnw;
         }
     }
     if (oldest >= 0) slot_clear(ctx, oldest);
@@ -53,8 +300,9 @@ DpbStatus Dpb_Init(DpbCtx *ctx, const DpbPoolEntry *pool, uint32_t pool_size)
     }
 
     memset(ctx, 0, sizeof(*ctx));
-    ctx->pool_size   = pool_size;
-    ctx->current_idx = -1;
+    ctx->pool_size              = pool_size;
+    ctx->current_idx            = -1;
+    ctx->max_long_term_frame_idx = -1; /* "no LT" until MMCO 4 sets it */
     for (uint32_t i = 0; i < pool_size; i++) {
         ctx->pool[i] = pool[i];
     }
@@ -68,40 +316,22 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
     if (!ctx || !parsed || !out) return DPB_INVALID_INPUT;
     if (!parsed->has_slice)      return DPB_INVALID_INPUT;
 
-    /* IDR flushes everything before picking the new slot. */
-    if (parsed->decode.flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) {
+    /* IDR flushes everything before picking the new slot.  Spec 8.2.5.1:
+     * MaxLongTermFrameIdx becomes 0 if long_term_reference_flag set
+     * (and the IDR pic itself is stored as LT idx 0); else "no LT". */
+    const bool is_idr = (parsed->decode.flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) != 0;
+    if (is_idr) {
         for (uint32_t i = 0; i < ctx->pool_size; i++) slot_clear(ctx, (int)i);
+        ctx->max_long_term_frame_idx = parsed->idr_long_term_reference_flag ? 0 : -1;
     }
 
-    /* BSP-parity pre-Select eviction for non-ref AUs.
-     *
-     * Empirically BSP's DPB at non-ref-AU init time has at most
-     * `max_num_ref_frames - 1` short-term refs.  This emerges from the
-     * combination of `store_picture_in_dpb`'s while-loop output sequence
-     * plus subsequent ref-pic stores running sliding-window:
-     *   - After AU 3 (last P ref): DPB = 4 refs.
-     *   - AU 4 (B nonref) at decode-prep time: BSP shim shows 3 refs.
-     * Tracing the BSP code paths doesn't reveal a single-line cause, but
-     * the observable invariant is: non-ref AU's regs see at most max-1
-     * refs; ref AUs see up to max.  Mirror that empirical bound directly
-     * by evicting the oldest short-term ref when the upcoming pic is
-     * non-ref AND the DPB is already at max.
-     *
-     * For ref pics we DON'T evict at Select — eviction is deferred to
-     * OnDecodeComplete after add (matching BSP sliding_window semantics). */
-    if (parsed->decode.nal_ref_idc == 0) {
-        uint32_t max_refs = parsed->sps.max_num_ref_frames;
-        if (max_refs == 0) max_refs = 1;
-        for (;;) {
-            uint32_t cnt = 0;
-            for (uint32_t i = 0; i < ctx->pool_size; i++) {
-                if (ctx->slots[i].in_use && ctx->slots[i].is_ref &&
-                    !ctx->slots[i].long_term) cnt++;
-            }
-            if (cnt < max_refs) break;
-            evict_oldest_short_term(ctx);
-        }
-    }
+    /* No pre-Select eviction.  Per H.264 8.2.5, sliding-window runs only
+     * when ADDING a ref picture (handled in Dpb_OnDecodeComplete).  Non-
+     * ref pictures don't change the active-ref count, so they never need
+     * eviction.  An earlier "BSP-parity max-1" pre-eviction here was
+     * wrong: it dropped a still-live ref before the B pic, leaving the
+     * NEXT P pic with too few refs (parser_dump exposed this on
+     * dancing.h264 between au=11 P fn=11 and au=13 P fn=12). */
 
     int slot = find_free(ctx);
     if (slot < 0) {
@@ -114,12 +344,24 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
     /* Populate the chosen slot for the picture currently being decoded. */
     ctx->slots[slot].in_use     = 1;
     ctx->slots[slot].is_ref     = (parsed->decode.nal_ref_idc != 0);
-    ctx->slots[slot].long_term  = 0;
+    ctx->slots[slot].long_term  = (is_idr && parsed->idr_long_term_reference_flag) ? 1 : 0;
     ctx->slots[slot].fields     = V4L2_H264_FRAME_REF;
     ctx->slots[slot].frame_num  = parsed->decode.frame_num;
     ctx->slots[slot].top_poc    = parsed->decode.top_field_order_cnt;
     ctx->slots[slot].bottom_poc = parsed->decode.bottom_field_order_cnt;
+    ctx->slots[slot].long_term_frame_idx = 0;   /* IDR LT idx is 0 by spec */
     ctx->current_idx            = slot;
+
+    /* Capture the dec_ref_pic_marking surface for OnDecodeComplete to
+     * apply.  IDR's long_term_reference_flag was handled above; non-IDR
+     * MMCO ops are deferred (spec 8.2.5.4 — MMCO runs after pic decode). */
+    ctx->pending_adaptive     = (!is_idr) ? parsed->adaptive_ref_pic_marking_mode_flag : 0;
+    ctx->pending_n_mmco       = (!is_idr) ? parsed->n_mmco : 0;
+    ctx->pending_curr_pic_num = parsed->decode.frame_num;
+    if (ctx->pending_n_mmco > 0) {
+        memcpy(ctx->pending_mmco, parsed->mmco,
+               sizeof(H264Mmco) * ctx->pending_n_mmco);
+    }
 
     /* Sliding-window ref marking (H.264 8.2.5.3) is DEFERRED to
      * Dpb_OnDecodeComplete.
@@ -135,6 +377,10 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
      * the bound without re-parsing the SPS. */
     ctx->max_num_ref_frames = parsed->sps.max_num_ref_frames;
     if (ctx->max_num_ref_frames == 0) ctx->max_num_ref_frames = 1;
+    /* Capture FrameNumWrap reference state for OnDecodeComplete's
+     * sliding-window eviction (spec 8.2.4.1). */
+    ctx->max_frame_num = 1u << (parsed->sps.log2_max_frame_num_minus4 + 4);
+    ctx->curr_pic_num  = (uint16_t)parsed->decode.frame_num;
 
     /* Fill caller-visible selection. */
     memset(out, 0, sizeof(*out));
@@ -166,6 +412,7 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
         int32_t  bottom_poc;
         uint8_t  fields;
         uint8_t  long_term;
+        uint16_t long_term_frame_idx;
     };
     CompactRef compact[DPB_MAX_SLOTS];
     uint32_t   n_compact = 0;
@@ -179,14 +426,29 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
         compact[n_compact].bottom_poc = ctx->slots[i].bottom_poc;
         compact[n_compact].fields     = ctx->slots[i].fields;
         compact[n_compact].long_term  = ctx->slots[i].long_term;
+        compact[n_compact].long_term_frame_idx = ctx->slots[i].long_term_frame_idx;
         n_compact++;
     }
-    /* Sort by frame_num ascending — matches BSP fs[] decode-order traversal
-     * once sliding-window has compacted earlier evictions out.  For our
-     * test streams (no fn wrap, no LT) this is also FrameNumWrap ascending. */
-    for (uint32_t i = 1; i < n_compact; i++) {
-        for (uint32_t j = i; j > 0 && compact[j-1].frame_num > compact[j].frame_num; j--) {
-            CompactRef t = compact[j-1]; compact[j-1] = compact[j]; compact[j] = t;
+    /* Sort by FrameNumWrap ascending — matches BSP fs[] decode-order
+     * traversal in the wrap-aware case (h264d_init.c FrameNumWrap fixup).
+     * Raw-frame_num ascending was an approximation that holds only when
+     * no frame_num wrap occurred; post-wrap the orderings disagree
+     * (e.g. cur=2, refs fn=0,1,15 → raw asc = [0,1,15] but FNW asc =
+     * [15(=-1), 0, 1] since fn>cur becomes negative).  The compact slot
+     * order seeds reg67..98 (POC bank) and the rps_table per-slot
+     * fields; mismatch produces wrong inter prediction on post-wrap
+     * P frames. */
+    {
+        int32_t cur_fn   = (int32_t)parsed->decode.frame_num;
+        int32_t max_fn_w = (int32_t)(1u << (parsed->sps.log2_max_frame_num_minus4 + 4));
+        auto    fnw      = [&](const CompactRef &c) -> int32_t {
+            int32_t fn = (int32_t)c.frame_num;
+            return (fn > cur_fn) ? fn - max_fn_w : fn;
+        };
+        for (uint32_t i = 1; i < n_compact; i++) {
+            for (uint32_t j = i; j > 0 && fnw(compact[j-1]) > fnw(compact[j]); j--) {
+                CompactRef t = compact[j-1]; compact[j-1] = compact[j]; compact[j] = t;
+            }
         }
     }
 
@@ -207,7 +469,12 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
             e.flags |= V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM;
         e.fields    = compact[i].fields;
         e.frame_num = compact[i].frame_num;
-        e.pic_num   = compact[i].frame_num;
+        /* For LT refs, pic_num conveys LongTermPicNum (frame coding:
+         * == LongTermFrameIdx).  ST refs use raw frame_num — the codec
+         * keys ref selection off POC (top_field_order_cnt) anyway, and
+         * empirically rejects FrameNumWrap-encoded pic_num. */
+        e.pic_num   = compact[i].long_term ? compact[i].long_term_frame_idx
+                                           : compact[i].frame_num;
         e.top_field_order_cnt    = compact[i].top_poc;
         e.bottom_field_order_cnt = compact[i].bottom_poc;
     }
@@ -290,14 +557,27 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
             for (uint32_t j = i; j > 0 && future[j-1].poc > future[j].poc; j--)
                 { auto t = future[j-1]; future[j-1] = future[j]; future[j] = t; }
 
-        /* listP[0] → ref_lists[0]: ALL n_compact refs, frame_num desc. */
+        /* listP[0] → ref_lists[0]: ALL n_compact refs sorted by
+         * FrameNumWrap descending (spec 8.2.4.2.1).  FrameNumWrap is
+         * `frame_num <= CurrPicNum ? frame_num : frame_num - MaxFrameNum`,
+         * giving a signed picture-distance.  Raw-frame_num desc is wrong
+         * across frame_num wrap (e.g. fn=15 should sort BEFORE fn=0
+         * after a wrap because 15-16=-1 < 0). */
         {
-            RefSort all[DPB_MAX_SLOTS];
+            int32_t cur_fn   = (int32_t)parsed->decode.frame_num;
+            int32_t max_fn_w = (int32_t)(1u << (parsed->sps.log2_max_frame_num_minus4 + 4));
+            struct RefP { uint32_t compact_idx; int32_t fnw; };
+            RefP all[DPB_MAX_SLOTS];
             uint32_t n = 0;
-            for (uint32_t i = 0; i < n_past; i++) all[n++] = past[i];
-            for (uint32_t i = 0; i < n_fut;  i++) all[n++] = future[i];
+            for (uint32_t i = 0; i < n_compact; i++) {
+                int32_t fn  = (int32_t)compact[i].frame_num;
+                int32_t fnw = (fn > cur_fn) ? fn - max_fn_w : fn;
+                all[n].compact_idx = i;
+                all[n].fnw         = fnw;
+                n++;
+            }
             for (uint32_t i = 1; i < n; i++)
-                for (uint32_t j = i; j > 0 && all[j-1].frame_num < all[j].frame_num; j--)
+                for (uint32_t j = i; j > 0 && all[j-1].fnw < all[j].fnw; j--)
                     { auto t = all[j-1]; all[j-1] = all[j]; all[j] = t; }
             for (uint32_t i = 0; i < n && i < 32; i++) {
                 out->ref_lists[0][i].index  = (uint8_t)all[i].compact_idx;
@@ -348,6 +628,53 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
                 }
             }
         }
+
+        /* ref_pic_list_modification (spec 8.2.4.3) — applied AFTER the
+         * default lists are built.  For P slices (and SP), modifies
+         * ref_lists[0] (= listP).  For B slices, modifies ref_lists[1]
+         * (B's L0) and ref_lists[2] (B's L1).  Without applying these,
+         * the codec uses our default POC/frame_num-sorted lists which
+         * disagree with what the slice header asks for → wrong inter
+         * prediction → cascading garbage from the first RPLM-using AU. */
+        if (parsed->ref_pic_list_modification_flag_l0 ||
+            parsed->ref_pic_list_modification_flag_l1) {
+            uint16_t compact_fn_arr [DPB_MAX_SLOTS];
+            uint8_t  compact_lt_arr [DPB_MAX_SLOTS];
+            uint16_t compact_lti_arr[DPB_MAX_SLOTS];
+            for (uint32_t i = 0; i < n_compact; i++) {
+                compact_fn_arr [i] = compact[i].frame_num;
+                compact_lt_arr [i] = compact[i].long_term;
+                compact_lti_arr[i] = compact[i].long_term_frame_idx;
+            }
+            uint32_t max_pic_num = ctx->max_frame_num
+                                   ? ctx->max_frame_num : 16u;
+            uint16_t curr_pic_num = (uint16_t)parsed->decode.frame_num;
+            const uint8_t st_local = parsed->slice.slice_type;
+
+            uint32_t l0_active = (uint32_t)parsed->slice.num_ref_idx_l0_active_minus1 + 1u;
+            uint32_t l1_active = (uint32_t)parsed->slice.num_ref_idx_l1_active_minus1 + 1u;
+            if (l0_active > 32) l0_active = 32;
+            if (l1_active > 32) l1_active = 32;
+
+            if (st_local == V4L2_H264_SLICE_TYPE_P ||
+                st_local == V4L2_H264_SLICE_TYPE_SP) {
+                /* P slice: modify listP (= ref_lists[0]). */
+                apply_rplm(out->ref_lists[0], parsed, /*which=*/0,
+                           compact_fn_arr, compact_lt_arr, compact_lti_arr,
+                           n_compact, curr_pic_num, max_pic_num,
+                           l0_active);
+            } else if (st_local == V4L2_H264_SLICE_TYPE_B) {
+                /* B slice: modify both B-list halves. */
+                apply_rplm(out->ref_lists[1], parsed, /*which=*/0,
+                           compact_fn_arr, compact_lt_arr, compact_lti_arr,
+                           n_compact, curr_pic_num, max_pic_num,
+                           l0_active);
+                apply_rplm(out->ref_lists[2], parsed, /*which=*/1,
+                           compact_fn_arr, compact_lt_arr, compact_lti_arr,
+                           n_compact, curr_pic_num, max_pic_num,
+                           l1_active);
+            }
+        }
     }
     return DPB_OK;
 }
@@ -363,24 +690,31 @@ void Dpb_OnDecodeComplete(DpbCtx *ctx)
     if (!ctx->slots[cur].is_ref) {
         /* Non-reference picture — release the slot back to the pool. */
         slot_clear(ctx, cur);
+        ctx->pending_adaptive = 0;
+        ctx->pending_n_mmco   = 0;
         return;
     }
 
-    /* Reference picture stays in the DPB.  Apply sliding-window short-
-     * term ref bound (H.264 8.2.5.3): if the total count of short-term
-     * + long-term refs in the DPB exceeds max_num_ref_frames, drop the
-     * one with the smallest FrameNumWrap.  max_num_ref_frames was
-     * captured in Dpb_Select. */
-    uint32_t max_refs = ctx->max_num_ref_frames ? ctx->max_num_ref_frames : 1;
-    for (;;) {
-        uint32_t cnt = 0;
-        for (uint32_t i = 0; i < ctx->pool_size; i++) {
-            if (ctx->slots[i].in_use && ctx->slots[i].is_ref &&
-                !ctx->slots[i].long_term) cnt++;
+    /* Spec 8.2.5.4: if adaptive_ref_pic_marking_mode_flag was set, MMCO
+     * ops fully replace sliding-window.  Otherwise run sliding-window
+     * (8.2.5.3). */
+    if (ctx->pending_adaptive) {
+        apply_mmco_ops(ctx, cur);
+    } else {
+        uint32_t max_refs = ctx->max_num_ref_frames ? ctx->max_num_ref_frames : 1;
+        for (;;) {
+            uint32_t cnt = 0;
+            for (uint32_t i = 0; i < ctx->pool_size; i++) {
+                if (ctx->slots[i].in_use && ctx->slots[i].is_ref &&
+                    !ctx->slots[i].long_term) cnt++;
+            }
+            if (cnt <= max_refs) break;
+            evict_oldest_short_term(ctx);
         }
-        if (cnt <= max_refs) break;
-        evict_oldest_short_term(ctx);
     }
+
+    ctx->pending_adaptive = 0;
+    ctx->pending_n_mmco   = 0;
 }
 
 /* =====================================================================

@@ -22,6 +22,11 @@ typedef struct _RKMPP_JOB {
     UINT32          HardwareStatus; /* raw INT_STATUS value (0 in Phase 2) */
     LARGE_INTEGER   StartQpc;
     LARGE_INTEGER   EndQpc;
+    /* Owning file-object (the open handle that submitted this job).
+     * EvtFileCleanup uses this to drain a process's outstanding jobs
+     * before freeing its buffer pool — keeps the codec from DMA'ing
+     * to iovas whose backing memory we just freed. */
+    WDFFILEOBJECT   Owner;
     /* Snapshot of the submission inputs.  Phase 3 will translate BufRefs into
      * iova substitutions on the register list before kicking hardware. */
     UINT32          RegWriteCount;
@@ -85,6 +90,26 @@ NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
 NTSTATUS RkMppJobPeek(_In_ WDFDEVICE Device,
                       _In_ UINT64 JobId,
                       _Out_ RKMPP_PEEK_JOB_OUT *Out);
+
+/* Drain all jobs owned by a closing file-object so the codec is no
+ * longer DMA'ing to iovas backed by buffers we're about to free.
+ *
+ * Pending jobs (queued, not yet kicked): removed and freed.
+ * In-flight job (kicked, awaiting INT_RDY): waited up to TimeoutMs;
+ *   if it doesn't complete, returned STATUS_TIMEOUT (caller may then
+ *   force-reset).  When in-flight does complete in time we let the
+ *   normal RkMppJobComplete path run.
+ * Completed jobs (finished, not WaitJob'd): removed and freed.
+ *
+ * Caller is RkMppEvtFileCleanup; thread is the closing process /
+ * a system worker if the process already exited.
+ *
+ * Returns STATUS_SUCCESS even when in-flight timed out; the bool
+ * out tells the caller whether to follow up with a hardware reset. */
+NTSTATUS RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
+                             _In_ WDFFILEOBJECT File,
+                             _In_ ULONG TimeoutMs,
+                             _Out_ BOOLEAN *InFlightTimedOut);
 
 /* ISR — declared here so device.c can pass it to WdfInterruptCreate. */
 EVT_WDF_INTERRUPT_ISR  RkMppEvtIsr;

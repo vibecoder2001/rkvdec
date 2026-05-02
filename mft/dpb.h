@@ -70,6 +70,24 @@ typedef struct DpbCtx {
     /* Sliding-window bound captured at Select time so OnDecodeComplete
      * can apply H.264 8.2.5.3 eviction without re-parsing the SPS. */
     uint32_t     max_num_ref_frames;
+    /* Captured for FrameNumWrap math during eviction (spec 8.2.4.1).
+     * max_frame_num = 1 << (log2_max_frame_num_minus4 + 4); curr_pic_num
+     * is the frame_num of the most recently decoded reference picture. */
+    uint32_t     max_frame_num;
+    uint16_t     curr_pic_num;
+
+    /* MaxLongTermFrameIdx (spec 8.2.5.4 op 4); -1 means "no LT allowed".
+     * Initial value is "no LT" until an MMCO 4 sets it (spec 8.2.5.2). */
+    int32_t      max_long_term_frame_idx;
+
+    /* Deferred MMCO state captured at Dpb_Select time and applied in
+     * Dpb_OnDecodeComplete after the codec finishes decoding the pic
+     * (spec 8.2.5.4 — MMCO runs after decode). */
+    uint8_t      pending_adaptive;
+    uint8_t      pending_n_mmco;
+    H264Mmco     pending_mmco[H264_MAX_MMCO_OPS];
+    /* Captured at Select time so OnDecodeComplete can resolve PicNumX. */
+    uint16_t     pending_curr_pic_num;
 
     /* Per-slot state. */
     struct {
@@ -80,6 +98,7 @@ typedef struct DpbCtx {
         uint16_t frame_num;
         int32_t  top_poc;
         int32_t  bottom_poc;
+        uint16_t long_term_frame_idx;
     } slots[DPB_MAX_SLOTS];
 } DpbCtx;
 

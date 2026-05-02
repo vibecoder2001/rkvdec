@@ -28,5 +28,14 @@ Makefile
 *.code-workspace
 # Test fixtures generated locally — may have copyright issues
 tests/data/*.h264
+tests/data/*.h265
+tests/data/*.264
+tests/data/*.265
 tests/data/*.yuv
 tests/data/*.mp4
+# Generated parser test streams (reproducible via generate_streams.sh)
+tests/data/streams_h264/
+tests/data/streams_h265/
+# FATE samples (downloaded — license / large binaries)
+tests/data/fate_h264/
+tests/data/fate_h265/

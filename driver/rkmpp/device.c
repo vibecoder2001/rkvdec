@@ -490,6 +490,38 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
         /* Never initialised — nothing to do. */
         return;
     }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkmpp: EvtFileCleanup fileobject=%p — draining jobs\n",
+               FileObject);
+
+    /* Drain this file-object's outstanding jobs BEFORE freeing its
+     * buffer pool.  If a kicked job's bitstream / output / colmv
+     * buffers vanish from under the codec mid-DMA, the IOMMU tears
+     * down the mappings and the codec's next AXI transaction wedges
+     * the cluster (and historically the whole driver).  500ms cap is
+     * plenty for a single decode-kick to finish.
+     *
+     * Only force a core reset on the next kick when we ACTUALLY hit
+     * the timeout — if the in-flight finished cleanly, the codec is
+     * idle and another session's clean kick shouldn't pay the reset
+     * cost.  Forcing reset unconditionally regressed the common case
+     * (process exits cleanly post-playback → next session's first
+     * kick burned a reset for nothing, and the inter-session timing
+     * disrupted ongoing pipelines on other cores). */
+    BOOLEAN timedOut = FALSE;
+    (void)RkMppJobsDrainOwner(ctx->Device, FileObject, 500, &timedOut);
+    if (timedOut) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "rkmpp: FileCleanup in-flight wait timed out — "
+                   "marking codec for reset on next submission\n");
+        RkMppSetNeedsCoreReset(ctx->Device);
+    } else {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "rkmpp: drain done fileobject=%p clean (no reset)\n",
+                   FileObject);
+    }
+
     RkMppBufFreeAll(FileObject);
 }
 

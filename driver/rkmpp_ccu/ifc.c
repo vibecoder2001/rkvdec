@@ -15,6 +15,7 @@ NTSTATUS RkMppCcuRaiseCluster    (_In_  PVOID   Ctx);
 NTSTATUS RkMppCcuDropCluster     (_In_  PVOID   Ctx);
 NTSTATUS RkMppCcuAssertCoreReset (_In_  PVOID   Ctx);
 NTSTATUS RkMppCcuDeassertCoreReset(_In_ PVOID   Ctx);
+NTSTATUS RkMppCcuFullCoreReset   (_In_  PVOID   Ctx);
 
 NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device)
 {
@@ -38,6 +39,7 @@ NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.DropCluster              = RkMppCcuDropCluster;
     ifc.AssertCoreReset          = RkMppCcuAssertCoreReset;
     ifc.DeassertCoreReset        = RkMppCcuDeassertCoreReset;
+    ifc.FullCoreReset            = RkMppCcuFullCoreReset;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

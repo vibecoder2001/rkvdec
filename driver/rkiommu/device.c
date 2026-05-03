@@ -89,6 +89,73 @@ RkIommuReadAcpiId(_In_ WDFDEVICE Device,
 }
 
 /* ---------------------------------------------------------------------------
+ * RkIommuDisable — pair to RkIommuEnable.  Mirrors Linux's
+ * rockchip_iommu_disable: mask IRQs, command DISABLE_PAGING, zero
+ * DTE_ADDR.  All MMU instances are touched.  After this returns, the
+ * IOMMU is in the same state as before any RkIommuEnable was ever
+ * called — page-table contents preserved (Domain is not freed) but the
+ * hardware no longer holds any walk-cache state for them.
+ *
+ * Idempotent: calling on an already-disabled IOMMU returns SUCCESS
+ * without touching MMIO.
+ * --------------------------------------------------------------------------- */
+_Use_decl_annotations_
+NTSTATUS RkIommuDisable(PRKIOMMU_DEVICE Dev)
+{
+    if (!Dev || !Dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+    if (!Dev->PagingEnabled)    return STATUS_SUCCESS;
+
+    int n_cfg = (Dev->MmioLength >= 0x80) ? 2 : 1;
+
+    /* STALL all instances first so any in-flight AXI traffic completes
+     * or is held until we finish the disable sequence. */
+    for (int mi = 0; mi < n_cfg; mi++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_ENABLE_STALL);
+        KeStallExecutionProcessor(20);
+    }
+
+    for (int mi = 0; mi < n_cfg; mi++) {
+        volatile UCHAR *base = Dev->MmioBase + (mi * 0x40);
+
+        /* Mask IRQs so the disable sequence doesn't fire a spurious
+         * fault interrupt when the codec's last AXI gets translated
+         * with a paging-disabled engine. */
+        WRITE_REGISTER_ULONG((volatile ULONG*)(base + RK_MMU_INT_MASK), 0u);
+
+        /* DISABLE_PAGING. */
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(base + RK_MMU_COMMAND),
+            RK_MMU_CMD_DISABLE_PAGING);
+        KeStallExecutionProcessor(20);
+
+        /* Zero DTE_ADDR — drops the binding to the page directory.
+         * Critical: the next RkIommuEnable will write the original
+         * Dev->Domain->PdPhys back, forcing the IOMMU to re-fetch the
+         * directory and rebuild walk caches from scratch.  Without
+         * this zero step, attaching the same domain is treated as a
+         * no-op by some implementations (we observed walk-cache
+         * residue surviving a plain Enable→Disable→Enable). */
+        WRITE_REGISTER_ULONG((volatile ULONG*)(base + RK_MMU_DTE_ADDR), 0u);
+    }
+
+    Dev->PagingEnabled = FALSE;
+
+    /* UN-STALL all instances. */
+    for (int mi = 0; mi < n_cfg; mi++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(Dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_DISABLE_STALL);
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkiommu: disabled (HID=RKCP%04x UID=%u cfg=%d)\n",
+               Dev->Hid, Dev->Uid, n_cfg);
+    return STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
  * RkIommuEnable — activate IOMMU paging on the hardware.
  *
  * Phase 3a: real MMIO programming, with three BSP-mandated flags:

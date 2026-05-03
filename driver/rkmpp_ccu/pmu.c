@@ -244,3 +244,30 @@ bus_idled:;
     PmuHiwordWrite(D->PwrOffset, D->PwrBit, D->PwrBit);
     return STATUS_SUCCESS;
 }
+
+NTSTATUS RkMppPmuIdleRequest(_In_ const RKMPP_PMU_DOMAIN *D, _In_ BOOLEAN Idle)
+{
+    if (!g_pmu_mmio)            return STATUS_DEVICE_NOT_READY;
+    if (D->IdleReqOffset == 0)  return STATUS_SUCCESS;  /* no bus to quiesce */
+
+    ULONG reqValue = Idle ? D->IdleReqBit : 0u;
+    ULONG targetAck = Idle ? D->IdleReqBit : 0u;
+
+    PmuHiwordWrite(D->IdleReqOffset, D->IdleReqBit, reqValue);
+
+    /* Wait up to 10 ms for ack to track the requested state. */
+    for (ULONG i = 0; i < 10000; i++) {
+        ULONG ack = READ_REGISTER_ULONG(
+            (volatile ULONG*)(g_pmu_mmio + D->IdleAckOffset));
+        if ((ack & D->IdleAckBit) == targetAck) {
+            return STATUS_SUCCESS;
+        }
+        KeStallExecutionProcessor(1);
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+               "rkmpp_ccu: pmu_idle_request(%s) ack timeout (PD pwrBit=0x%x) — "
+               "continuing without bus quiesce\n",
+               Idle ? "TRUE" : "FALSE", D->PwrBit);
+    return STATUS_SUCCESS;
+}

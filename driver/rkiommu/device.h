@@ -49,3 +49,9 @@ extern KSPIN_LOCK  g_deviceListLock;
  * Returns STATUS_SUCCESS on success, STATUS_DEVICE_HARDWARE_ERROR on timeout. */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 NTSTATUS RkIommuEnable(_In_ PRKIOMMU_DEVICE Dev);
+
+/* Disable IOMMU paging on the hardware.  STALLs all instances, masks
+ * IRQs, sends DISABLE_PAGING, zeroes DTE_ADDR, and clears PagingEnabled
+ * so the next MapMdl/Reattach lazily re-enables.  Idempotent. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS RkIommuDisable(_In_ PRKIOMMU_DEVICE Dev);

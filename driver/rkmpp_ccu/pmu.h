@@ -87,3 +87,15 @@ extern const RKMPP_PMU_DOMAIN g_pdRkvdec1;  /* depends on both VCODEC and VDPU  
 
 NTSTATUS RkMppPmuPowerOn (_In_ const RKMPP_PMU_DOMAIN *D);
 NTSTATUS RkMppPmuPowerOff(_In_ const RKMPP_PMU_DOMAIN *D);
+
+/* Bus-idle handshake without changing power state.  Used by hang-recovery
+ * paths to quiesce a wedged codec's AXI bus before issuing wide CRU
+ * resets.  Linux equivalent is `rockchip_pmu_idle_request(dev, idle)`
+ * called from `mpp_pmu_idle_request` in mpp_common.h.
+ *
+ * Idle=TRUE  → assert IdleReqBit, wait for IdleAckBit to set.
+ * Idle=FALSE → clear IdleReqBit, wait for IdleAckBit to clear.
+ * 10 ms timeout per direction (matching Linux's readx_poll budget).
+ * Returns SUCCESS even on timeout (with a Dbg log) so callers don't
+ * abandon a wedge-recovery sequence on a transiently-stuck bus. */
+NTSTATUS RkMppPmuIdleRequest(_In_ const RKMPP_PMU_DOMAIN *D, _In_ BOOLEAN Idle);

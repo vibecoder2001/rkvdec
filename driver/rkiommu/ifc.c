@@ -289,6 +289,36 @@ RkIommuFlushTlb(_In_ PVOID ProviderContext)
     return STATUS_SUCCESS;
 }
 
+/* Reattach — Disable + Enable the IOMMU so the hardware drops walk-cache
+ * state and re-fetches the page directory.  Mirrors Linux's
+ * `mpp_iommu_refresh` (rockchip_iommu_disable + rockchip_iommu_enable).
+ * Called by codec drivers from EvtFileCleanup / hang-recovery paths
+ * after the codec is known quiescent. */
+static NTSTATUS
+RkIommuReattach(_In_ PVOID ProviderContext)
+{
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+    if (!dev->Domain)           return STATUS_DEVICE_NOT_READY;
+
+    NTSTATUS s = RkIommuDisable(dev);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkiommu: Reattach disable phase failed 0x%08x\n", s);
+        return s;
+    }
+    s = RkIommuEnable(dev);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkiommu: Reattach enable phase failed 0x%08x\n", s);
+        return s;
+    }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkiommu: reattached (HID=RKCP%04x UID=%u)\n",
+               dev->Hid, dev->Uid);
+    return STATUS_SUCCESS;
+}
+
 /* ---------------------------------------------------------------------------
  * RkIommuRegisterIfc — called from device.c after WdfDeviceCreate
  * --------------------------------------------------------------------------- */
@@ -323,6 +353,7 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.RegisterFaultHandler     = RkIommuRegisterFaultHandler;
     ifc.Snapshot                 = RkIommuSnapshot;
     ifc.FlushTlb                 = RkIommuFlushTlb;
+    ifc.Reattach                 = RkIommuReattach;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

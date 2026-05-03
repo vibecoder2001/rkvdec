@@ -26,7 +26,19 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKIOMMU,
  * wrong instance.  RegisterFaultHandler additionally takes a separate
  * ConsumerContext that is opaque to the provider and passed back
  * verbatim to the fault callback. */
-#define RKIOMMU_IFC_VERSION 3u
+/* v4: add Reattach for cross-session walk-cache flush.  Linux's
+ * `mpp_iommu_refresh` (mpp_common.c, called from mpp_dev_reset) detaches
+ * and re-attaches the IOMMU domain on every full reset; the source
+ * comment is explicit: "if the domain does not change, iommu attach will
+ * be return as an empty operation. Therefore, force to close and then
+ * open, will update the domain. In this way, domain can really attach."
+ * Our `FlushTlb` only invalidates page-table TLB entries; it does NOT
+ * flush walk caches / prefetch buffers.  Killing a process mid-decode
+ * leaves walk-cache state from the killed session that the next session
+ * can chase into stale physical addresses — `Reattach` resets that
+ * state.  Body: STALL → mask IRQs → DISABLE_PAGING → zero DTE_ADDR
+ * → reprogram DTE_ADDR with the same domain → ENABLE_PAGING → UN-STALL. */
+#define RKIOMMU_IFC_VERSION 4u
 
 typedef NTSTATUS (*RKIOMMU_QUERY_VERSION)(_Out_ PUINT32);
 
@@ -78,6 +90,12 @@ typedef NTSTATUS (*RKIOMMU_SNAPSHOT)(
  * obsolete physical addresses. */
 typedef NTSTATUS (*RKIOMMU_FLUSH_TLB)(_In_ PVOID ProviderContext);
 
+/* Detach + reattach the IOMMU domain.  See RKIOMMU_IFC_VERSION header
+ * comment for rationale.  Existing iova→phys mappings in the domain are
+ * preserved; only the hardware-side walk caches and DTE binding are
+ * rebuilt.  Safe to call even when paging is already disabled. */
+typedef NTSTATUS (*RKIOMMU_REATTACH)(_In_ PVOID ProviderContext);
+
 typedef struct _RKIOMMU_INTERFACE {
     INTERFACE                Header;
     UINT32                   Hid;     /* e.g. 0x3570 / 0x3571 */
@@ -88,4 +106,5 @@ typedef struct _RKIOMMU_INTERFACE {
     RKIOMMU_REGISTER_FAULT   RegisterFaultHandler;
     RKIOMMU_SNAPSHOT         Snapshot;
     RKIOMMU_FLUSH_TLB        FlushTlb;
+    RKIOMMU_REATTACH         Reattach;
 } RKIOMMU_INTERFACE, *PRKIOMMU_INTERFACE;

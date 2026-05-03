@@ -405,3 +405,56 @@ NTSTATUS RkMppCcuDeassertCoreReset(_In_ PVOID Ctx)
     KeStallExecutionProcessor(20);
     return STATUS_SUCCESS;
 }
+
+/* RkMppCcuFullCoreReset — wide hang-recovery reset.  Mirrors Linux
+ * `rkvdec2_reset` CRU-bundle path that fires when soft-reset times out:
+ * PMU idle req → assert {NIU_a/h, AXI/AHB, CABAC, HEVC_CABAC, CORE} →
+ * udelay(5) → deassert in reverse → PMU idle release.
+ *
+ * This resets the AXI/AHB bus blocks the IOMMU sits on, so DTE_ADDR is
+ * cleared as a side effect.  CALLER MUST follow with
+ * RKIOMMU_INTERFACE::Reattach to reprogram DTE_ADDR before any further
+ * codec activity, or AXI traffic will land at iova 0 / undefined phys.
+ *
+ * Only RVD0 covered today (CON40 group); RVD1 is a Phase 3b extension. */
+NTSTATUS RkMppCcuFullCoreReset(_In_ PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+
+    /* Wide reset bundle for the rkvdec0 cluster:
+     *   CON40 bits 2..9 — rkvdec_ccu_a/h, rkvdec0_a/h, ca, hevc_ca, c, core
+     *   CON44 bits 4..6 — VDPU NIU resets (aclk/aclk_low/hclk_NIU)
+     * Frame the entire bundle with a PMU bus-idle request so any
+     * in-flight AXI traffic on PD_RKVDEC0 gets quiesced before the
+     * resets land — otherwise the bus could trap on a half-issued
+     * burst when the AXI block itself is held in reset. */
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+               "rkmpp_ccu: FullCoreReset — wide CRU reset for RVD0\n");
+
+    /* Quiesce the PD_RKVDEC0 bus.  Best-effort: if the bus is wedged
+     * the ack will time out, but we proceed anyway (the reset itself
+     * is what unwedges it). */
+    (void)RkMppPmuIdleRequest(&g_pdRkvdec0, TRUE);
+
+    /* Assert the wide reset bundle. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
+                     g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44,
+                     g_rdcc.SoftRstCon44Mask, g_rdcc.SoftRstCon44Mask);
+    KeStallExecutionProcessor(5);
+
+    /* Deassert.  Order doesn't matter for hi-word-mask writes (each
+     * register is independent), but we mirror Linux's reverse-order
+     * convention: NIU first, then cluster. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44,
+                     g_rdcc.SoftRstCon44Mask, 0);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
+                     g_rdcc.SoftRstCon40Mask, 0);
+    KeStallExecutionProcessor(20);
+
+    /* Release the bus-idle request. */
+    (void)RkMppPmuIdleRequest(&g_pdRkvdec0, FALSE);
+
+    return STATUS_SUCCESS;
+}

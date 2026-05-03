@@ -198,7 +198,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                                      PAGE_READWRITE | PAGE_NOCACHE);
     ctx->MmioLength = mmioLen;
     if (!ctx->MmioBase) return STATUS_INSUFFICIENT_RESOURCES;
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "rkmpp: HID=RKCP%04x UID=%u MmioBase=phys 0x%llx len 0x%x\n",
                ctx->Hid, ctx->Uid, mmioLow.QuadPart, mmioLen);
 
@@ -241,7 +241,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         RkMppCloseIfcs(&ctx->Ifcs);
         return STATUS_REVISION_MISMATCH;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "rkmpp: ifcs opened (iommu v%u, ccu v%u)\n",
                ctx->Ifcs.Iommu.Header.Version, ctx->Ifcs.Ccu.Header.Version);
 
@@ -311,7 +311,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         }
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "rkmpp: HID=RKCP%04x UID=%u rev=0x%08x codecs=0x%08x\n",
                ctx->Hid, ctx->Uid, ctx->RevisionWord, ctx->SupportedCodecs);
     return STATUS_SUCCESS;
@@ -514,15 +514,55 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
     if (timedOut) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "rkmpp: FileCleanup in-flight wait timed out — "
-                   "marking codec for reset on next submission\n");
+                   "issuing wide CRU reset for RVD0\n");
         RkMppSetNeedsCoreReset(ctx->Device);
+
+        /* Wide CRU reset bundle: PMU idle req + assert {CON40 bits 2..9,
+         * CON44 bits 4..6} + udelay + deassert + idle release.  Mirrors
+         * Linux `rkvdec2_reset` CRU-bundle path.  This also resets the
+         * AXI/AHB blocks the IOMMU sits on, so the IOMMU's DTE_ADDR
+         * is cleared as a side effect — the Reattach below reprograms
+         * it before the next session can map any buffer. */
+        PRKMPP_DEVICE devCtx = RkMppDeviceGet(ctx->Device);
+        if (devCtx && devCtx->Ifcs.CcuOpen &&
+            devCtx->Ifcs.Ccu.FullCoreReset) {
+            devCtx->Ifcs.Ccu.FullCoreReset(
+                devCtx->Ifcs.Ccu.Header.Context);
+        }
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "rkmpp: drain done fileobject=%p clean (no reset)\n",
+                   "rkmpp: drain done fileobject=%p clean\n",
                    FileObject);
     }
 
     RkMppBufFreeAll(FileObject);
+
+    /* Reattach the IOMMU domain on every session close, regardless of
+     * whether drain timed out.  Linux's `mpp_iommu_dev_deactivate` is
+     * called on every IRQ completion; we don't have per-IRQ deactivate
+     * machinery, but reattaching at session-close gives an equivalent
+     * guarantee that the next session never inherits walk-cache state
+     * from a prior session.  This is cheap (one Disable + Enable on the
+     * IOMMU, ~10 µs) and is the architectural answer to the
+     * kill-mid-decode wedge documented in
+     * memory:rkmpp_kernel_security_todos.md item 9.
+     *
+     * Order matters: must run AFTER BufFreeAll so the buffer iovas have
+     * been UnmapMdl'd from the page tables.  Reattach preserves the
+     * domain (and any iovas still mapped by other sessions) — only the
+     * hardware-side walk caches are flushed. */
+    {
+        PRKMPP_DEVICE devCtx = RkMppDeviceGet(ctx->Device);
+        if (devCtx && devCtx->Ifcs.IommuOpen &&
+            devCtx->Ifcs.Iommu.Reattach) {
+            NTSTATUS rs = devCtx->Ifcs.Iommu.Reattach(
+                devCtx->Ifcs.Iommu.Header.Context);
+            if (!NT_SUCCESS(rs)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "rkmpp: post-drain Reattach failed 0x%08x\n", rs);
+            }
+        }
+    }
 }
 
 VOID

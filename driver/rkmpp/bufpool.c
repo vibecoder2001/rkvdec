@@ -169,6 +169,19 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     }
     MmBuildMdlForNonPagedPool(mdl);
 
+    /* Flush CPU caches for the underlying physical pages.  PAGE_NOCACHE
+     * makes our kernel mapping uncached, so RtlZeroMemory above wrote
+     * straight to DRAM through that mapping — but the same physical pages
+     * may have been previously mapped cacheable under another VA (the OS
+     * recycles pages across allocations).  Stale dirty lines in the L1/L2
+     * for those aliasing VAs can be snooped by the codec's DMA on ARM64
+     * and surface as residue.  Linux dma-heap is bit-exact deterministic
+     * because it both zeroes and flushes; we match that here.  See memory
+     * `h264_bframe_colmv_investigation.md` for the full chain of evidence
+     * (BSP determinism on Linux, Windows B-frame run-to-run divergence,
+     * regbuilder verified bit-correct against BSP shim). */
+    KeFlushIoBuffers(mdl, /*ReadOperation*/ FALSE, /*DmaOperation*/ TRUE);
+
     /* --- 4. Map into IOMMU -------------------------------------------- */
     PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(Device);
     if (!iommu || !iommu->MapMdl) {

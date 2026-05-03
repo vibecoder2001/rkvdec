@@ -27,7 +27,7 @@ extern VOID RkMppSetNeedsCoreReset(_In_ WDFDEVICE Device);
 /* Tracing wrapper for codec MMIO writes — matches BSP's
  * mpp_dev_debug=DEBUG_SET_REG output format so the two traces can be
  * diffed directly.  Set to 0 to disable. */
-#define RKMPP_TRACE_WRITES 1
+#define RKMPP_TRACE_WRITES 0
 #if RKMPP_TRACE_WRITES
 #define TRACED_WRITE_ULONG(addr, val)                                     \
     do {                                                                  \
@@ -69,9 +69,16 @@ extern VOID RkMppSetNeedsCoreReset(_In_ WDFDEVICE Device);
     (RKVDEC2_INT_DEC_RDY_STA | RKVDEC2_INT_DEC_ERROR_STA | \
      RKVDEC2_INT_DEC_TIMEOUT_STA | RKVDEC2_INT_DEC_BUS_STA | \
      RKVDEC2_INT_BUF_EMPTY_STA | RKVDEC2_INT_COLMV_REF_ERROR)
+/* Conservative superset: BSP's `RKVDEC_INT_ERROR_MASK` is bits 4|5|6|7
+ * (ERROR | TIMEOUT | BUF_EMPTY | COLMV_REF_ERR).  We include BUS_STA
+ * (bit 3) too — empirically a status of bit 3 alone (without DEC_RDY)
+ * has paired with stale codec FSM state that produces all-zero output
+ * unless we trip NeedsCoreReset.  Slightly over-classifies vs BSP but
+ * preserves the reset cadence the codec actually depends on. */
 #define RKVDEC2_INT_ERROR_MASK \
     (RKVDEC2_INT_DEC_ERROR_STA | RKVDEC2_INT_DEC_TIMEOUT_STA | \
-     RKVDEC2_INT_DEC_BUS_STA | RKVDEC2_INT_COLMV_REF_ERROR)
+     RKVDEC2_INT_DEC_BUS_STA | RKVDEC2_INT_BUF_EMPTY_STA | \
+     RKVDEC2_INT_COLMV_REF_ERROR)
 
 /* Forward declarations */
 static VOID RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job);
@@ -338,44 +345,6 @@ have_status:
                    : STATUS_SUCCESS;
         }
 
-        /* Dump the IRQ-status bank (idx 224..237 = bytes 0x380..0x3B4 in
-         * SWREG-space, our_mmio +0x480..+0x4B4 with the 0x100 prefix). */
-        ULONG bank[14] = {0};
-        for (int i = 0; i < 14; i++) {
-            bank[i] = READ_REGISTER_ULONG(
-                (volatile ULONG *)((PUCHAR)mmio + RKVDEC2_SWREG_BASE + 0x380 + i * 4));
-        }
-
-        /* Read back the control regs we just wrote — if the codec consumed
-         * the kick we expect dec_e (idx 10 / off 0x28) to be self-cleared
-         * to 0; if it stayed at 1 the kick never made it into the FSM. */
-#define RB(off) READ_REGISTER_ULONG((volatile ULONG*)((PUCHAR)mmio + RKVDEC2_SWREG_BASE + (off)))
-        ULONG rb_mode  = RB(0x024);
-        ULONG rb_dec_e = RB(0x028);
-        ULONG rb_imp   = RB(0x02C);
-        ULONG rb_sec   = RB(0x030);
-        ULONG rb_err   = RB(0x034);
-        ULONG rb_strln = RB(0x040);
-        ULONG rb_rlc   = RB(0x200);
-        ULONG rb_decout= RB(0x208);     /* idx 130 DECOUT_BASE */
-        ULONG rb_pps   = RB(0x284);     /* idx 161 PPS_BASE */
-        ULONG rb_rps   = RB(0x28c);     /* idx 163 RPS_BASE */
-        ULONG rb_cab   = RB(0x314);     /* idx 197 CABACTBL_BASE */
-        ULONG rb_scan  = RB(0x2d0);     /* idx 180 SCANLIST_ADDR */
-        ULONG rb_pochi0= RB(0x320);     /* idx 200 POC_HIGHBIT[0] */
-        ULONG rb_pochi1= RB(0x324);     /* idx 201 */
-        ULONG rb_pochi4= RB(0x330);     /* idx 204 */
-#undef RB
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "  ctrl readback mode=0x%08x dec_e=0x%08x imp=0x%08x "
-                   "sec=0x%08x err=0x%08x strlen=0x%08x rlc=0x%08x\n"
-                   "  addr readback decout=0x%08x pps=0x%08x rps=0x%08x "
-                   "cabac=0x%08x scanlist=0x%08x\n"
-                   "  poc_hi readback [0]=0x%08x [1]=0x%08x [4]=0x%08x\n",
-                   rb_mode, rb_dec_e, rb_imp, rb_sec, rb_err, rb_strln, rb_rlc,
-                   rb_decout, rb_pps, rb_rps, rb_cab, rb_scan,
-                   rb_pochi0, rb_pochi1, rb_pochi4);
-
         /* Ack pending status bits (write-1-to-clear). */
         if (hwStatus) {
             WRITE_REGISTER_ULONG(
@@ -383,35 +352,70 @@ have_status:
                 hwStatus);
         }
 
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkmpp: poller INT=0x%08x result=0x%08x\n"
-                   "  irqbank[224..231]: %08x %08x %08x %08x %08x %08x %08x %08x\n"
-                   "  irqbank[232..237]: %08x %08x %08x %08x %08x %08x\n",
-                   hwStatus, result,
-                   bank[0], bank[1], bank[2], bank[3],
-                   bank[4], bank[5], bank[6], bank[7],
-                   bank[8], bank[9], bank[10], bank[11],
-                   bank[12], bank[13]);
+        /* Diagnostic dump only when the codec genuinely didn't finish —
+         * DONE bit not set within the poll budget.  Codec routinely
+         * raises ERROR_STA / TIMEOUT_STA *together with* DEC_RDY_STA on
+         * what is otherwise a successful decode (informational warnings
+         * about the bitstream); BSP treats those as "errors" too but
+         * just bumps reset_request and moves on.  Dumping on every such
+         * "error+done" kick used to flood DbgView at 30 fps × multi-line
+         * dumps.  Use no-DONE-at-all as the trigger — that's the case
+         * where the codec is stuck and we have no useful state. */
+        if ((hwStatus & RKVDEC2_INT_DEC_RDY_STA) == 0) {
+            ULONG bank[14] = {0};
+            for (int i = 0; i < 14; i++) {
+                bank[i] = READ_REGISTER_ULONG(
+                    (volatile ULONG *)((PUCHAR)mmio + RKVDEC2_SWREG_BASE + 0x380 + i * 4));
+            }
+#define RB(off) READ_REGISTER_ULONG((volatile ULONG*)((PUCHAR)mmio + RKVDEC2_SWREG_BASE + (off)))
+            ULONG rb_mode  = RB(0x024);
+            ULONG rb_dec_e = RB(0x028);
+            ULONG rb_imp   = RB(0x02C);
+            ULONG rb_sec   = RB(0x030);
+            ULONG rb_err   = RB(0x034);
+            ULONG rb_strln = RB(0x040);
+            ULONG rb_rlc   = RB(0x200);
+            ULONG rb_decout= RB(0x208);
+            ULONG rb_pps   = RB(0x284);
+            ULONG rb_rps   = RB(0x28c);
+            ULONG rb_cab   = RB(0x314);
+            ULONG rb_scan  = RB(0x2d0);
+            ULONG rb_pochi0= RB(0x320);
+            ULONG rb_pochi1= RB(0x324);
+            ULONG rb_pochi4= RB(0x330);
+#undef RB
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkmpp: poller INT=0x%08x result=0x%08x\n"
+                       "  ctrl readback mode=0x%08x dec_e=0x%08x imp=0x%08x "
+                       "sec=0x%08x err=0x%08x strlen=0x%08x rlc=0x%08x\n"
+                       "  addr readback decout=0x%08x pps=0x%08x rps=0x%08x "
+                       "cabac=0x%08x scanlist=0x%08x\n"
+                       "  poc_hi readback [0]=0x%08x [1]=0x%08x [4]=0x%08x\n"
+                       "  irqbank[224..231]: %08x %08x %08x %08x %08x %08x %08x %08x\n"
+                       "  irqbank[232..237]: %08x %08x %08x %08x %08x %08x\n",
+                       hwStatus, result,
+                       rb_mode, rb_dec_e, rb_imp, rb_sec, rb_err, rb_strln, rb_rlc,
+                       rb_decout, rb_pps, rb_rps, rb_cab, rb_scan,
+                       rb_pochi0, rb_pochi1, rb_pochi4,
+                       bank[0], bank[1], bank[2], bank[3],
+                       bank[4], bank[5], bank[6], bank[7],
+                       bank[8], bank[9], bank[10], bank[11],
+                       bank[12], bank[13]);
 
-        /* Sample the IOMMU instance that owns this codec to find out
-         * whether the hardware silently faulted on an iova — if it did,
-         * INT_RAWSTAT bit 0 latches and PAGE_FAULT_ADDR carries the iova
-         * the codec asked for.  Helps distinguish "codec didn't kick"
-         * from "codec kicked but AXI traffic was page-faulted away". */
-        PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(q->Device);
-        if (iommu && iommu->Snapshot) {
-            RKIOMMU_FAULT_SNAPSHOT snap = {0};
-            if (NT_SUCCESS(iommu->Snapshot(iommu->Header.Context, &snap))) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "  iommu#0 STATUS=0x%08x INT_RAWSTAT=0x%08x "
-                           "INT_STATUS=0x%08x FAULT_ADDR=0x%08x DTE=0x%08x\n",
-                           snap.Status, snap.IntRawStat, snap.IntStatus,
-                           snap.PageFaultAddr, snap.DteAddr);
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "  iommu#1 STATUS=0x%08x INT_RAWSTAT=0x%08x "
-                           "INT_STATUS=0x%08x FAULT_ADDR=0x%08x DTE=0x%08x\n",
-                           snap.Status1, snap.IntRawStat1, snap.IntStatus1,
-                           snap.PageFaultAddr1, snap.DteAddr1);
+            PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(q->Device);
+            if (iommu && iommu->Snapshot) {
+                RKIOMMU_FAULT_SNAPSHOT snap = {0};
+                if (NT_SUCCESS(iommu->Snapshot(iommu->Header.Context, &snap))) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "  iommu#0 STATUS=0x%08x INT_RAWSTAT=0x%08x "
+                               "INT_STATUS=0x%08x FAULT_ADDR=0x%08x DTE=0x%08x\n"
+                               "  iommu#1 STATUS=0x%08x INT_RAWSTAT=0x%08x "
+                               "INT_STATUS=0x%08x FAULT_ADDR=0x%08x DTE=0x%08x\n",
+                               snap.Status, snap.IntRawStat, snap.IntStatus,
+                               snap.PageFaultAddr, snap.DteAddr,
+                               snap.Status1, snap.IntRawStat1, snap.IntStatus1,
+                               snap.PageFaultAddr1, snap.DteAddr1);
+                }
             }
         }
 
@@ -488,6 +492,22 @@ RkMppEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
     if (job) {
         RkMppJobComplete(device, STATUS_SUCCESS, 0);
     }
+
+    /* Mirror Linux `mpp_iommu_dev_deactivate` semantics: on every IRQ
+     * completion clear stale TLB state so the next kick — possibly from
+     * a different session — never inherits address-space residue.
+     * Linux's deactivate is pure software (clears `info->dev_active`);
+     * the closest hardware analog we have is `FlushTlb` (ZAP_CACHE).
+     * This pairs with the per-kick FlushTlb already done in JobStart;
+     * doing it on both edges of the kick → completion arc gives us
+     * defense-in-depth without any measurable cost (one MMIO write per
+     * MMU instance, on the order of 100 ns). */
+    {
+        PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(device);
+        if (iommu && iommu->FlushTlb) {
+            iommu->FlushTlb(iommu->Header.Context);
+        }
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -553,23 +573,6 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                 (volatile ULONG *)((PUCHAR)mmio + RKVDEC2_INT_STATUS_OFFSET),
                 sta & ~1u);
         }
-    }
-
-    /* Pre-kick snapshot of perf-counter regs (idx 228..234) — useful to
-     * tell whether 0x003c0130 in the post-kick dump is actual decode
-     * progress or just a constant the codec returns regardless. */
-    {
-        ULONG pre[10] = {0};
-        for (int i = 0; i < 10; i++) {
-            pre[i] = READ_REGISTER_ULONG(
-                (volatile ULONG *)((PUCHAR)mmio + RKVDEC2_SWREG_BASE
-                                                + 228 * 4 + i * 4));
-        }
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkmpp: pre-kick perf[228..237]: "
-                   "%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                   pre[0], pre[1], pre[2], pre[3], pre[4],
-                   pre[5], pre[6], pre[7], pre[8], pre[9]);
     }
 
     /* Configure the rkvdec2 internal AXI read caches.  BSP `rkvdec2_run`

@@ -130,6 +130,35 @@ RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
 }
 
 /* -----------------------------------------------------------------------
+ * RkMppBufLookupMdl — return the MDL for a buffer cookie.  Walks the
+ * file's allocation list under the spinlock; safe at <= DISPATCH_LEVEL.
+ * --------------------------------------------------------------------- */
+NTSTATUS
+RkMppBufLookupMdl(_In_  WDFFILEOBJECT File,
+                  _In_  UINT64        Cookie,
+                  _Out_ PMDL         *OutMdl)
+{
+    PRKMPP_FILE_CTX ctx = RkMppFileGet(File);
+    KIRQL oldIrql;
+    NTSTATUS status = STATUS_NOT_FOUND;
+
+    *OutMdl = NULL;
+    KeAcquireSpinLock(&ctx->Lock, &oldIrql);
+    for (PLIST_ENTRY entry = ctx->Buffers.Flink;
+         entry != &ctx->Buffers;
+         entry = entry->Flink) {
+        PRKMPP_BUFFER buf = CONTAINING_RECORD(entry, RKMPP_BUFFER, Link);
+        if (buf->Cookie == Cookie) {
+            *OutMdl = buf->Mdl;
+            status  = STATUS_SUCCESS;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&ctx->Lock, oldIrql);
+    return status;
+}
+
+/* -----------------------------------------------------------------------
  * RkMppBufAlloc
  * --------------------------------------------------------------------- */
 NTSTATUS
@@ -152,9 +181,18 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     hi.QuadPart = 0xFFFFFFFFLL;   /* < 4 GiB */
     PHYSICAL_ADDRESS boundary = {0};
 
+    /* Cached mapping.  An earlier attempt produced top-half-fresh /
+     * bottom-half-stale tearing; rediagnosed as an AXI write-buffer
+     * drain race rather than a cache coherency hole — the codec's IRQ
+     * asserts before its tail-end DMA writes reach DRAM, and our
+     * uncached read was masking it by being slow enough.  Fix is in
+     * the poller (RkMppPollerThread): dummy MMIO read + short stall
+     * after observing DEC_RDY, before invalidate.  With that drain in
+     * place, cached + per-job KeFlushIoBuffers gives ~4× faster CPU
+     * reads of the 4K output buffer (12 ms uncached → 3 ms cached). */
     PVOID kernelVa = MmAllocateContiguousNodeMemory(
         sizeRounded, lo, hi, boundary,
-        PAGE_READWRITE | PAGE_NOCACHE,
+        PAGE_READWRITE,
         MM_ANY_NODE_OK);
     if (!kernelVa)
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -176,10 +214,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
      * recycles pages across allocations).  Stale dirty lines in the L1/L2
      * for those aliasing VAs can be snooped by the codec's DMA on ARM64
      * and surface as residue.  Linux dma-heap is bit-exact deterministic
-     * because it both zeroes and flushes; we match that here.  See memory
-     * `h264_bframe_colmv_investigation.md` for the full chain of evidence
-     * (BSP determinism on Linux, Windows B-frame run-to-run divergence,
-     * regbuilder verified bit-correct against BSP shim). */
+     * because it both zeroes and flushes; we match that here. */
     KeFlushIoBuffers(mdl, /*ReadOperation*/ FALSE, /*DmaOperation*/ TRUE);
 
     /* --- 4. Map into IOMMU -------------------------------------------- */
@@ -205,7 +240,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
 
     /* --- 5. Map into calling process user space ----------------------- */
     PVOID userVa = MmMapLockedPagesSpecifyCache(
-        mdl, UserMode, MmNonCached, NULL, FALSE, NormalPagePriority);
+        mdl, UserMode, MmCached, NULL, FALSE, NormalPagePriority);
     if (!userVa) {
         iommu->UnmapMdl(provCtx, iova);
         IoFreeMdl(mdl);

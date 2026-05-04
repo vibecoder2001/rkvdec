@@ -17,9 +17,13 @@
  * --------------------------------------------------------------------- */
 
 typedef struct _RKMPP_FILE_CTX {
-    LIST_ENTRY  Buffers;    /* list of RKMPP_BUFFER.Link */
-    KSPIN_LOCK  Lock;       /* guards Buffers list */
-    WDFDEVICE   Device;     /* back-pointer so cleanup can reach the ifcs */
+    LIST_ENTRY    Buffers;    /* list of RKMPP_BUFFER.Link */
+    KSPIN_LOCK    Lock;       /* guards Buffers list */
+    WDFDEVICE     Device;     /* back-pointer so cleanup can reach the ifcs */
+    volatile LONG ErrorCount; /* count of error-flagged jobs this session;
+                                 read by EvtFileCleanup to decide whether
+                                 to invoke the soft-tier IOMMU force-reset
+                                 for session isolation */
 } RKMPP_FILE_CTX, *PRKMPP_FILE_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RKMPP_FILE_CTX, RkMppFileGet);
@@ -66,3 +70,11 @@ NTSTATUS RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
                             _In_ UINT64 Cookie,
                             _Out_ UINT64 *OutIova,
                             _Out_ ULONG  *OutSize);
+
+/* Look up a buffer's MDL by cookie.  Used by RkMppJobSubmit to capture
+ * MDLs into the job for later cache-maintenance (KeFlushIoBuffers) at
+ * kick + completion time when buffers are mapped cached.
+ * STATUS_NOT_FOUND if the cookie is unknown. */
+NTSTATUS RkMppBufLookupMdl(_In_  WDFFILEOBJECT File,
+                           _In_  UINT64 Cookie,
+                           _Out_ PMDL *OutMdl);

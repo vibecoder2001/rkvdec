@@ -33,6 +33,34 @@ typedef struct _RKMPP_JOB {
     RKMPP_REG_WRITE Writes[RKMPP_MAX_REG_WRITES];
     UINT32          BufRefCount;
     RKMPP_BUFFER_REF BufRefs[RKMPP_MAX_BUF_REFS];
+    /* MDLs requiring per-kick cache maintenance, tracked by direction.
+     *
+     * CleanMdls — user-mode-written inputs the codec reads this kick:
+     *   bitstream (RLC), packed PPS, packed RPS, scaling list.
+     *   `dc cvac` issued at the head of RkMppJobStart so codec sees
+     *   the freshly written CPU data on its first DMA read.
+     *
+     * OutputFrameMdl — the buffer the codec writes this kick that the
+     *   CPU will read next.  `dc ivac` issued in RkMppJobComplete so
+     *   user-mode reads from the cached mapping see codec's fresh
+     *   data, not stale CPU cache lines.
+     *
+     * Buffers NOT tracked here (no per-kick maintenance needed):
+     *   - Reference frames: codec reads them, CPU doesn't dirty them,
+     *     and they were already invalidated when they were the output
+     *     of their original kick.
+     *   - Per-ref colmv: codec read-only this kick.
+     *   - colmv_cur: codec writes it but CPU doesn't read it (only the
+     *     codec consumes colmv as ref input on subsequent kicks).
+     *   - RCB scratch / error_ref: codec-internal use only.
+     *   - CABAC init table: filled once at engine init; CPU doesn't
+     *     dirty it after, so no per-kick clean needed.
+     *
+     * Pre-narrowing this saved ~1 ms / frame at 1440p (~30 buffers
+     * walked → ~4) and made it possible to keep up at 4K. */
+    UINT32          CleanMdlCount;
+    PMDL            CleanMdls[8];
+    PMDL            OutputFrameMdl;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------

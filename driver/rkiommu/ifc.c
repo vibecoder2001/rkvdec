@@ -319,6 +319,76 @@ RkIommuReattach(_In_ PVOID ProviderContext)
     return STATUS_SUCCESS;
 }
 
+/* ForceReset — issue RK_MMU_CMD_FORCE_RESET to all MMU instances under
+ * STALL, then poll DTE_ADDR == 0 for completion.  Mirrors BSP
+ * `rk_iommu_force_reset` (rockchip-iommu.c:564).  Resets the MMU's
+ * internal state machine — walk caches, prefetcher, fault state — but
+ * does NOT touch CRU/AXI/AHB/NIU bus blocks the wide
+ * `Ccu.FullCoreReset` would.  Caller MUST follow with `Reattach` to
+ * reprogram DTE_ADDR (FORCE_RESET zeroes it out).
+ *
+ * Used as the soft tier of the two-tier session-end recovery: gentle
+ * enough to leave HEVC's bus state intact when we just want to clear
+ * H.264 codec FSM state. */
+static NTSTATUS
+RkIommuForceReset(_In_ PVOID ProviderContext)
+{
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+
+    int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
+
+    /* STALL all instances first.  FORCE_RESET while a master has
+     * in-flight AXI traffic produces undefined behaviour. */
+    for (int mi = 0; mi < n_mmu; mi++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_ENABLE_STALL);
+        KeStallExecutionProcessor(20);
+    }
+
+    /* Issue FORCE_RESET to all instances. */
+    for (int mi = 0; mi < n_mmu; mi++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_FORCE_RESET);
+    }
+
+    /* Poll for DTE_ADDR == 0 on all instances — BSP's
+     * rk_iommu_is_reset_done.  Cap at ~100 ms (matches BSP
+     * RK_MMU_FORCE_RESET_TIMEOUT_US = 100000). */
+    NTSTATUS rs = STATUS_SUCCESS;
+    for (int mi = 0; mi < n_mmu; mi++) {
+        ULONG poll = 0;
+        for (poll = 0; poll < 100000; poll++) {
+            ULONG dte = READ_REGISTER_ULONG(
+                (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_DTE_ADDR));
+            if (dte == 0) break;
+            KeStallExecutionProcessor(1);
+        }
+        if (poll >= 100000) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "rkiommu: ForceReset MMU#%d DTE_ADDR didn't clear\n", mi);
+            rs = STATUS_TIMEOUT;
+        }
+    }
+
+    /* UN-STALL — even on timeout, leave the MMU in a known state. */
+    for (int mi = 0; mi < n_mmu; mi++) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+            RK_MMU_CMD_DISABLE_STALL);
+    }
+
+    /* FORCE_RESET zeroed DTE_ADDR — paging is effectively off now even
+     * though the PagingEnabled flag still says on.  Clear the flag so
+     * the next RkIommuEnable doesn't short-circuit on the "already
+     * enabled" check. */
+    if (NT_SUCCESS(rs)) dev->PagingEnabled = FALSE;
+
+    return rs;
+}
+
 /* ---------------------------------------------------------------------------
  * RkIommuRegisterIfc — called from device.c after WdfDeviceCreate
  * --------------------------------------------------------------------------- */
@@ -354,6 +424,7 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.Snapshot                 = RkIommuSnapshot;
     ifc.FlushTlb                 = RkIommuFlushTlb;
     ifc.Reattach                 = RkIommuReattach;
+    ifc.ForceReset               = RkIommuForceReset;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

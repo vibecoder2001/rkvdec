@@ -22,7 +22,19 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKMPP_CCU,
  * an `RKIOMMU_INTERFACE::Reattach` so the IOMMU's DTE_ADDR is
  * reprogrammed (bits 2..5 reset the AXI/AHB bus blocks the IOMMU sits
  * on, and a paging-disabled IOMMU silently drops AXI traffic). */
-#define RKMPP_CCU_IFC_VERSION 3u
+/* v4: add per-kick leaf-clock gate/ungate.  Linux BSP `rkvdec2_clk_off`
+ * runs at the end of every task (mpp_task_finish → mpp_power_off →
+ * clk_off) and `rkvdec2_clk_on` at the start (mpp_power_on → clk_on),
+ * gating + ungating the codec leaf clocks (clk_rkvdec0_core,
+ * clk_rkvdec0_ca, clk_rkvdec0_hevc_ca) between every kick.  This
+ * clock-cycle break drains in-flight AXI traffic and resets
+ * clock-domain-crossing flops without touching the codec FSM.  Without
+ * it, our 12 ms uncached output-buffer read was accidentally providing
+ * the same settle window — and removing that read (zero-copy or
+ * non-ref skip) collapsed inter-kick spacing and wedged the codec.
+ * Bus-root clocks (CON40 bits 0,1,2 — hclk/aclk/aclk_ccu) stay UNgated
+ * so MMIO register access between kicks still works. */
+#define RKMPP_CCU_IFC_VERSION 4u
 
 typedef NTSTATUS (*RKMPP_CCU_QUERY_VERSION)(_Out_ PUINT32);
 typedef NTSTATUS (*RKMPP_CCU_RAISE_CLUSTER) (_In_ PVOID ClientCookie);
@@ -30,6 +42,8 @@ typedef NTSTATUS (*RKMPP_CCU_DROP_CLUSTER)  (_In_ PVOID ClientCookie);
 typedef NTSTATUS (*RKMPP_CCU_ASSERT_RESET)  (_In_ PVOID ClientCookie);
 typedef NTSTATUS (*RKMPP_CCU_DEASSERT_RESET)(_In_ PVOID ClientCookie);
 typedef NTSTATUS (*RKMPP_CCU_FULL_RESET)    (_In_ PVOID ClientCookie);
+typedef NTSTATUS (*RKMPP_CCU_LEAF_GATE)     (_In_ PVOID ClientCookie);
+typedef NTSTATUS (*RKMPP_CCU_LEAF_UNGATE)   (_In_ PVOID ClientCookie);
 
 typedef struct _RKMPP_CCU_INTERFACE {
     INTERFACE                 Header;
@@ -39,4 +53,6 @@ typedef struct _RKMPP_CCU_INTERFACE {
     RKMPP_CCU_ASSERT_RESET    AssertCoreReset;
     RKMPP_CCU_DEASSERT_RESET  DeassertCoreReset;
     RKMPP_CCU_FULL_RESET      FullCoreReset;
+    RKMPP_CCU_LEAF_GATE       GateCoreLeafClocks;     /* per-kick gate */
+    RKMPP_CCU_LEAF_UNGATE     UngateCoreLeafClocks;   /* per-kick ungate */
 } RKMPP_CCU_INTERFACE, *PRKMPP_CCU_INTERFACE;

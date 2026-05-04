@@ -1,9 +1,19 @@
 ;
-; rkmpp.inx — Rockchip RK3588 MPP codec core driver
-; Matches all eight codec-engine HIDs: RKCP3510 (vpu-jpegd), RKCP3511 (vpu-jpege-v2),
-;     RKCP3512 (vpu-jpege-v2-core1), RKCP3520 (avs-plus), RKCP3521 (avs-plus-core),
-;     RKCP3540 (rk-hega), RKCP3550 (rkv-decoder-v2), RKCP3560 (rkv-encoder-v2).
-; Phase 1: probe, map MMIO, read REVISION register; codec dispatch lands in later phases.
+; rkmpp.inx — Rockchip RK3588 MPP codec core driver.
+;
+; Attaches to the eight codec-engine HIDs the firmware exposes for the
+; RK3588 video subsystem.  Each HID gets its own device description so
+; Device Manager can show what the codec actually does, since one driver
+; binary handles a heterogeneous mix of encoders and decoders:
+;
+;   RKCP3510 — VEPU       — VPU H.264 / VP8 encoder
+;   RKCP3511 — VDPU       — VPU H.264 / MPEG / VP8 decoder
+;   RKCP3512 — AVSD       — AVS+ decoder
+;   RKCP3520 — JPGD       — RKJPEG hardware JPEG decoder
+;   RKCP3521 — JPE0..3    — VPU JPEG encoder core (4 instances)
+;   RKCP3540 — RVE0..1    — RKVENC v2 core (H.264 / HEVC encode, 2 instances)
+;   RKCP3550 — RVD0..1    — RKVDEC v2 core (H.264 / HEVC / VP9 decode, 2 instances)
+;   RKCP3560 — AV1D       — RKVDEC AV1 decoder
 ;
 [Version]
 Signature   = "$WINDOWS NT$"
@@ -27,14 +37,14 @@ rkmpp.sys = 1,,
 %ManufacturerName% = Standard,NTARM64.10.0...16299
 
 [Standard.NTARM64.10.0...16299]
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3510
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3511
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3512
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3520
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3521
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3540
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3550
-%rkmpp.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3560
+%rkmpp.VEPU.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3510
+%rkmpp.VDPU.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3511
+%rkmpp.AVSD.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3512
+%rkmpp.JPGD.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3520
+%rkmpp.JPGE.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3521
+%rkmpp.RVE.DeviceDesc%  = rkmpp_Inst, ACPI\RKCP3540
+%rkmpp.RVD.DeviceDesc%  = rkmpp_Inst, ACPI\RKCP3550
+%rkmpp.AV1D.DeviceDesc% = rkmpp_Inst, ACPI\RKCP3560
 
 [rkmpp_Inst.NT]
 CopyFiles = Drivers_Dir
@@ -56,5 +66,14 @@ ServiceBinary  = %13%\rkmpp.sys
 SPSVCINST_ASSOCSERVICE = 0x00000002
 ManufacturerName       = "Rockchip Windows Drivers Project"
 DiskName               = "rkmpp Installation Disk"
-rkmpp.DeviceDesc       = "Rockchip RK3588 MPP codec core"
-rkmpp.SVCDESC          = "rkmpp Service"
+
+rkmpp.VEPU.DeviceDesc  = "Rockchip RK3588 VPU video encoder (VEPU)"
+rkmpp.VDPU.DeviceDesc  = "Rockchip RK3588 VPU video decoder (VDPU)"
+rkmpp.AVSD.DeviceDesc  = "Rockchip RK3588 AVS+ video decoder"
+rkmpp.JPGD.DeviceDesc  = "Rockchip RK3588 JPEG decoder (RKJPEGD)"
+rkmpp.JPGE.DeviceDesc  = "Rockchip RK3588 JPEG encoder core (VPU JPEGE)"
+rkmpp.RVE.DeviceDesc   = "Rockchip RK3588 RKVENC v2 core (H.264 / HEVC encoder)"
+rkmpp.RVD.DeviceDesc   = "Rockchip RK3588 RKVDEC v2 core (H.264 / HEVC / VP9 decoder)"
+rkmpp.AV1D.DeviceDesc  = "Rockchip RK3588 AV1 video decoder"
+
+rkmpp.SVCDESC          = "Rockchip RK3588 MPP codec service"

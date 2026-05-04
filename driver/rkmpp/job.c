@@ -343,6 +343,61 @@ have_status:
             result = (hwStatus & RKVDEC2_INT_ERROR_MASK)
                    ? STATUS_DEVICE_HARDWARE_ERROR
                    : STATUS_SUCCESS;
+
+            /* AXI write-buffer drain.  RK3588 vdpu's IRQ asserts on the
+             * codec's internal "core done" event, NOT after the last
+             * outbound write reaches DRAM.  When buffers are mapped
+             * uncached, the slow ~12 ms user-mode read provides plenty
+             * of drain time; when cached + invalidate, we read fast
+             * enough to race the codec's tail-end writes — manifests
+             * as deterministic top-fresh / bottom-stale tearing.
+             *
+             * Force a drain before signalling completion: a dummy MMIO
+             * read of the codec's REVISION register (offset 0x004 in
+             * the SWREG window) goes through the same AXI bus the
+             * codec used for its DMA writes; the read can't return
+             * until prior writes from the same master domain have
+             * committed, so it forces drain.  Plus a short
+             * KeStallExecutionProcessor as a belt-and-suspenders
+             * upper bound for any NoC-side buffering not covered by
+             * the AXI ordering rule. */
+            volatile ULONG drain = READ_REGISTER_ULONG(
+                (volatile ULONG *)((PUCHAR)mmio + RKVDEC2_SWREG_BASE + 0x004));
+            UNREFERENCED_PARAMETER(drain);
+            /* AXI write-tail drain via polled idle indicator.  The
+             * codec's PERF_WORKING_CNT (offset 0x41c, BSP
+             * RKVDEC_PERF_WORKING_CNT) increments every cycle the codec
+             * is processing.  Once DEC_RDY is asserted AND the counter
+             * stops changing for a couple consecutive reads, the codec
+             * is fully drained — internal pipeline finished, AXI write
+             * FIFO empty.  Replaces a fixed 1500 µs stall that
+             * over-waited at 720p/1080p and slightly under-waited at
+             * 4K (causing "very slight tearing").
+             *
+             * Bounds: minimum 200 µs (covers the basic AXI BVALID
+             * round-trip even on the smallest frames), maximum 5000 µs
+             * (worst-case 4K frame with complex post-processing).
+             * Step 100 µs per poll, require 2 consecutive equal reads
+             * to declare done. */
+            {
+                volatile ULONG *perf_cnt =
+                    (volatile ULONG *)((PUCHAR)mmio + RKVDEC2_SWREG_BASE + 0x41c);
+                KeStallExecutionProcessor(200);  /* min */
+                ULONG prev = READ_REGISTER_ULONG(perf_cnt);
+                ULONG stable = 0;
+                ULONG total_us = 200;
+                while (total_us < 5000) {
+                    KeStallExecutionProcessor(100);
+                    total_us += 100;
+                    ULONG cur = READ_REGISTER_ULONG(perf_cnt);
+                    if (cur == prev) {
+                        if (++stable >= 2) break;
+                    } else {
+                        stable = 0;
+                        prev = cur;
+                    }
+                }
+            }
         }
 
         /* Ack pending status bits (write-1-to-clear). */
@@ -575,6 +630,21 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         }
     }
 
+    /* Ungate the codec's leaf clocks (clk_rkvdec0_core / ca / hevc_ca).
+     * BSP runs this at the start of every task via `mpp_power_on →
+     * clk_on`; we mirror it so that gate→ungate cycles between every
+     * pair of kicks, draining in-flight AXI traffic and resetting
+     * clock-domain-crossing flops without disturbing bus-root MMIO.
+     * Without this, sustained back-to-back kicks (zero-copy or
+     * non-ref-skip paths) wedge the codec — see memory note
+     * `rkmpp_zero_copy_kicks_too_fast.md`. */
+    {
+        PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
+        if (ccu && ccu->UngateCoreLeafClocks) {
+            ccu->UngateCoreLeafClocks(ccu->Header.Context);
+        }
+    }
+
     /* Configure the rkvdec2 internal AXI read caches.  BSP `rkvdec2_run`
      * (mpp_rkvdec2.c:344-350) writes these BEFORE the kick:
      *   CACHE_PERMIT_CACHEABLE (bit 0) | READ_ALLOCATE (bit 1) |
@@ -621,6 +691,17 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
             (w->Value & RKVDEC2_REG_DEC_E_BIT)) {
             hasKick = TRUE;
         }
+    }
+
+    /* Pre-kick clean: push CPU-dirty cache lines for the just-written
+     * input buffers (bitstream + packed PPS/RPS/scaling) to DRAM so
+     * the codec's first DMA read gets the fresh data.  Narrowed from
+     * "every referenced buffer" to "only buffers we know CPU wrote
+     * this kick" — refs/colmv/RCB/etc. aren't CPU-written so cleaning
+     * them is wasted work that dominated submit_us at 1440p+. */
+    for (UINT32 fi = 0; fi < Job->CleanMdlCount; fi++) {
+        KeFlushIoBuffers(Job->CleanMdls[fi],
+                         /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
     }
 
     /* Write the register list to MMIO in BSP-equivalent order.  BSP's
@@ -735,6 +816,27 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
      * = bits 4,5,6,7.  Plus we treat NTSTATUS failure as an error. */
     if (!NT_SUCCESS(Result) || (HardwareStatus & 0xF0u)) {
         RkMppSetNeedsCoreReset(Device);
+
+        /* Charge the error to the file-object that submitted this job so
+         * EvtFileCleanup can promote its session-end teardown to the
+         * soft-tier IOMMU force-reset.  Mirrors BSP's per-task
+         * `reset_request` accumulation that drives `mpp_dev_reset` on
+         * task finish. */
+        if (job->Owner) {
+            PRKMPP_FILE_CTX fctx = RkMppFileGet(job->Owner);
+            if (fctx) InterlockedIncrement(&fctx->ErrorCount);
+        }
+    }
+
+    /* Cache invalidate the OUTPUT FRAME only — that's the single buffer
+     * the codec wrote this kick that the CPU will read next.  Refs are
+     * codec-read-only and their cache lines were invalidated back when
+     * they were the output of an earlier kick; redoing them is wasted
+     * work, dominating per-frame cache cost at 1440p+ where it added
+     * ~1-2 ms of kernel time.  `ReadOperation=FALSE` → `dc ivac`. */
+    if (job->OutputFrameMdl) {
+        KeFlushIoBuffers(job->OutputFrameMdl,
+                         /*ReadOperation*/ FALSE, /*DmaOperation*/ TRUE);
     }
 
     /* Move from InFlight to Completed. */
@@ -758,6 +860,15 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
      * RkMppJobSubmit.  Done from DPC context (here) so the refcount stays
      * balanced even if user mode never calls WaitJob. */
     PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
+    /* Gate the codec's leaf clocks now that this job is finished.
+     * Pairs with the ungate at the head of RkMppJobStart; the
+     * gate→ungate transition between successive kicks drains the
+     * codec's internal AXI/clock-domain pipelines, matching what BSP
+     * `mpp_power_off → clk_off` does at end-of-task.  Done before
+     * starting the next job so the next kick sees a fresh ungate. */
+    if (ccu && ccu->GateCoreLeafClocks) {
+        ccu->GateCoreLeafClocks(ccu->Header.Context);
+    }
     if (ccu && ccu->DropCluster) {
         ccu->DropCluster(ccu->Header.Context);
     }
@@ -825,6 +936,41 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
             return STATUS_INVALID_PARAMETER;
         }
         dst->Value = (UINT32)(iova + src->IovaOffset);
+
+        /* Direction-based cache maintenance:
+         *
+         *   Output frame  (reg130 / 0x208) — CPU will read post-decode.
+         *     Captured into OutputFrameMdl for the post-IRQ invalidate.
+         *
+         *   Inputs (CPU writes, codec reads this kick):
+         *     reg128 / 0x200 — RLC base (bitstream)
+         *     reg129 / 0x204 — RLCWRITE base (alias of bitstream)
+         *     reg161 / 0x284 — packed PPS
+         *     reg163 / 0x28C — packed RPS
+         *     reg180 / 0x2D0 — packed scaling list
+         *   Captured into CleanMdls[] for the pre-kick clean.
+         *
+         *   Everything else (refs, ref_colmv, RCB, error_ref, CABAC init,
+         *   colmv_cur) is skipped — see RKMPP_JOB comment for why. */
+        PMDL mdl = NULL;
+        if (!NT_SUCCESS(RkMppBufLookupMdl(File, src->BufferHandle, &mdl)) ||
+            mdl == NULL) {
+            continue;
+        }
+        if (src->Offset == 0x208u) {
+            if (job->OutputFrameMdl == NULL) job->OutputFrameMdl = mdl;
+        } else if (src->Offset == 0x200u || src->Offset == 0x204u ||
+                   src->Offset == 0x284u || src->Offset == 0x28Cu ||
+                   src->Offset == 0x2D0u) {
+            BOOLEAN already = FALSE;
+            for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
+                if (job->CleanMdls[k] == mdl) { already = TRUE; break; }
+            }
+            if (!already &&
+                job->CleanMdlCount < RTL_NUMBER_OF(job->CleanMdls)) {
+                job->CleanMdls[job->CleanMdlCount++] = mdl;
+            }
+        }
     }
     job->BufRefCount = In->BufRefCount;
     if (In->BufRefCount > 0) {
@@ -851,9 +997,36 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
         }
     }
 
-    /* Enqueue the job under the spin lock. */
+    /* Enqueue the job under the spin lock.  Cap the pending-job count
+     * as a kernel-side safeguard against runaway user-mode submission
+     * — if a session keeps submitting faster than the codec can drain
+     * (e.g. zero-copy ProcessInput pumping at decode rate while EVR
+     * pulls at audio rate), the queue would grow without bound, holding
+     * DPB slots and eventually feeding the codec bad refs that wedge
+     * the hardware.  STATUS_DEVICE_BUSY tells the caller to back off
+     * and call IOCTL_RKMPP_WAIT_JOB before submitting more. */
+    enum { RKMPP_MAX_PENDING_JOBS = 8 };
     KIRQL oldIrql;
     KeAcquireSpinLock(&q->Lock, &oldIrql);
+
+    /* Count pending entries — list is short (capped here), no LIST_FOR_EACH
+     * macro on Windows kernel so iterate manually. */
+    ULONG pendingCount = 0;
+    for (PLIST_ENTRY e = q->Pending.Flink;
+         e != &q->Pending;
+         e = e->Flink) {
+        pendingCount++;
+        if (pendingCount >= RKMPP_MAX_PENDING_JOBS) break;
+    }
+    if (pendingCount >= RKMPP_MAX_PENDING_JOBS) {
+        KeReleaseSpinLock(&q->Lock, oldIrql);
+        /* Drop the per-job CCU raise so refcount stays balanced. */
+        if (ccu && ccu->DropCluster) {
+            ccu->DropCluster(ccu->Header.Context);
+        }
+        ExFreePoolWithTag(job, 'JppM');
+        return STATUS_DEVICE_BUSY;
+    }
 
     BOOLEAN startNow = (q->InFlight == NULL);
     if (startNow) {

@@ -381,6 +381,55 @@ NTSTATUS RkMppCcuDropCluster(_In_ PVOID Ctx)
     return STATUS_SUCCESS;
 }
 
+/* RKVDEC0 leaf-clock gate bits in CLKGATE_CON40:
+ *   bit 3  hclk_rkvdec0       (codec hclk leaf — child of hclk_rkvdec0_root)
+ *   bit 4  aclk_rkvdec0       (codec aclk leaf — child of aclk_rkvdec0_root)
+ *   bit 7  clk_rkvdec0_ca     (CABAC)
+ *   bit 8  clk_rkvdec0_hevc_ca (HEVC CABAC)
+ *   bit 9  clk_rkvdec0_core   (decode pipeline)
+ *
+ * Mapping from BSP rkvdec2_clk_off / clk_on:
+ *   dec->aclk_info.clk        → bit 4   (DTS "aclk_rkvdec0")
+ *   dec->hclk_info.clk        → bit 3   (DTS "hclk_rkvdec0")
+ *   dec->core_clk_info.clk    → bit 9
+ *   dec->cabac_clk_info.clk   → bit 7
+ *   dec->hevc_cabac_clk_info  → bit 8
+ *
+ * Verified against upstream drivers/clk/rockchip/clk-rk3588.c gate
+ * descriptors (CLK_RKVDEC0_CA / _HEVC_CA / _CORE at bits 7/8/9 of
+ * RK3588_CLKGATE_CON(40); HCLK_RKVDEC0 / ACLK_RKVDEC0 at bits 3/4).
+ *
+ * Root clocks at bits 0,1,2 (hclk_rkvdec0_root / aclk_rkvdec0_root /
+ * aclk_rkvdec_ccu) are deliberately EXCLUDED — they are refcounted
+ * shared parents in CCF and BSP does not toggle them per task.
+ *
+ * Codec MMIO between kicks: not accessed.  JobStart ungates BEFORE
+ * the register-list writes and the kick; the poller polls INT_STATUS
+ * while clocks are on; JobComplete gates AFTER the poller exits.
+ * No code path touches codec MMIO while bit 3 is gated. */
+#define RDCC_CON40_LEAF_GATE_MASK  0x00000398u  /* bits 3,4,7,8,9 */
+
+NTSTATUS RkMppCcuGateCoreLeafClocks(_In_ PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    /* Set gate bits = stop the leaf clocks. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
+                     RDCC_CON40_LEAF_GATE_MASK,
+                     RDCC_CON40_LEAF_GATE_MASK);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS RkMppCcuUngateCoreLeafClocks(_In_ PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    /* Clear gate bits = restart the leaf clocks. */
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
+                     RDCC_CON40_LEAF_GATE_MASK, 0);
+    return STATUS_SUCCESS;
+}
+
 /* Hang-recovery reset toggles for the RVD0 core only.  RaiseCluster
  * deasserts the full reset bundle on bring-up; these helpers target
  * just the CORE bit (CON40 bit 9) so a stuck job can be killed without

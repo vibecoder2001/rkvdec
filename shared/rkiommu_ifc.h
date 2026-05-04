@@ -38,7 +38,14 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKIOMMU,
  * can chase into stale physical addresses — `Reattach` resets that
  * state.  Body: STALL → mask IRQs → DISABLE_PAGING → zero DTE_ADDR
  * → reprogram DTE_ADDR with the same domain → ENABLE_PAGING → UN-STALL. */
-#define RKIOMMU_IFC_VERSION 4u
+/* v5: add ForceReset for soft-tier session-end recovery.  Mirrors BSP
+ * `rk_iommu_force_reset` (rockchip-iommu.c): STALL → write
+ * RK_MMU_CMD_FORCE_RESET → poll DTE_ADDR == 0 → UN-STALL.  Resets the
+ * MMU's internal state machine (walk caches, prefetcher, fault state)
+ * without touching the codec/AXI/AHB/NIU CRU bits the wide
+ * `Ccu.FullCoreReset` toggles.  Caller MUST follow with `Reattach` to
+ * reprogram DTE_ADDR (FORCE_RESET zeroes it). */
+#define RKIOMMU_IFC_VERSION 5u
 
 typedef NTSTATUS (*RKIOMMU_QUERY_VERSION)(_Out_ PUINT32);
 
@@ -96,6 +103,11 @@ typedef NTSTATUS (*RKIOMMU_FLUSH_TLB)(_In_ PVOID ProviderContext);
  * rebuilt.  Safe to call even when paging is already disabled. */
 typedef NTSTATUS (*RKIOMMU_REATTACH)(_In_ PVOID ProviderContext);
 
+/* Soft-tier reset: issues RK_MMU_CMD_FORCE_RESET to all MMU instances
+ * under stall, then polls DTE_ADDR == 0 for completion.  Returns
+ * STATUS_TIMEOUT if any MMU instance fails to ack within 100 ms. */
+typedef NTSTATUS (*RKIOMMU_FORCE_RESET)(_In_ PVOID ProviderContext);
+
 typedef struct _RKIOMMU_INTERFACE {
     INTERFACE                Header;
     UINT32                   Hid;     /* e.g. 0x3570 / 0x3571 */
@@ -107,4 +119,5 @@ typedef struct _RKIOMMU_INTERFACE {
     RKIOMMU_SNAPSHOT         Snapshot;
     RKIOMMU_FLUSH_TLB        FlushTlb;
     RKIOMMU_REATTACH         Reattach;
+    RKIOMMU_FORCE_RESET      ForceReset;
 } RKIOMMU_INTERFACE, *PRKIOMMU_INTERFACE;

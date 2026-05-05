@@ -34,7 +34,13 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKMPP_CCU,
  * non-ref skip) collapsed inter-kick spacing and wedged the codec.
  * Bus-root clocks (CON40 bits 0,1,2 — hclk/aclk/aclk_ccu) stay UNgated
  * so MMIO register access between kicks still works. */
-#define RKMPP_CCU_IFC_VERSION 4u
+/* v5: add RaiseAv1Cluster / DropAv1Cluster.  AV1 (RKCP3560) lives in its
+ * own power domain (PD_AV1) with independent clocks/resets from the
+ * rkvdec0/1 cluster.  The base RaiseCluster powers PD_VCODEC + PD_VDPU
+ * + PD_RKVDEC0/1; the AV1 path powers PD_VCODEC + PD_VDPU + PD_AV1.
+ * The two parent PDs are ref-counted so both clusters can coexist
+ * without one's drop yanking power from the other. */
+#define RKMPP_CCU_IFC_VERSION 5u
 
 typedef NTSTATUS (*RKMPP_CCU_QUERY_VERSION)(_Out_ PUINT32);
 typedef NTSTATUS (*RKMPP_CCU_RAISE_CLUSTER) (_In_ PVOID ClientCookie);
@@ -55,4 +61,9 @@ typedef struct _RKMPP_CCU_INTERFACE {
     RKMPP_CCU_FULL_RESET      FullCoreReset;
     RKMPP_CCU_LEAF_GATE       GateCoreLeafClocks;     /* per-kick gate */
     RKMPP_CCU_LEAF_UNGATE     UngateCoreLeafClocks;   /* per-kick ungate */
+    /* AV1 cluster (RKCP3560) — independent PD_AV1 / clocks / resets
+     * from the rkvdec0/1 cluster.  PD_VCODEC + PD_VDPU parents are
+     * ref-counted internally so both clusters can coexist. */
+    RKMPP_CCU_RAISE_CLUSTER   RaiseAv1Cluster;
+    RKMPP_CCU_DROP_CLUSTER    DropAv1Cluster;
 } RKMPP_CCU_INTERFACE, *PRKMPP_CCU_INTERFACE;

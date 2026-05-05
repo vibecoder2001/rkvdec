@@ -99,11 +99,24 @@ RkIommuReadAcpiId(_In_ WDFDEVICE Device,
  * Idempotent: calling on an already-disabled IOMMU returns SUCCESS
  * without touching MMIO.
  * --------------------------------------------------------------------------- */
+/* AV1D disable — single write to AHB_CONTROL clears the enable bit. */
+static NTSTATUS RkIommuDisableAv1d(_In_ PRKIOMMU_DEVICE Dev)
+{
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG*)(Dev->MmioBase + AV1_MMU_AHB_CONTROL), 0u);
+    Dev->PagingEnabled = FALSE;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkiommu(av1d): disabled (HID=RKCP%04x UID=%u)\n",
+               Dev->Hid, Dev->Uid);
+    return STATUS_SUCCESS;
+}
+
 _Use_decl_annotations_
 NTSTATUS RkIommuDisable(PRKIOMMU_DEVICE Dev)
 {
     if (!Dev || !Dev->MmioBase) return STATUS_DEVICE_NOT_READY;
     if (!Dev->PagingEnabled)    return STATUS_SUCCESS;
+    if (Dev->IsAv1d)            return RkIommuDisableAv1d(Dev);
 
     int n_cfg = (Dev->MmioLength >= 0x80) ? 2 : 1;
 
@@ -165,11 +178,69 @@ NTSTATUS RkIommuDisable(PRKIOMMU_DEVICE Dev)
  *
  * Called lazily by MapMdl on the first successful map.
  * --------------------------------------------------------------------------- */
+/* AV1D enable sequence — register layout per linux-rockchip BSP
+ * mpp_iommu_av1d.c::av1_iommu_enable.  Single MMU instance per device.
+ * Programs the PTA (Page Table Array) base, sets OUT_OF_BOUND, enables
+ * exceptions, then enables paging.  No STALL/COMMAND model; a flat write
+ * sequence.  Idempotent — readback of AHB_CONTROL ENABLE bit short-
+ * circuits if already enabled. */
+static NTSTATUS RkIommuEnableAv1d(_In_ PRKIOMMU_DEVICE Dev)
+{
+    volatile UCHAR *base = Dev->MmioBase;
+    ULONG ctrl = READ_REGISTER_ULONG(
+        (volatile ULONG*)(base + AV1_MMU_AHB_CONTROL));
+    if (ctrl & AV1_MMU_AHB_CONTROL_ENABLE) {
+        Dev->PagingEnabled = TRUE;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "rkiommu(av1d): already enabled (ctrl=0x%08x)\n", ctrl);
+        return STATUS_SUCCESS;
+    }
+
+    /* Program PTA base low / high.  PtaPhys is 32-bit, high is 0 today
+     * (we allocate domain pages below 4 GiB). */
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG*)(base + AV1_MMU_AHB_TBL_ARRAY_BASE_L),
+        Dev->Domain->PtaPhys);
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG*)(base + AV1_MMU_AHB_TBL_ARRAY_BASE_H), 0u);
+
+    /* Set OUT_OF_BOUND in CONFIG1 (required to enable fault generation
+     * for accesses outside the mapped IOVA space). */
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG*)(base + AV1_MMU_CONFIG1),
+        AV1_MMU_CONFIG1_OUT_OF_BOUND);
+
+    /* Enable exception reporting, then paging itself. */
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG*)(base + AV1_MMU_AHB_EXCEPTION),
+        AV1_MMU_AHB_CONTROL_ENABLE);
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG*)(base + AV1_MMU_AHB_CONTROL),
+        AV1_MMU_AHB_CONTROL_ENABLE);
+
+    /* Verify. */
+    ctrl = READ_REGISTER_ULONG(
+        (volatile ULONG*)(base + AV1_MMU_AHB_CONTROL));
+    if (!(ctrl & AV1_MMU_AHB_CONTROL_ENABLE)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkiommu(av1d): enable readback ctrl=0x%08x — failed\n",
+                   ctrl);
+        return STATUS_DEVICE_HARDWARE_ERROR;
+    }
+    Dev->PagingEnabled = TRUE;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkiommu(av1d): paging enabled (HID=RKCP%04x UID=%u "
+               "PTA=0x%08x ctrl=0x%08x)\n",
+               Dev->Hid, Dev->Uid, Dev->Domain->PtaPhys, ctrl);
+    return STATUS_SUCCESS;
+}
+
 _Use_decl_annotations_
 NTSTATUS RkIommuEnable(PRKIOMMU_DEVICE Dev)
 {
     if (!Dev->MmioBase || !Dev->Domain) return STATUS_DEVICE_NOT_READY;
     if (Dev->PagingEnabled)             return STATUS_SUCCESS;
+    if (Dev->IsAv1d)                    return RkIommuEnableAv1d(Dev);
 
     /* RK3588 rkvdec0_mmu / rkvdec1_mmu have TWO MMU instances per
      * codec, one for read-port one for write-port.  DT:
@@ -327,6 +398,11 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
         ctx->FlagShootdownEntire = FALSE;
     }
 
+    /* Variant select.  RKCP3571 (A1MU) is rockchip,iommu-av1d — different
+     * register layout, paging structure, and DTE/PTE encoding from the
+     * v2 IOMMU rkvdec0/1 use. */
+    ctx->IsAv1d = (ctx->Hid == 0x3571);
+
     /* RK3588 codec MMUs come in pairs.  ACPI declares two Memory regions
      *   0xFDC38700/0x40 + 0xFDC38740/0x40
      * which we want to map as ONE contiguous 0x80 block so num_mmu=2
@@ -365,8 +441,8 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    /* Allocate the domain (page directory + IOVA bitmap) */
-    status = RkIommuDomainCreate(&ctx->Domain);
+    /* Allocate the domain (page directory + IOVA bitmap; PTA for AV1D) */
+    status = RkIommuDomainCreate(&ctx->Domain, ctx->IsAv1d);
     if (!NT_SUCCESS(status)) {
         MmUnmapIoSpace((PVOID)ctx->MmioBase, ctx->MmioLength);
         ctx->MmioBase = NULL;

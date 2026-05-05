@@ -18,6 +18,14 @@ typedef struct _RKIOMMU_DEVICE {
 
     BOOLEAN             PagingEnabled;  /* TRUE after RkIommuEnable() */
 
+    /* IOMMU IP variant.  RKCP3570 uses rockchip,iommu-v2 — register
+     * layout matches mainline rockchip-iommu.c.  RKCP3571 uses
+     * rockchip,iommu-av1d — completely different register offsets,
+     * and a 3-level paging structure (PTA → DT → PT) instead of v2's
+     * 2-level (DT → PT).  See linux-rockchip BSP
+     * drivers/video/rockchip/mpp/mpp_iommu_av1d.c. */
+    BOOLEAN             IsAv1d;
+
     /* BSP _DSD flags — set in EvtPrepareHardware based on HID/UID. */
     BOOLEAN             FlagDisableMmuReset;   /* rockchip,disable-mmu-reset */
     BOOLEAN             FlagEnableCmdRetry;    /* rockchip,enable-cmd-retry  */

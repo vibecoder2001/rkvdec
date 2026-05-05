@@ -34,6 +34,22 @@ BOOLEAN RkIommuEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 
     if (!ctx->MmioBase) return FALSE;
 
+    if (ctx->IsAv1d) {
+        /* AV1D ISR: STATUS at 0x384 (write 0 to clear), fault addr at 0x380.
+         * Single MMU instance per device. */
+        ULONG st = READ_REGISTER_ULONG(
+            (volatile ULONG*)(ctx->MmioBase + AV1_MMU_STATUS_AV1));
+        if (!(st & AV1_MMU_STATUS_AV1_IRQ_MASK)) return FALSE;
+        ULONG iova = READ_REGISTER_ULONG(
+            (volatile ULONG*)(ctx->MmioBase + AV1_MMU_PAGE_FAULT_ADDR_AV1));
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(ctx->MmioBase + AV1_MMU_STATUS_AV1), 0u);
+        ctx->FaultCtx.IntStatus = st;
+        ctx->FaultCtx.FaultIova = iova;
+        WdfInterruptQueueDpcForIsr(Interrupt);
+        return TRUE;
+    }
+
     /* RK3588 codec MMUs come in pairs (read-port + write-port) sharing
      * one GIC IRQ.  Walk all instances; ack faults on every one with
      * a non-zero INT_STATUS.  If we only check MMU#0 and #1 has a

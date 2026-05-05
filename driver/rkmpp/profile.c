@@ -20,20 +20,24 @@ static const RKMPP_PROFILE g_profiles[] = {
      * the kick path: it copies the user-mode RKMPP_REG_WRITE list to
      * MMIO verbatim, so the driver doesn't need a per-codec gate.
      * Advertise both. */
-    { 0x3550, 0, RKMPP_CODEC_H264 | RKMPP_CODEC_HEVC, 0x0100 },
-    { 0x3550, 1, RKMPP_CODEC_H264 | RKMPP_CODEC_HEVC, 0x0100 },
+    { 0x3550, 0, RKMPP_CODEC_H264 | RKMPP_CODEC_HEVC, 0x0100, RKMPP_PERSONALITY_RKVDEC2 },
+    { 0x3550, 1, RKMPP_CODEC_H264 | RKMPP_CODEC_HEVC, 0x0100, RKMPP_PERSONALITY_RKVDEC2 },
     /* All other matching HIDs probe but expose no codec capability in Phase 1. */
-    { 0x3510, 0, 0, 0x0000 },
-    { 0x3511, 0, 0, 0x0000 },
-    { 0x3512, 0, 0, 0x0000 },
-    { 0x3520, 0, 0, 0x0000 },
-    { 0x3521, 0, 0, 0x0000 },
-    { 0x3521, 1, 0, 0x0000 },
-    { 0x3521, 2, 0, 0x0000 },
-    { 0x3521, 3, 0, 0x0000 },
-    { 0x3540, 0, 0, 0x0000 },
-    { 0x3540, 1, 0, 0x0000 },
-    { 0x3560, 0, 0, 0x0000 },
+    { 0x3510, 0, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3511, 0, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3512, 0, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3520, 0, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3521, 0, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3521, 1, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3521, 2, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3521, 3, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3540, 0, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    { 0x3540, 1, 0, 0x0000, RKMPP_PERSONALITY_NONE },
+    /* RKCP3560 / AV1D — RKVDEC AV1 decoder, vdpu family.  Three MMIO
+     * windows (VCD/CACHE/AFBC); kick + IRQ live at VCD+0x004 (no 0x100
+     * SWREG_BASE prefix).  REVISION (REG0_VERSION) at VCD+0x000.
+     * Codec dispatch lives in RKMPP_CODEC_OPS table in job.c. */
+    { 0x3560, 0, RKMPP_CODEC_AV1, 0x0000, RKMPP_PERSONALITY_AV1D },
 };
 
 const RKMPP_PROFILE*

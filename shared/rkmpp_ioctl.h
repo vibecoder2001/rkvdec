@@ -106,7 +106,9 @@ typedef struct _RKMPP_REG_WRITE {
     UINT32 Reserved;
 } RKMPP_REG_WRITE;
 
-#define RKMPP_MAX_REG_WRITES 256
+/* AV1 emits up to 320 swregs (idx 0..319) per kick; rkvdec2 needs ~120.
+ * Cap at 384 so AV1 always fits with headroom for future codec banks. */
+#define RKMPP_MAX_REG_WRITES 384
 #define RKMPP_MAX_BUF_REFS    16
 
 typedef struct _RKMPP_BUFFER_REF {

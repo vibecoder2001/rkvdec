@@ -211,11 +211,20 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
     if (dev->PagingEnabled && dev->MmioBase) {
-        int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
-        for (int mi = 0; mi < n_mmu; mi++) {
+        if (dev->IsAv1d) {
+            /* AV1D flush: pulse FLUSH bit in CONFIG0/0x184. */
             WRITE_REGISTER_ULONG(
-                (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
-                RK_MMU_CMD_ZAP_CACHE);
+                (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH),
+                AV1_MMU_FLUSH_BIT);
+            WRITE_REGISTER_ULONG(
+                (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), 0u);
+        } else {
+            int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
+            for (int mi = 0; mi < n_mmu; mi++) {
+                WRITE_REGISTER_ULONG(
+                    (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+                    RK_MMU_CMD_ZAP_CACHE);
+            }
         }
     }
 
@@ -250,6 +259,19 @@ RkIommuSnapshot(_In_ PVOID ProviderContext,
 {
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+    if (dev->IsAv1d) {
+        /* AV1D snapshot: STATUS at 0x384 (= IRQ status), fault addr at 0x380.
+         * No INT_RAWSTAT / INT_STATUS distinction; only one MMU instance. */
+        Out->Status        = READ_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + AV1_MMU_STATUS_AV1));
+        Out->IntRawStat    = Out->Status;
+        Out->IntStatus     = Out->Status;
+        Out->PageFaultAddr = READ_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + AV1_MMU_PAGE_FAULT_ADDR_AV1));
+        Out->DteAddr       = READ_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + AV1_MMU_AHB_TBL_ARRAY_BASE_L));
+        return STATUS_SUCCESS;
+    }
     Out->Status        = READ_REGISTER_ULONG(
         (volatile ULONG*)(dev->MmioBase + RK_MMU_STATUS));
     Out->IntRawStat    = READ_REGISTER_ULONG(
@@ -280,6 +302,14 @@ RkIommuFlushTlb(_In_ PVOID ProviderContext)
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
     if (!dev->PagingEnabled)    return STATUS_SUCCESS;
+    if (dev->IsAv1d) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH),
+            AV1_MMU_FLUSH_BIT);
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), 0u);
+        return STATUS_SUCCESS;
+    }
     int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
     for (int mi = 0; mi < n_mmu; mi++) {
         WRITE_REGISTER_ULONG(
@@ -335,6 +365,15 @@ RkIommuForceReset(_In_ PVOID ProviderContext)
 {
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+
+    /* AV1D has no FORCE_RESET command — emulate via Disable+Enable.
+     * The MMU's internal state is small (no walk caches per the BSP
+     * driver), so a clean re-enable is sufficient. */
+    if (dev->IsAv1d) {
+        NTSTATUS s = RkIommuDisable(dev);
+        if (!NT_SUCCESS(s)) return s;
+        return RkIommuEnable(dev);
+    }
 
     int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
 

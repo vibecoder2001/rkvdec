@@ -27,6 +27,7 @@
  *   PD_VDPU   : pwr=BIT(10)  r_status=BIT(9)            req=idle=BIT(8)
  *   PD_RKVDEC0: pwr=BIT(8)   r_status=BIT(7)            req=idle=BIT(6)
  *   PD_RKVDEC1: pwr=BIT(9)   r_status=BIT(8)            req=idle=BIT(7)
+ *   PD_AV1    : pwr=BIT(12)  r_status=BIT(11)           req=idle=BIT(9)
  *
  * Parent hierarchy from rk3588s.dtsi `power-controller`:
  *   VD_VCODEC  → PD_RKVDEC0 / PD_RKVDEC1   (also includes PD_VENC0/1)
@@ -84,6 +85,7 @@ extern const RKMPP_PMU_DOMAIN g_pdVcodec;   /* VD_VCODEC parent — power on FIR
 extern const RKMPP_PMU_DOMAIN g_pdVdpu;     /* VD_LOGIC parent — power on SECOND  */
 extern const RKMPP_PMU_DOMAIN g_pdRkvdec0;  /* depends on both VCODEC and VDPU    */
 extern const RKMPP_PMU_DOMAIN g_pdRkvdec1;  /* depends on both VCODEC and VDPU    */
+extern const RKMPP_PMU_DOMAIN g_pdAv1;      /* AV1 decoder — depends on PD_VDPU   */
 
 NTSTATUS RkMppPmuPowerOn (_In_ const RKMPP_PMU_DOMAIN *D);
 NTSTATUS RkMppPmuPowerOff(_In_ const RKMPP_PMU_DOMAIN *D);

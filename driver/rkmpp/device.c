@@ -18,13 +18,33 @@
 #include "bufpool.h"
 #include "job.h"
 
+/* Per-codec memory window count.  rkvdec2 declares 1 or 2 contiguous
+ * regions (we merge to one MmioBase).  AV1 declares 3 separate windows
+ * (VCD, CACHE, AFBC) at 64 KB-spaced base addresses with un-allocated
+ * phys in between, so they CANNOT be merged: we map each independently
+ * and look them up via index. */
+#define RKMPP_MAX_MMIO_WINDOWS 4
+
+typedef struct _RKMPP_MMIO_WINDOW {
+    PVOID  Base;       /* virt mapping, NULL if slot unused */
+    SIZE_T Length;
+    PHYSICAL_ADDRESS Phys;
+} RKMPP_MMIO_WINDOW;
+
 typedef struct _RKMPP_DEVICE {
     UINT32                 Hid;
     UINT32                 Uid;
     UINT32                 RevisionWord;
     UINT32                 SupportedCodecs;
+    RKMPP_CODEC_PERSONALITY Personality;
+    /* Primary MMIO base — first window (rkvdec2: link+regs merged;
+     * AV1: VCD).  Job/IOCTL paths still address through MmioBase as
+     * the codec's main register window.  Additional windows live in
+     * Mmios[1..]. */
     PVOID                  MmioBase;
     SIZE_T                 MmioLength;
+    RKMPP_MMIO_WINDOW      Mmios[RKMPP_MAX_MMIO_WINDOWS];
+    UINT32                 MmioCount;
     RKMPP_IFC_CLIENT       Ifcs;
     RKMPP_JOB_QUEUE        JobQueue;
 
@@ -138,7 +158,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
      * mpp_common.c:2026 — gates mpp_dev_reset on reset_request > 0). */
     InterlockedExchange(&ctx->NeedsCoreReset, 1);
 
-    /* Step 1: walk resources to capture the MMIO base AND the raw+translated
+    /* Step 1: walk resources to capture MMIO windows AND the raw+translated
      * descriptors for the first interrupt.  ARM64 GIC line interrupts require
      * the descriptors to be passed explicitly to WdfInterruptCreate; the
      * default auto-bind path fails with STATUS_WDF_INVALID_INTERRUPT_CONFIG
@@ -146,16 +166,25 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     PCM_PARTIAL_RESOURCE_DESCRIPTOR irqRaw   = NULL;
     PCM_PARTIAL_RESOURCE_DESCRIPTOR irqTrans = NULL;
 
-    /* RVD0/RVD1 (RKCP3550) declare TWO memory regions in _CRS:
-     *   link : 0xFDC38000 / 0x100  ← idx 0..63   (common bank + kick)
-     *   regs : 0xFDC38100 / 0x400  ← idx 64..319 (codec params + addrs)
+    const RKMPP_PROFILE *profile_for_map = RkMppFindProfile(ctx->Hid, ctx->Uid);
+    BOOLEAN isAv1d = (profile_for_map &&
+                      profile_for_map->Personality == RKMPP_PERSONALITY_AV1D);
+
+    /* RVD0/RVD1 (RKCP3550) declares TWO physically contiguous memory regions
+     *   link : 0xFDC38000 / 0x100  ← idx 0..63
+     *   regs : 0xFDC38100 / 0x400  ← idx 64..319
+     * which we merge into one MmioBase so the BSP idx*4 byte offsets line up.
      *
-     * They are physically contiguous, so we map [min_start, max_end) as
-     * one block — that gets us a single MmioBase whose offsets line up
-     * with the BSP's idx*4 byte offsets (idx 10 = 0x28 lands on the kick
-     * register, idx 224 = 0x380 lands on INT_STATUS, etc.).
+     * AV1D (RKCP3560) declares THREE non-contiguous regions
+     *   VCD   : 0xFDC70000 / 0x800
+     *   CACHE : 0xFDC80000 / 0x400
+     *   AFBC  : 0xFDC90000 / 0x400
+     * with unallocated phys gaps in between — must be mapped independently.
      *
-     * Single-region devices (encoder cores, etc.) take the obvious path. */
+     * Strategy: for AV1, map each CmResourceTypeMemory descriptor into its
+     * own slot of Mmios[]; for everything else, take the convex hull and
+     * map as a single block (matches existing rkvdec2 behaviour).  The
+     * primary MmioBase always points at Mmios[0].Base. */
     PHYSICAL_ADDRESS mmioLow  = {0};
     PHYSICAL_ADDRESS mmioHigh = {0};
     BOOLEAN          mmioFound = FALSE;
@@ -165,42 +194,83 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
             WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
         if (d->Type == CmResourceTypeMemory) {
             PHYSICAL_ADDRESS start = d->u.Memory.Start;
-            PHYSICAL_ADDRESS end;
-            end.QuadPart = start.QuadPart + d->u.Memory.Length;
-            if (!mmioFound) {
-                mmioLow   = start;
-                mmioHigh  = end;
-                mmioFound = TRUE;
+            ULONG len = d->u.Memory.Length;
+
+            if (isAv1d) {
+                if (ctx->MmioCount >= RKMPP_MAX_MMIO_WINDOWS) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "rkmpp: AV1 declares >%u memory windows, "
+                               "ignoring extras\n", RKMPP_MAX_MMIO_WINDOWS);
+                    continue;
+                }
+                PVOID v = MmMapIoSpaceEx(start, len,
+                                         PAGE_READWRITE | PAGE_NOCACHE);
+                if (!v) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "rkmpp: AV1 window[%u] map failed phys=0x%llx "
+                               "len=0x%x\n",
+                               ctx->MmioCount,
+                               (ULONGLONG)start.QuadPart, len);
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                ctx->Mmios[ctx->MmioCount].Base   = v;
+                ctx->Mmios[ctx->MmioCount].Length = len;
+                ctx->Mmios[ctx->MmioCount].Phys   = start;
+                ctx->MmioCount++;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                           "rkmpp: AV1 window[%u] phys=0x%llx len=0x%x va=%p\n",
+                           ctx->MmioCount - 1,
+                           (ULONGLONG)start.QuadPart, len, v);
             } else {
-                if (start.QuadPart < mmioLow.QuadPart)  mmioLow  = start;
-                if (end.QuadPart   > mmioHigh.QuadPart) mmioHigh = end;
+                PHYSICAL_ADDRESS end;
+                end.QuadPart = start.QuadPart + len;
+                if (!mmioFound) {
+                    mmioLow   = start;
+                    mmioHigh  = end;
+                    mmioFound = TRUE;
+                } else {
+                    if (start.QuadPart < mmioLow.QuadPart)  mmioLow  = start;
+                    if (end.QuadPart   > mmioHigh.QuadPart) mmioHigh = end;
+                }
             }
         } else if (d->Type == CmResourceTypeInterrupt && !irqTrans) {
             irqTrans = d;
             irqRaw   = WdfCmResourceListGetDescriptor(ResourcesRaw, i);
         }
     }
-    if (!mmioFound) return STATUS_INSUFFICIENT_RESOURCES;
-    ULONG mmioLen = (ULONG)(mmioHigh.QuadPart - mmioLow.QuadPart);
-    /* RVD0/RVD1 (RKCP3550): the ACPI _CRS only declares the lower 0x500
-     * bytes of the IP's register file (link 0x100 + regs 0x400), but the
-     * BSP DTS exposes the full 0x800 — the extra 0x300 holds the rkvdec2
-     * internal cache configuration registers (CACHE0/1/2_SIZE at
-     * 0x51C/0x55C/0x59C, CLR_CACHE0/1/2 at 0x510/0x550/0x590, MAX_READS
-     * at 0x518) which the kernel BSP run path must program before kick.
-     * Force the mapping to the full 0x800 so those writes can land.
-     * Firmware fix is to extend the _CRS — until then this runtime
-     * widening keeps us moving. */
-    if (ctx->Hid == 0x3550 && mmioLen < 0x800) {
-        mmioLen = 0x800;
+
+    if (isAv1d) {
+        if (ctx->MmioCount == 0) return STATUS_INSUFFICIENT_RESOURCES;
+        ctx->MmioBase   = ctx->Mmios[0].Base;
+        ctx->MmioLength = ctx->Mmios[0].Length;
+    } else {
+        if (!mmioFound) return STATUS_INSUFFICIENT_RESOURCES;
+        ULONG mmioLen = (ULONG)(mmioHigh.QuadPart - mmioLow.QuadPart);
+        /* RVD0/RVD1 (RKCP3550): the ACPI _CRS only declares the lower 0x500
+         * bytes of the IP's register file (link 0x100 + regs 0x400), but the
+         * BSP DTS exposes the full 0x800 — the extra 0x300 holds the rkvdec2
+         * internal cache configuration registers (CACHE0/1/2_SIZE at
+         * 0x51C/0x55C/0x59C, CLR_CACHE0/1/2 at 0x510/0x550/0x590, MAX_READS
+         * at 0x518) which the kernel BSP run path must program before kick.
+         * Force the mapping to the full 0x800 so those writes can land.
+         * Firmware fix is to extend the _CRS — until then this runtime
+         * widening keeps us moving. */
+        if (ctx->Hid == 0x3550 && mmioLen < 0x800) {
+            mmioLen = 0x800;
+        }
+        PVOID v = MmMapIoSpaceEx(mmioLow, mmioLen,
+                                 PAGE_READWRITE | PAGE_NOCACHE);
+        if (!v) return STATUS_INSUFFICIENT_RESOURCES;
+        ctx->Mmios[0].Base   = v;
+        ctx->Mmios[0].Length = mmioLen;
+        ctx->Mmios[0].Phys   = mmioLow;
+        ctx->MmioCount       = 1;
+        ctx->MmioBase        = v;
+        ctx->MmioLength      = mmioLen;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "rkmpp: HID=RKCP%04x UID=%u MmioBase=phys 0x%llx len 0x%x\n",
+                   ctx->Hid, ctx->Uid, mmioLow.QuadPart, mmioLen);
     }
-    ctx->MmioBase   = MmMapIoSpaceEx(mmioLow, mmioLen,
-                                     PAGE_READWRITE | PAGE_NOCACHE);
-    ctx->MmioLength = mmioLen;
-    if (!ctx->MmioBase) return STATUS_INSUFFICIENT_RESOURCES;
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "rkmpp: HID=RKCP%04x UID=%u MmioBase=phys 0x%llx len 0x%x\n",
-               ctx->Hid, ctx->Uid, mmioLow.QuadPart, mmioLen);
 
     /* Connect the WDF interrupt with explicit raw + translated descriptors.
      * Phase 3a: ISR/DPC are wired but the hardware kick path (Phase 3b) is
@@ -246,10 +316,21 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                ctx->Ifcs.Iommu.Header.Version, ctx->Ifcs.Ccu.Header.Version);
 
     /* Raise the cluster.  Refcounted; matching DropCluster in ReleaseHardware.
-     * The cluster stays raised for the device's lifetime in v1; idle-timeout
-     * drop is a future hardening item. */
+     * Picks the rkvdec0/1 path or the AV1 path based on personality, which
+     * we look up from the profile early because the per-codec branch below
+     * (where ctx->Personality is finalized) hasn't run yet. */
     PVOID cookie = WdfDeviceWdmGetDeviceObject(Device);
-    status = ctx->Ifcs.Ccu.RaiseCluster(cookie);
+    {
+        const RKMPP_PROFILE *probe_profile = RkMppFindProfile(ctx->Hid, ctx->Uid);
+        BOOLEAN useAv1 = (probe_profile &&
+                          probe_profile->Personality == RKMPP_PERSONALITY_AV1D &&
+                          ctx->Ifcs.Ccu.RaiseAv1Cluster);
+        if (useAv1) {
+            status = ctx->Ifcs.Ccu.RaiseAv1Cluster(cookie);
+        } else {
+            status = ctx->Ifcs.Ccu.RaiseCluster(cookie);
+        }
+    }
     if (!NT_SUCCESS(status)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp: RaiseCluster failed 0x%08x\n", status);
@@ -264,6 +345,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     const RKMPP_PROFILE *p = RkMppFindProfile(ctx->Hid, ctx->Uid);
     if (p) {
         ctx->SupportedCodecs = p->SupportedCodecs;
+        ctx->Personality     = p->Personality;
     }
 
     /* Only touch codec MMIO + IOMMU wiring for devices we actually plan
@@ -325,15 +407,26 @@ RkMppEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTransl
 
     /* Mirror PrepareHardware in reverse: drop the cluster raise we took
      * there, then release the ifcs and unmap MMIO. */
-    if (ctx->Ifcs.CcuOpen && ctx->Ifcs.Ccu.DropCluster) {
-        ctx->Ifcs.Ccu.DropCluster(WdfDeviceWdmGetDeviceObject(Device));
+    if (ctx->Ifcs.CcuOpen) {
+        PVOID cookie = WdfDeviceWdmGetDeviceObject(Device);
+        if (ctx->Personality == RKMPP_PERSONALITY_AV1D &&
+            ctx->Ifcs.Ccu.DropAv1Cluster) {
+            ctx->Ifcs.Ccu.DropAv1Cluster(cookie);
+        } else if (ctx->Ifcs.Ccu.DropCluster) {
+            ctx->Ifcs.Ccu.DropCluster(cookie);
+        }
     }
     RkMppCloseIfcs(&ctx->Ifcs);
 
-    if (ctx->MmioBase) {
-        MmUnmapIoSpace(ctx->MmioBase, ctx->MmioLength);
-        ctx->MmioBase = NULL;
+    for (UINT32 i = 0; i < ctx->MmioCount; i++) {
+        if (ctx->Mmios[i].Base) {
+            MmUnmapIoSpace(ctx->Mmios[i].Base, ctx->Mmios[i].Length);
+            ctx->Mmios[i].Base = NULL;
+        }
     }
+    ctx->MmioBase   = NULL;
+    ctx->MmioLength = 0;
+    ctx->MmioCount  = 0;
     return STATUS_SUCCESS;
 }
 
@@ -687,6 +780,34 @@ RkMppGetJobQueue(_In_ WDFDEVICE Device)
 {
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     return &ctx->JobQueue;
+}
+
+/* Codec-personality accessor — selects the kick path in job.c. */
+RKMPP_CODEC_PERSONALITY
+RkMppGetPersonality(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    return ctx->Personality;
+}
+
+/* Auxiliary MMIO window accessor.  Index 0 is the primary (same as
+ * MmioBase); 1..N-1 hit additional windows declared in _CRS.  Returns
+ * NULL if the slot is unused.  AV1 uses indices 0=VCD, 1=CACHE, 2=AFBC. */
+PVOID
+RkMppGetMmioWindow(_In_ WDFDEVICE Device,
+                   _In_ UINT32 Index,
+                   _Out_opt_ PULONG Length)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    if (Index >= ctx->MmioCount) {
+        if (Length) *Length = 0;
+        return NULL;
+    }
+    if (Length) {
+        SIZE_T l = ctx->Mmios[Index].Length;
+        *Length = (l > MAXULONG) ? MAXULONG : (ULONG)l;
+    }
+    return ctx->Mmios[Index].Base;
 }
 
 void RkMppGetPublic(_In_ WDFDEVICE Device, _Out_ RKMPP_DEVICE_PUBLIC *Out)

@@ -18,6 +18,8 @@ NTSTATUS RkMppCcuDeassertCoreReset   (_In_  PVOID   Ctx);
 NTSTATUS RkMppCcuFullCoreReset       (_In_  PVOID   Ctx);
 NTSTATUS RkMppCcuGateCoreLeafClocks  (_In_  PVOID   Ctx);
 NTSTATUS RkMppCcuUngateCoreLeafClocks(_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuRaiseAv1Cluster     (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuDropAv1Cluster      (_In_  PVOID   Ctx);
 
 NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device)
 {
@@ -44,6 +46,8 @@ NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.FullCoreReset            = RkMppCcuFullCoreReset;
     ifc.GateCoreLeafClocks       = RkMppCcuGateCoreLeafClocks;
     ifc.UngateCoreLeafClocks     = RkMppCcuUngateCoreLeafClocks;
+    ifc.RaiseAv1Cluster          = RkMppCcuRaiseAv1Cluster;
+    ifc.DropAv1Cluster           = RkMppCcuDropAv1Cluster;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

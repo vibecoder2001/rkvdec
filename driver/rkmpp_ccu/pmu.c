@@ -110,6 +110,27 @@ const RKMPP_PMU_DOMAIN g_pdRkvdec1 = {
     .IdleStBit     = (1u << 7),
 };
 
+/* PD_AV1:
+ *   pwr=BIT(12), repair_status=BIT(11) (1=on)
+ *   req=idle=BIT(9).
+ * Sourced from rk3588_pm_domains[] DOMAIN_RK3588 macro args
+ * (jammy-branch BSP — Joshua-Riek/linux-rockchip).  PD_AV1 sits under
+ * VD_LOGIC → PD_VDPU; PD_VDPU must be on first or the AV1 idle ack
+ * never propagates. */
+const RKMPP_PMU_DOMAIN g_pdAv1 = {
+    .PwrOffset       = RK3588_PMU_PWR_GATE_CON,
+    .PwrBit          = (1u << 12),
+    .StatusOffset    = 0,
+    .StatusBit       = 0,
+    .RepairStatusBit = (1u << 11),
+    .IdleReqOffset = RK3588_PMU_BUS_IDLE_REQ,
+    .IdleReqBit    = (1u << 9),
+    .IdleAckOffset = RK3588_PMU_BUS_IDLE_ACK,
+    .IdleAckBit    = (1u << 9),
+    .IdleStOffset  = RK3588_PMU_BUS_IDLE_ST,
+    .IdleStBit     = (1u << 9),
+};
+
 /* Hi-word-mask write: upper 16 = bit-enable mask, lower 16 = value.
  * Per-domain pwr_w_mask = pwr << 16, so the value 0 clears the bit and the
  * value (mask) sets the bit.  Same convention for req. */

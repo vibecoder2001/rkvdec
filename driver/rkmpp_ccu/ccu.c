@@ -119,6 +119,31 @@
 #define RDCC_CRU_CLKSEL_CON91_MASK   0x3Fu
 #define RDCC_CRU_CLKSEL_CON91_VALUE  ((7u << 0) | (0u << 5))
 
+/* AV1 decoder clock + reset registers (jammy-branch BSP):
+ *   CLKSEL_CON(163) at 0x300 + 163*4 = 0x58C
+ *     bits [4:0]   ACLK_AV1_ROOT divider  (actual_div − 1)
+ *     bits [7:5]   ACLK_AV1_ROOT mux      (gpll | cpll | aupll)
+ *     bits [8:7]   PCLK_AV1_ROOT mux      (200m | 100m | 50m | 24m)  -- overlap [7]
+ *   CLKGATE_CON(68) at 0x800 + 68*4 = 0x910
+ *     bit 0  ACLK_AV1_ROOT  bit 3  PCLK_AV1_ROOT
+ *   SOFTRST_CON(68) at 0xa00 + 68*4 = 0xB10
+ *     bit 1  SRST_A_AV1_BIU   bit 4  SRST_P_AV1_BIU
+ *     bit 2  SRST_A_AV1       bit 5  SRST_P_AV1
+ *
+ * Pick ACLK_AV1_ROOT = GPLL (mux 0) / 4 (BSP wants ~400 MHz; GPLL is
+ * 1188 MHz so /3 = 396 MHz, /4 = 297 MHz — be conservative for first
+ * bring-up and bump later if needed).  PCLK_AV1_ROOT = 100 MHz (mux 1). */
+#define RDCC_CRU_CLKSEL_CON163        0x58Cu
+#define RDCC_CRU_CLKSEL_CON163_MASK   0x01FFu  /* [8:0] */
+#define RDCC_CRU_CLKSEL_CON163_VALUE  ((3u << 0) | (0u << 5) | (1u << 7))
+
+#define RDCC_CRU_CLKGATE_CON68        0x910u
+#define RDCC_CRU_CLKGATE_CON68_MASK   ((1u << 0) | (1u << 3))
+
+#define RDCC_CRU_SOFTRST_CON68        0xB10u
+#define RDCC_CRU_SOFTRST_CON68_MASK   ((1u << 1) | (1u << 2) | \
+                                       (1u << 4) | (1u << 5))
+
 typedef struct _RDCC_REGS {
     ULONG ClkGateCon44;     /* VDPU root clocks (must be on before PD_VDPU) */
     ULONG ClkGateCon44Mask;
@@ -194,6 +219,16 @@ extern volatile UCHAR *g_rdcc_mmio;
 extern volatile UCHAR *g_cru_mmio;
 extern LONG            g_raise_refcount;
 
+/* AV1 cluster bring-up is independent of the rkvdec0/1 cluster — it
+ * has its own PD (PD_AV1) with its own clock + reset bundle.  Use a
+ * separate refcount so AV1 device probe doesn't end up as a no-op
+ * just because rkvdec0 already raised the rkvdec cluster. */
+static LONG g_av1_refcount = 0;
+/* Both cluster paths share the VD_LOGIC + VD_VCODEC parents (PD_VCODEC
+ * + PD_VDPU).  Track those separately so power-off on one cluster's
+ * Drop doesn't yank the rug from under the other. */
+static LONG g_parents_refcount = 0;
+
 /* Hi-word-mask write helper.  Bits set in `mask` (lower 16) get updated to
  * the corresponding bit in `value`; other bits are unaffected.  The upper
  * 16 bits of the actual MMIO write are the mask itself. */
@@ -211,41 +246,24 @@ NTSTATUS RkMppCcuQueryVersion(_Out_ PUINT32 v)
     return STATUS_SUCCESS;
 }
 
-NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
+/* Parents (PD_VCODEC + PD_VDPU) raise — shared between rkvdec cluster
+ * and AV1 cluster bring-up.  Refcounted so the second caller skips the
+ * full PMU sequence and just bumps the count. */
+static NTSTATUS RaiseParents(void)
 {
-    UNREFERENCED_PARAMETER(Ctx);
-    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    if (InterlockedIncrement(&g_raise_refcount) != 1) return STATUS_SUCCESS;
+    if (InterlockedIncrement(&g_parents_refcount) != 1) return STATUS_SUCCESS;
 
-    /* Linux pm_domains.c per-domain sequence:
-     *   ungate the PD's clocks → bus-idle deassert → PMU power-on.
-     * The bus-idle ack only updates when the bus's own clocks are running,
-     * so clocks come BEFORE the PMU handshake.  We unfold per-domain order:
-     *
-     *   PD_VCODEC      (no clocks, no idle)
-     *   ungate VDPU root clocks (CON44 b0..2)
-     *   PD_VDPU        (idle handshake + pwr)
-     *   ungate rkvdec0 cluster clocks (CON40 mask 0x3FF)
-     *   PD_RKVDEC0     (idle handshake + pwr)
-     *   ungate rkvdec1 cluster clocks (CON41 mask 0x1CF)
-     *   PD_RKVDEC1     (idle handshake + pwr)
-     *   deassert resets
-     */
     NTSTATUS s = RkMppPmuPowerOn(&g_pdVcodec);
     if (!NT_SUCCESS(s)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: PD_VCODEC power-on failed 0x%08x\n", s);
-        InterlockedDecrement(&g_raise_refcount);
+        InterlockedDecrement(&g_parents_refcount);
         return s;
     }
 
-    /* Ungate VDPU root clocks BEFORE PD_VDPU's bus-idle handshake. */
+    /* VDPU root clocks must tick before its bus-idle handshake; NIU resets
+     * sit on the same path so deassert them too. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44, g_rdcc.ClkGateCon44Mask, 0);
-
-    /* Deassert VDPU NIU resets (CON44 bits 4..6).  The VDPU NIU sits between
-     * PD_VDPU and downstream PDs (RKVDEC0/1, IEP, RGA, ...).  UEFI leaves
-     * these asserted; downstream codec MMIO reads SError on a NIU in reset
-     * even after the rkvdec0 NIU is brought up. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44, g_rdcc.SoftRstCon44Mask, 0);
 
     s = RkMppPmuPowerOn(&g_pdVdpu);
@@ -255,6 +273,42 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
                          g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
         RkMppPmuPowerOff(&g_pdVcodec);
+        InterlockedDecrement(&g_parents_refcount);
+        return s;
+    }
+    return STATUS_SUCCESS;
+}
+
+static void DropParents(void)
+{
+    if (InterlockedDecrement(&g_parents_refcount) != 0) return;
+    RkMppPmuPowerOff(&g_pdVdpu);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44,
+                     g_rdcc.SoftRstCon44Mask, g_rdcc.SoftRstCon44Mask);
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
+                     g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
+    RkMppPmuPowerOff(&g_pdVcodec);
+}
+
+NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    if (InterlockedIncrement(&g_raise_refcount) != 1) return STATUS_SUCCESS;
+
+    /* Linux pm_domains.c per-domain sequence:
+     *   ungate the PD's clocks → bus-idle deassert → PMU power-on.
+     * The bus-idle ack only updates when the bus's own clocks are running,
+     * so clocks come BEFORE the PMU handshake.  Per-domain order:
+     *
+     *   parents: PD_VCODEC then PD_VDPU (factored out in RaiseParents)
+     *   ungate rkvdec0 cluster clocks (CON40 mask 0x3FF)
+     *   PD_RKVDEC0     (idle handshake + pwr)
+     *   ungate rkvdec1 cluster clocks (CON41 mask 0x1CF)
+     *   PD_RKVDEC1     (idle handshake + pwr)
+     */
+    NTSTATUS s = RaiseParents();
+    if (!NT_SUCCESS(s)) {
         InterlockedDecrement(&g_raise_refcount);
         return s;
     }
@@ -309,10 +363,7 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
                    s, g40, g44, s89, r40);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                          g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
-        RkMppPmuPowerOff(&g_pdVdpu);
-        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
-                         g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
-        RkMppPmuPowerOff(&g_pdVcodec);
+        DropParents();
         InterlockedDecrement(&g_raise_refcount);
         return s;
     }
@@ -332,10 +383,7 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
         RkMppPmuPowerOff(&g_pdRkvdec0);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                          g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
-        RkMppPmuPowerOff(&g_pdVdpu);
-        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
-                         g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
-        RkMppPmuPowerOff(&g_pdVcodec);
+        DropParents();
         InterlockedDecrement(&g_raise_refcount);
         return s;
     }
@@ -356,8 +404,7 @@ NTSTATUS RkMppCcuDropCluster(_In_ PVOID Ctx)
     /* Reverse of RaiseCluster, child-first:
      *   reassert resets → power off PD_RKVDEC1 → gate rkvdec1 clocks
      *   → power off PD_RKVDEC0 → gate rkvdec0 clocks
-     *   → power off PD_VDPU → gate VDPU root clocks
-     *   → power off PD_VCODEC */
+     *   → DropParents (handles VDPU + VCODEC ref-counted) */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
                      g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41,
@@ -371,13 +418,72 @@ NTSTATUS RkMppCcuDropCluster(_In_ PVOID Ctx)
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                      g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
 
-    RkMppPmuPowerOff(&g_pdVdpu);
-    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44,
-                     g_rdcc.SoftRstCon44Mask, g_rdcc.SoftRstCon44Mask);
-    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
-                     g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
+    DropParents();
+    return STATUS_SUCCESS;
+}
 
-    RkMppPmuPowerOff(&g_pdVcodec);
+/* AV1 cluster bring-up — separate ref-counted path from rkvdec0/1.
+ * Sequence:
+ *   parents (PD_VCODEC + PD_VDPU)
+ *   configure ACLK_AV1_ROOT mux+div / PCLK_AV1_ROOT mux (CLKSEL_CON163)
+ *   ungate CLKGATE_CON(68) bits 0,3
+ *   deassert SOFTRST_CON(68) bits 1,2,4,5
+ *   PD_AV1 power on (idle handshake + pwr clear)
+ */
+NTSTATUS RkMppCcuRaiseAv1Cluster(_In_ PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    if (InterlockedIncrement(&g_av1_refcount) != 1) return STATUS_SUCCESS;
+
+    NTSTATUS s = RaiseParents();
+    if (!NT_SUCCESS(s)) {
+        InterlockedDecrement(&g_av1_refcount);
+        return s;
+    }
+
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON163,
+                     RDCC_CRU_CLKSEL_CON163_MASK, RDCC_CRU_CLKSEL_CON163_VALUE);
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKGATE_CON68,
+                     RDCC_CRU_CLKGATE_CON68_MASK, 0);
+    /* Deassert AV1 BIU + AV1 + PCLK_AV1_BIU + PCLK_AV1 resets BEFORE the
+     * PD_AV1 idle handshake — same reasoning as the rkvdec0/1 reset
+     * ordering: the BIU NIU has to be out of reset for its idle FSM to
+     * advance and ack the deassert. */
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_SOFTRST_CON68,
+                     RDCC_CRU_SOFTRST_CON68_MASK, 0);
+
+    s = RkMppPmuPowerOn(&g_pdAv1);
+    if (!NT_SUCCESS(s)) {
+        ULONG g68 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKGATE_CON68));
+        ULONG s163 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKSEL_CON163));
+        ULONG r68 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_SOFTRST_CON68));
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: PD_AV1 power-on failed 0x%08x "
+                   "CLKGATE68=0x%08x CLKSEL163=0x%08x SOFTRST68=0x%08x\n",
+                   s, g68, s163, r68);
+        RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKGATE_CON68,
+                         RDCC_CRU_CLKGATE_CON68_MASK,
+                         RDCC_CRU_CLKGATE_CON68_MASK);
+        DropParents();
+        InterlockedDecrement(&g_av1_refcount);
+        return s;
+    }
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS RkMppCcuDropAv1Cluster(_In_ PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    if (!g_cru_mmio) return STATUS_SUCCESS;
+    if (InterlockedDecrement(&g_av1_refcount) != 0) return STATUS_SUCCESS;
+
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_SOFTRST_CON68,
+                     RDCC_CRU_SOFTRST_CON68_MASK, RDCC_CRU_SOFTRST_CON68_MASK);
+    RkMppPmuPowerOff(&g_pdAv1);
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKGATE_CON68,
+                     RDCC_CRU_CLKGATE_CON68_MASK, RDCC_CRU_CLKGATE_CON68_MASK);
+    DropParents();
     return STATUS_SUCCESS;
 }
 

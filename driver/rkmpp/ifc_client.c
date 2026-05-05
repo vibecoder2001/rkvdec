@@ -108,9 +108,10 @@ static NTSTATUS QueryByGuid(_In_ const GUID *Guid,
 }
 
 /* v1 client→IOMMU topology — must match driver/rkiommu/topology.c.
- * RKCP3550 (rkvdec0/1 cores) → RKCP3570 with the matching UID:
- *   RVD0 (3550, UID 0) → RD0M (3570, UID 9)
- *   RVD1 (3550, UID 1) → RD1M (3570, UID 10)
+ *   RKCP3550 (rkvdec0/1 cores) → RKCP3570 with the matching UID:
+ *     RVD0 (3550, UID 0) → RD0M (3570, UID 9)
+ *     RVD1 (3550, UID 1) → RD1M (3570, UID 10)
+ *   RKCP3560 (AV1 decoder) → RKCP3571 (A1MU, single instance, UID 0)
  * Returns 0,0 if no entry. */
 static VOID LookupIommuForClient(UINT32 ClientHid, UINT32 ClientUid,
                                  UINT32 *IommuHid, UINT32 *IommuUid)
@@ -120,6 +121,9 @@ static VOID LookupIommuForClient(UINT32 ClientHid, UINT32 ClientUid,
     if (ClientHid == 0x3550) {
         *IommuHid = 0x3570;
         *IommuUid = (ClientUid == 0) ? 9 : 10;
+    } else if (ClientHid == 0x3560) {
+        *IommuHid = 0x3571;
+        *IommuUid = 0;
     }
 }
 

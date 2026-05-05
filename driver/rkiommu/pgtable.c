@@ -63,19 +63,40 @@ static VOID FreePageBelow4G(_In_ volatile ULONG *Va)
  * RkIommuDomainCreate
  * --------------------------------------------------------------------------- */
 _Use_decl_annotations_
-NTSTATUS RkIommuDomainCreate(PRKIOMMU_DOMAIN *Domain)
+NTSTATUS RkIommuDomainCreate(PRKIOMMU_DOMAIN *Domain, BOOLEAN IsAv1d)
 {
     PRKIOMMU_DOMAIN d = (PRKIOMMU_DOMAIN)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(*d), 'mDkR');
     if (!d) return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(d, sizeof(*d));
     KeInitializeSpinLock(&d->Lock);
+    d->IsAv1d = IsAv1d;
 
-    /* Allocate the page directory */
+    /* Allocate the page directory (DT for AV1D, PD for v2 — same layout
+     * for our purposes; AV1D's DTE format differs but the table itself
+     * is still 1024 × 4-byte entries). */
     d->Pd = AllocPageBelow4G(&d->PdPhys);
     if (!d->Pd) {
         ExFreePoolWithTag(d, 'mDkR');
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    /* AV1D adds an extra Page-Table-Array level above the DT.  PTA is
+     * 1024 × 8-byte entries; we only use PTA[0] (single-domain), pointed
+     * at our DT in 4K mode.  IOMMU MMIO is programmed with PtaPhys
+     * instead of PdPhys at enable time. */
+    if (IsAv1d) {
+        ULONG ptaPhys = 0;
+        d->Pta = (volatile ULONGLONG *)AllocPageBelow4G(&ptaPhys);
+        if (!d->Pta) {
+            FreePageBelow4G(d->Pd);
+            ExFreePoolWithTag(d, 'mDkR');
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        d->PtaPhys = ptaPhys;
+        /* PTA[0] = DT phys (1KB-aligned bits) | mode 0 (4K). */
+        d->Pta[0] = ((ULONGLONG)d->PdPhys & AV1_PTA_DT_ADDR_MASK) |
+                    AV1_PTA_MODE_4K;
     }
 
     /* Allocate the IOVA bitmap (128 KiB) from non-paged pool */
@@ -160,6 +181,12 @@ VOID RkIommuDomainDestroy(PRKIOMMU_DOMAIN Domain)
         FreePageBelow4G(Domain->Pd);
         Domain->Pd    = NULL;
         Domain->PdPhys = 0;
+    }
+
+    if (Domain->Pta) {
+        FreePageBelow4G((volatile ULONG *)Domain->Pta);
+        Domain->Pta     = NULL;
+        Domain->PtaPhys = 0;
     }
 
     if (Domain->IovaBitmap) {
@@ -286,15 +313,31 @@ NTSTATUS RkIommuMapAt(PRKIOMMU_DOMAIN Domain, ULONG64 Iova,
             }
             Domain->Pts[pdi] = pt;
 
-            /* Install the PDE: PA | valid */
-            Domain->Pd[pdi] = Domain->PtPhys[pdi] | RK_DTE_PT_VALID;
+            /* Install the DTE: PT phys | valid.  Mainline-v2 uses the
+             * full 32 bits of address (mask 0xfffff000); AV1D uses
+             * mask 0xffffffc0 (64-byte alignment).  Both work with
+             * 4 KiB-aligned PTs we allocate. */
+            ULONG dte = Domain->IsAv1d
+                ? (Domain->PtPhys[pdi] & AV1_DTE_PT_ADDR_MASK) | AV1_DTE_VALID
+                : (Domain->PtPhys[pdi] | RK_DTE_PT_VALID);
+            Domain->Pd[pdi] = dte;
         }
 
-        /* Install the PTE: PA | flags | valid */
+        /* Install the PTE.  Mainline-v2: address[31:12] | r/w/v (bits 0/1/2).
+         * AV1D: address[31:12] | (address[39:32] << 28) | v (bit 0) | w (bit 2);
+         * no "readable" bit. */
         ULONG64 pagePhys = PhysAddr + (ULONG64)i * RK_IOMMU_PAGE_SIZE;
-        ULONG pte = (ULONG)(pagePhys & RK_PTE_PAGE_ADDRESS_MASK) |
-                    (Flags & (RK_PTE_PAGE_READABLE | RK_PTE_PAGE_WRITABLE)) |
-                    RK_PTE_PAGE_VALID;
+        ULONG pte;
+        if (Domain->IsAv1d) {
+            ULONG lo  = (ULONG)(pagePhys & AV1_PTE_PAGE_ADDR_LOW_MASK);
+            ULONG hi8 = (ULONG)((pagePhys >> 32) & AV1_PTE_PAGE_ADDR_HIGH_MASK);
+            pte = lo | (hi8 << AV1_PTE_PAGE_ADDR_HIGH_SHIFT) | AV1_PTE_VALID;
+            if (Flags & RK_PTE_PAGE_WRITABLE) pte |= AV1_PTE_WRITABLE;
+        } else {
+            pte = (ULONG)(pagePhys & RK_PTE_PAGE_ADDRESS_MASK) |
+                  (Flags & (RK_PTE_PAGE_READABLE | RK_PTE_PAGE_WRITABLE)) |
+                  RK_PTE_PAGE_VALID;
+        }
         Domain->Pts[pdi][pti] = pte;
     }
 

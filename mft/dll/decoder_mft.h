@@ -34,6 +34,7 @@ namespace rkmpp {
 enum class CodecKind {
     H264,
     HEVC,
+    AV1,
 };
 
 /* DLL-wide lock count for DllCanUnloadNow. */
@@ -161,8 +162,13 @@ private:
     bool        engine_init_failed_ = false;
 
     /* Engine handle — DecodeEngine* allocated in BEGIN_STREAMING and
-     * destroyed in END_STREAMING / ~DecoderMFT. */
+     * destroyed in END_STREAMING / ~DecoderMFT.  H.264 / HEVC only. */
     void       *engine_ = nullptr;
+
+    /* Av1DecodeEngine* for kind_ == AV1.  Software mode by default
+     * (dav1d-decoded NV12 output) until the rkmpp.sys AV1 personality
+     * lands; then Hardware mode kicks the codec. */
+    void       *engine_av1_ = nullptr;
 
     /* D3D11 output state.  Populated by MFT_MESSAGE_SET_D3D_MANAGER.
      * When d3d_device_ is non-null, ProcessOutput emits NV12 textures

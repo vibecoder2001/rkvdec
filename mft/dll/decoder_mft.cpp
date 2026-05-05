@@ -21,10 +21,15 @@
  * so harness binaries and this DLL share one user-mode pipeline.  Codec
  * mapping: rkmpp::CodecKind <-> ::Codec (separate enums, same intent). */
 #include "../../tests/harness/rkmpp_decode/decode_engine.h"
+#include "../../tests/harness/rkmpp_decode/decode_engine_av1.h"
 
 namespace rkmpp {
 
 static ::Codec ToEngineCodec(CodecKind k) {
+    /* AV1 is not yet wired through DecodeEngine — BEGIN_STREAMING
+     * short-circuits before reaching this for AV1, but keep the H264
+     * fallthrough explicit so future engine work fails loudly rather
+     * than silently mis-decoding. */
     return (k == CodecKind::H264) ? ::Codec::H264 : ::Codec::H265;
 }
 
@@ -55,17 +60,28 @@ long g_dll_lock_count = 0;
 /* ---------- codec-table helpers ---------------------------------- */
 
 const wchar_t *DecoderFriendlyName(CodecKind k) {
-    return (k == CodecKind::H264)
-        ? L"Rockchip RK3588 H.264 Decoder"
-        : L"Rockchip RK3588 HEVC Decoder";
+    switch (k) {
+    case CodecKind::H264: return L"Rockchip RK3588 H.264 Decoder";
+    case CodecKind::HEVC: return L"Rockchip RK3588 HEVC Decoder";
+    case CodecKind::AV1:  return L"Rockchip RK3588 AV1 Decoder";
+    }
+    return L"Rockchip RK3588 Decoder";
 }
 const GUID &DecoderClsid(CodecKind k) {
-    return (k == CodecKind::H264) ? CLSID_RkmppH264Decoder
-                                  : CLSID_RkmppHevcDecoder;
+    switch (k) {
+    case CodecKind::H264: return CLSID_RkmppH264Decoder;
+    case CodecKind::HEVC: return CLSID_RkmppHevcDecoder;
+    case CodecKind::AV1:  return CLSID_RkmppAv1Decoder;
+    }
+    return CLSID_RkmppH264Decoder;
 }
 const GUID &DecoderInputSubtype(CodecKind k) {
-    return (k == CodecKind::H264) ? MFVideoFormat_H264
-                                  : MFVideoFormat_HEVC;
+    switch (k) {
+    case CodecKind::H264: return MFVideoFormat_H264;
+    case CodecKind::HEVC: return MFVideoFormat_HEVC;
+    case CodecKind::AV1:  return MFVideoFormat_AV1;
+    }
+    return MFVideoFormat_H264;
 }
 
 /* ---------- ctor / dtor ------------------------------------------ */
@@ -83,6 +99,12 @@ DecoderMFT::~DecoderMFT() {
         DecodeEngine_Shutdown(eng);
         delete eng;
         engine_ = nullptr;
+    }
+    if (engine_av1_) {
+        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+        Av1DecodeEngine_Shutdown(eng);
+        delete eng;
+        engine_av1_ = nullptr;
     }
     ReleaseD3DManager();
     if (attributes_) { attributes_->Release(); attributes_ = nullptr; }
@@ -283,11 +305,17 @@ STDMETHODIMP DecoderMFT::SetInputType(DWORD id, IMFMediaType *type, DWORD flags)
         if (FAILED(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), hdr_len, nullptr)))
             return MF_E_INVALIDMEDIATYPE;
 
-        /* Parse into a temporary instance so we can roll back on failure. */
+        /* Parse into a temporary instance so we can roll back on failure.
+         * AV1 extradata is `av1C` (OBU sequence header) — dav1d will
+         * pick up the SPS from the OBU stream itself, so just skip the
+         * parse and leave annexb empty. */
         DecoderMFT tmp(kind_);
-        HRESULT hr = (kind_ == CodecKind::H264)
-            ? tmp.ParseAvcCExtradata(hdr.data(), hdr.size())
-            : tmp.ParseHvcCExtradata(hdr.data(), hdr.size());
+        HRESULT hr = S_OK;
+        if (kind_ == CodecKind::H264) {
+            hr = tmp.ParseAvcCExtradata(hdr.data(), hdr.size());
+        } else if (kind_ == CodecKind::HEVC) {
+            hr = tmp.ParseHvcCExtradata(hdr.data(), hdr.size());
+        }
         if (FAILED(hr)) {
             /* Don't reject the type just because extradata is malformed —
              * many sources put SPS/PPS inline. Phase 2B will re-validate
@@ -541,6 +569,33 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
     case MFT_MESSAGE_NOTIFY_BEGIN_STREAMING: {
         if (streaming_) return S_OK;
         if (!input_type_ || !output_type_) return MF_E_TRANSFORM_TYPE_NOT_SET;
+        /* AV1: try Hardware mode first (rkmpp.sys AV1 personality);
+         * fall back to Software (dav1d) if the device isn't present
+         * or the HW init fails — keeps the MFT working on dev machines
+         * and gracefully degrading if the AV1 codec is offline. */
+        if (kind_ == CodecKind::AV1) {
+            if (!engine_av1_) {
+                auto *eng = new Av1DecodeEngine();
+                int rc = Av1DecodeEngine_Init(eng, Av1EngineMode::Hardware,
+                                              width_, height_);
+                if (rc != 0) {
+                    /* HW init failed — re-init in Software mode. */
+                    Av1DecodeEngine_Shutdown(eng);
+                    rc = Av1DecodeEngine_Init(eng, Av1EngineMode::Software,
+                                              width_, height_);
+                }
+                if (rc != 0) {
+                    delete eng;
+                    engine_av1_       = nullptr;
+                    engine_init_failed_ = true;
+                } else {
+                    engine_av1_       = eng;
+                    engine_init_failed_ = false;
+                }
+            }
+            streaming_ = true;
+            return S_OK;
+        }
         if (!engine_) {
             auto *eng = new DecodeEngine();
             int rc = DecodeEngine_Init(eng, ToEngineCodec(kind_),
@@ -587,6 +642,12 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
             delete eng;
             engine_ = nullptr;
         }
+        if (engine_av1_) {
+            auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+            Av1DecodeEngine_Shutdown(eng);
+            delete eng;
+            engine_av1_ = nullptr;
+        }
         engine_init_failed_ = false;
         streaming_ = false;
         input_queue_.clear();
@@ -602,6 +663,10 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
         if (engine_) {
             auto *eng = static_cast<DecodeEngine *>(engine_);
             (void)DecodeEngine_Flush(eng);
+        }
+        if (engine_av1_) {
+            auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+            (void)Av1DecodeEngine_Flush(eng);
         }
         return S_OK;
     case MFT_MESSAGE_NOTIFY_START_OF_STREAM:
@@ -619,6 +684,46 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
     std::lock_guard<std::mutex> g(lock_);
     if (!input_type_ || !output_type_) return MF_E_TRANSFORM_TYPE_NOT_SET;
     if (!streaming_)                    return MF_E_TRANSFORM_TYPE_NOT_SET;
+
+    /* AV1 path: feed each MF sample (one OBU temporal unit) directly
+     * into Av1DecodeEngine_Submit; dav1d emits zero or more pictures
+     * per call which ProcessOutput drains in display order. */
+    if (kind_ == CodecKind::AV1) {
+        if (!engine_av1_ || engine_init_failed_) return MF_E_NOTACCEPTING;
+        const size_t kQueueCap = 4;
+        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+        if (Av1DecodeEngine_QueueDepth(eng) >= kQueueCap) {
+            return MF_E_NOTACCEPTING;
+        }
+        LONGLONG pts = 0;
+        if (FAILED(sample->GetSampleTime(&pts))) {
+            pts = (LONGLONG)((samples_received_ * 10'000'000ULL * fps_den_)
+                             / (fps_num_ ? fps_num_ : 30));
+        }
+        DWORD buf_count = 0;
+        HRESULT hr = sample->GetBufferCount(&buf_count);
+        if (FAILED(hr)) return hr;
+        std::vector<uint8_t> au;
+        for (DWORD i = 0; i < buf_count; ++i) {
+            IMFMediaBuffer *buf = nullptr;
+            hr = sample->GetBufferByIndex(i, &buf);
+            if (FAILED(hr)) return hr;
+            BYTE *p = nullptr; DWORD cur = 0, max = 0;
+            hr = buf->Lock(&p, &max, &cur);
+            if (SUCCEEDED(hr)) {
+                au.insert(au.end(), p, p + cur);
+                buf->Unlock();
+            }
+            buf->Release();
+            if (FAILED(hr)) return hr;
+        }
+        samples_received_++;
+        int rc = Av1DecodeEngine_Submit(eng, au.data(), au.size(),
+                                        (int64_t)pts);
+        if (rc != 0) decode_errors_++;
+        return S_OK;
+    }
+
     if (!engine_ || engine_init_failed_) return MF_E_NOTACCEPTING;
 
     /* Backpressure: each queued frame holds a DPB slot via the external-
@@ -703,6 +808,51 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
     std::lock_guard<std::mutex> g(lock_);
     if (!input_type_ || !output_type_) return MF_E_TRANSFORM_TYPE_NOT_SET;
     if (buf[0].pSample) return E_FAIL;
+
+    /* AV1 path: software-decoded NV12 from dav1d, packed to a sysmem
+     * IMFMediaBuffer.  No D3D11 / DXGI fast path yet — first goal is
+     * to land a working playable AV1 decode in MF, then optimise. */
+    if (kind_ == CodecKind::AV1) {
+        if (!engine_av1_ || engine_init_failed_) {
+            buf[0].pSample = nullptr;
+            return E_FAIL;
+        }
+        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+        if (draining_) Av1DecodeEngine_Drain(eng);
+        Av1DecodedFrame frame;
+        int got = Av1DecodeEngine_PollFrame(eng, &frame);
+        if (got <= 0) {
+            buf[0].pSample = nullptr;
+            return MF_E_TRANSFORM_NEED_MORE_INPUT;
+        }
+        IMFSample *out_sample = nullptr;
+        IMFMediaBuffer *mbuf = nullptr;
+        HRESULT hr = MFCreateMemoryBuffer((DWORD)frame.yuv.size(), &mbuf);
+        if (SUCCEEDED(hr)) {
+            BYTE *p = nullptr; DWORD max = 0;
+            hr = mbuf->Lock(&p, &max, nullptr);
+            if (SUCCEEDED(hr)) {
+                std::memcpy(p, frame.yuv.data(), frame.yuv.size());
+                mbuf->Unlock();
+                mbuf->SetCurrentLength((DWORD)frame.yuv.size());
+            }
+        }
+        if (SUCCEEDED(hr)) hr = MFCreateSample(&out_sample);
+        if (SUCCEEDED(hr)) hr = out_sample->AddBuffer(mbuf);
+        if (SUCCEEDED(hr)) hr = out_sample->SetSampleTime(frame.pts_hns);
+        if (SUCCEEDED(hr)) hr = out_sample->SetSampleDuration(frame.dur_hns);
+        if (mbuf) mbuf->Release();
+        if (FAILED(hr)) {
+            if (out_sample) out_sample->Release();
+            Av1DecodeEngine_ReleaseFrame(eng, &frame);
+            return hr;
+        }
+        buf[0].pSample = out_sample;
+        Av1DecodeEngine_ReleaseFrame(eng, &frame);
+        frames_emitted_++;
+        return S_OK;
+    }
+
     if (!engine_ || engine_init_failed_) {
         buf[0].pSample = nullptr;
         return E_FAIL;

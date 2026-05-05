@@ -41,7 +41,7 @@ extern long g_dll_lock_count;
 inline void DllAddRef() { InterlockedIncrement(&g_dll_lock_count); }
 inline void DllRelease() { InterlockedDecrement(&g_dll_lock_count); }
 
-class DecoderMFT : public IMFTransform {
+class DecoderMFT : public IMFTransform, public IMFQualityAdvise {
 public:
     explicit DecoderMFT(CodecKind kind);
     ~DecoderMFT();
@@ -85,6 +85,18 @@ public:
     STDMETHODIMP ProcessOutput(DWORD flags, DWORD c,
                                MFT_OUTPUT_DATA_BUFFER *buf,
                                DWORD *status) override;
+
+    /* IMFQualityAdvise — EVR's quality manager calls SetDropMode when it
+     * sees the decoder falling behind audio.  We honor it by draining
+     * surplus frames from the engine's reorder window without copying
+     * them into output samples — gives EVR a chance to catch up without
+     * needing to drop our output samples on the rendering side, which
+     * would otherwise look like fast-forward scrubbing. */
+    STDMETHODIMP SetDropMode(MF_QUALITY_DROP_MODE eDropMode) override;
+    STDMETHODIMP SetQualityLevel(MF_QUALITY_LEVEL eQualityLevel) override;
+    STDMETHODIMP GetDropMode(MF_QUALITY_DROP_MODE *peDropMode) override;
+    STDMETHODIMP GetQualityLevel(MF_QUALITY_LEVEL *peQualityLevel) override;
+    STDMETHODIMP DropTime(LONGLONG hnsAmountToDrop) override;
 
 private:
     /* avcC / hvcC parsing — extracts SPS/PPS/(VPS) and emits a single
@@ -131,9 +143,18 @@ private:
     uint64_t    samples_received_ = 0;
     uint64_t    frames_emitted_   = 0;
     uint64_t    decode_errors_    = 0;
+    /* Frames popped from the engine but skipped at emit time — tracked
+     * per drop-mode reason so the periodic stats line can show what's
+     * actually getting filtered out. */
+    uint64_t    frames_skipped_dropmode_ = 0;
 
     bool        streaming_     = false;
     bool        draining_      = false;
+    /* IMFQualityAdvise drop mode — set by EVR's quality manager when we
+     * fall behind.  Used in ProcessOutput to drain surplus reorder-queue
+     * frames without doing the per-frame sysmem copy, keeping us paced
+     * with the audio clock. */
+    MF_QUALITY_DROP_MODE drop_mode_ = MF_DROP_MODE_NONE;
     /* Set if BEGIN_STREAMING tried to init the engine and failed (e.g.
      * no rkmpp.sys present).  Type-negotiation tests still succeed; the
      * first ProcessInput surfaces MF_E_NOTACCEPTING. */
@@ -156,6 +177,11 @@ private:
 
     HRESULT EnsureAttributes();
     void    ReleaseD3DManager();
+
+    /* Log emitted/skipped/error counts to stderr every 15 frames seen
+     * (emitted + drop-skipped).  Called from ProcessOutput on both
+     * emit and skip paths; throttled by an internal modulo counter. */
+    void    MaybeLogFrameStats();
 };
 
 /* Codec-specific friendly names + subtypes used by registration.cpp. */

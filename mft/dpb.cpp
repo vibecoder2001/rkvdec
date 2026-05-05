@@ -5,7 +5,10 @@
 namespace {
 
 /* Helpers for the per-slot bitfield struct (the C ABI uses :1 fields,
- * so we go through tiny accessors to keep the implementation tidy). */
+ * so we go through tiny accessors to keep the implementation tidy).
+ * Note: external_hold is intentionally preserved here — it's a refcount
+ * owned by a downstream consumer, and the DPB clearing this slot doesn't
+ * release the consumer's reference to its data. */
 static inline void slot_clear(DpbCtx *ctx, int i) {
     ctx->slots[i].in_use    = 0;
     ctx->slots[i].is_ref    = 0;
@@ -252,9 +255,23 @@ static void apply_mmco_ops(DpbCtx *ctx, int cur) {
 
 static int find_free(const DpbCtx *ctx) {
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
-        if (!ctx->slots[i].in_use) return (int)i;
+        if (ctx->slots[i].in_use)         continue;
+        if (ctx->slots[i].external_hold)  continue;
+        return (int)i;
     }
     return -1;
+}
+
+extern "C" void Dpb_AddExternalHold(DpbCtx *ctx, uint32_t slot_idx) {
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    if (ctx->slots[slot_idx].external_hold < 0xF)
+        ctx->slots[slot_idx].external_hold++;
+}
+
+extern "C" void Dpb_ReleaseExternalHold(DpbCtx *ctx, uint32_t slot_idx) {
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    if (ctx->slots[slot_idx].external_hold > 0)
+        ctx->slots[slot_idx].external_hold--;
 }
 
 /* Sliding-window eviction: drop the short-term reference with the
@@ -729,6 +746,7 @@ void Dpb_OnDecodeComplete(DpbCtx *ctx)
 namespace {
 
 static inline void h265_slot_clear(H265DpbCtx *ctx, int i) {
+    /* external_hold deliberately not touched — see DpbCtx::slot_clear. */
     ctx->slots[i].in_use = 0;
     ctx->slots[i].is_ref = 0;
     ctx->slots[i].poc    = 0;
@@ -736,14 +754,29 @@ static inline void h265_slot_clear(H265DpbCtx *ctx, int i) {
 
 static int h265_find_free(const H265DpbCtx *ctx) {
     /* First reuse a slot that's no longer a ref (RPS marking already
-     * cleared its is_ref bit).  Then try truly-empty slots. */
+     * cleared its is_ref bit) AND isn't held by a downstream consumer.
+     * Then try truly-empty slots that also aren't held. */
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
+        if (ctx->slots[i].external_hold)              continue;
         if (ctx->slots[i].in_use && !ctx->slots[i].is_ref) return (int)i;
     }
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
-        if (!ctx->slots[i].in_use) return (int)i;
+        if (ctx->slots[i].external_hold) continue;
+        if (!ctx->slots[i].in_use)       return (int)i;
     }
     return -1;
+}
+
+extern "C" void H265Dpb_AddExternalHold(H265DpbCtx *ctx, uint32_t slot_idx) {
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    if (ctx->slots[slot_idx].external_hold < 0xF)
+        ctx->slots[slot_idx].external_hold++;
+}
+
+extern "C" void H265Dpb_ReleaseExternalHold(H265DpbCtx *ctx, uint32_t slot_idx) {
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    if (ctx->slots[slot_idx].external_hold > 0)
+        ctx->slots[slot_idx].external_hold--;
 }
 
 /* Resolve the active short-term RPS for the current slice (HEVC 7.4.7.1):

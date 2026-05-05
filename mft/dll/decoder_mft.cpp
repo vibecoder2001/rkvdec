@@ -28,6 +28,28 @@ static ::Codec ToEngineCodec(CodecKind k) {
     return (k == CodecKind::H264) ? ::Codec::H264 : ::Codec::H265;
 }
 
+/* Per-call ProcessOutput timing — pairs with the engine-side StageTimes
+ * CSV.  Gated on RKMPP_TIMING=1.  Reports total wall-clock, plus the
+ * sysmem-path memcpy cost (vector→IMFMediaBuffer) so the user-mode
+ * frame budget is fully accounted. */
+static bool MftTimingEnabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        char buf[8] = {};
+        DWORD n = GetEnvironmentVariableA("RKMPP_TIMING", buf, sizeof(buf));
+        cached = (n > 0 && buf[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+static int64_t MftQpcNow() {
+    LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart;
+}
+static int64_t MftQpcUs(int64_t a, int64_t b) {
+    static int64_t f = 0;
+    if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = q.QuadPart; }
+    return (b - a) * 1'000'000LL / f;
+}
+
 long g_dll_lock_count = 0;
 
 /* ---------- codec-table helpers ---------------------------------- */
@@ -98,6 +120,11 @@ STDMETHODIMP DecoderMFT::QueryInterface(REFIID iid, void **ppv) {
     if (!ppv) return E_POINTER;
     if (iid == IID_IUnknown || iid == IID_IMFTransform) {
         *ppv = static_cast<IMFTransform*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (iid == IID_IMFQualityAdvise) {
+        *ppv = static_cast<IMFQualityAdvise*>(this);
         AddRef();
         return S_OK;
     }
@@ -175,7 +202,19 @@ STDMETHODIMP DecoderMFT::AddInputStreams(DWORD, DWORD *)               { return 
 STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
     if (id != 0) return MF_E_INVALIDSTREAMNUMBER;
     if (!flags) return E_POINTER;
-    *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
+    /* Match the queue cap enforced in ProcessInput so the host knows
+     * when to drain output before pumping more input. */
+    std::lock_guard<std::mutex> g(lock_);
+    *flags = 0;
+    if (engine_) {
+        const size_t kQueueCap = 4;
+        auto *eng = static_cast<DecodeEngine *>(engine_);
+        if (DecodeEngine_QueueDepth(eng) < kQueueCap) {
+            *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
+        }
+    } else {
+        *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
+    }
     return S_OK;
 }
 STDMETHODIMP DecoderMFT::GetOutputStatus(DWORD *flags) {
@@ -456,19 +495,47 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
         IUnknown *unk = reinterpret_cast<IUnknown *>(param);
         IMFDXGIDeviceManager *mgr = nullptr;
         HRESULT hr = unk->QueryInterface(IID_PPV_ARGS(&mgr));
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) {
+            std::fprintf(stderr,
+                "rkmpp MFT: SET_D3D_MANAGER QI(IMFDXGIDeviceManager) "
+                "failed 0x%08x — staying on sysmem\n", (unsigned)hr);
+            std::fflush(stderr);
+            return hr;
+        }
         HANDLE h = nullptr;
         hr = mgr->OpenDeviceHandle(&h);
         if (FAILED(hr)) { mgr->Release(); return hr; }
-        ID3D11Device *dev = nullptr;
-        hr = mgr->GetVideoService(h, IID_PPV_ARGS(&dev));
-        if (FAILED(hr)) { mgr->CloseDeviceHandle(h); mgr->Release(); return hr; }
-        ID3D11DeviceContext *ctx = nullptr;
-        dev->GetImmediateContext(&ctx);
+
+        /* Commit the manager state up front — even if D3D11 device
+         * acquisition below fails (because EVR's default presenter
+         * wraps a D3D9 device), the IMFDXGIDeviceManager is still
+         * valid and signals "EVR is the consumer", which we use to
+         * pick the IMF2DBuffer output path that matches EVR's
+         * Lock2D-based read.  Without this commit, a D3D9-only EVR
+         * would leave dxgi_manager_ null and we'd fall through to
+         * the SYSMEM_1D_BUFFER path that EVR has to stride-convert
+         * and upload at extra cost. */
         dxgi_manager_  = mgr;
         dxgi_device_h_ = h;
-        d3d_device_    = dev;
-        d3d_context_   = ctx;
+
+        ID3D11Device *dev = nullptr;
+        hr = mgr->GetVideoService(h, IID_PPV_ARGS(&dev));
+        if (FAILED(hr)) {
+            std::fprintf(stderr,
+                "rkmpp MFT: SET_D3D_MANAGER GetVideoService(ID3D11Device) "
+                "returned 0x%08x — EVR is on D3D9, using 2D media buffer\n",
+                (unsigned)hr);
+            std::fflush(stderr);
+            return S_OK;  /* manager kept, just no D3D11 device */
+        }
+        ID3D11DeviceContext *ctx = nullptr;
+        dev->GetImmediateContext(&ctx);
+        d3d_device_  = dev;
+        d3d_context_ = ctx;
+        std::fprintf(stderr,
+            "rkmpp MFT: SET_D3D_MANAGER acquired ID3D11Device — "
+            "D3D11 surface output enabled\n");
+        std::fflush(stderr);
         return S_OK;
     }
     case MFT_MESSAGE_NOTIFY_BEGIN_STREAMING: {
@@ -488,6 +555,18 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
             } else {
                 engine_ = eng;
                 engine_init_failed_ = false;
+                /* Zero-copy readout (eng->populate_yuv = false) was tried
+                 * here but reliably wedged the codec at 4K, even with the
+                 * external-hold infrastructure protecting slot lifetime.
+                 * Best guess: removing the engine-side ~12 ms memcpy
+                 * collapses the gap between back-to-back kicks, exposing
+                 * a hardware contention issue (AXI write retire vs. ref
+                 * read on the same slot) that the slow read used to
+                 * mask.  Reverting to populate_yuv=true keeps the engine
+                 * memcpy gap and the codec stays stable.  The Phase 1
+                 * hold infrastructure (slot_idx + external_hold) is
+                 * left in place for future use if/when we sequence
+                 * kicks more carefully. */
                 /* Prime persistent SPS/PPS state from container extradata
                  * (avcC / hvcC parsed into Annex-B in SetInputType). */
                 if (!extradata_annexb_.empty()) {
@@ -541,6 +620,21 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
     if (!input_type_ || !output_type_) return MF_E_TRANSFORM_TYPE_NOT_SET;
     if (!streaming_)                    return MF_E_TRANSFORM_TYPE_NOT_SET;
     if (!engine_ || engine_init_failed_) return MF_E_NOTACCEPTING;
+
+    /* Backpressure: each queued frame holds a DPB slot via the external-
+     * hold counter (see dpb.h Dpb_AddExternalHold).  The DPB also needs
+     * slots for active reference frames (~5-8 typical).  When the engine
+     * pumps faster than EVR drains (e.g. zero-copy at 4K — Submit ~1ms,
+     * Output @ 24fps), uncapped queue growth exhausts the slot pool and
+     * the next decode hits DPB_FULL → bad refs → codec wedge.  Cap the
+     * queue at kQueueCap so EVR's source reader retries this AU later. */
+    {
+        const size_t kQueueCap = 4;
+        auto *eng = static_cast<DecodeEngine *>(engine_);
+        if (DecodeEngine_QueueDepth(eng) >= kQueueCap) {
+            return MF_E_NOTACCEPTING;
+        }
+    }
 
     /* Pull PTS / duration from the sample (HNS, 100ns units). */
     LONGLONG pts = 0, dur = 0;
@@ -601,6 +695,8 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
 STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
                                        MFT_OUTPUT_DATA_BUFFER *buf,
                                        DWORD *status) {
+    int64_t mft_t0 = MftTimingEnabled() ? MftQpcNow() : 0;
+    int64_t mft_copy_us = 0;
     if (c != 1 || !buf) return E_INVALIDARG;
     if (status) *status = 0;
     buf[0].dwStatus = 0;
@@ -627,22 +723,61 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
         return MF_E_TRANSFORM_NEED_MORE_INPUT;
     }
 
+    /* IMFQualityAdvise drop-mode acknowledged but no longer acted on:
+     * with cached buffers + AXI-drain stall in the kernel poller, the
+     * per-frame budget at 1080p / 4K is comfortably under realtime,
+     * so dropping non-refs would just halve our output rate and feed
+     * EVR's quality manager a "you're still behind" signal — keeping
+     * drop_mode pinned at 1 even when we're keeping up.  Best to emit
+     * every decoded frame and let EVR clear drop_mode on its own. */
+
     IMFMediaBuffer *mbuf      = nullptr;
     ID3D11Texture2D *texture  = nullptr;
     HRESULT hr = S_OK;
 
-    /* D3D11 output path is currently disabled: it requires a texture
-     * pool with cross-context sync (KeyedMutex / fences) to avoid GPU/
-     * CPU races between our UpdateSubresource and EVR's present.
-     * Without that, real-world streams show green/grayscale patches,
-     * scanline tears, and judder.  We still accept SET_D3D_MANAGER so
-     * EVR doesn't refuse the topology, but always emit a sysmem buffer
-     * — EVR uploads it into its own GPU layout with proper sync.
-     * Re-enable once we wire a proper sample-allocator with fences. */
-    /* D3D11 output path is gated off — see comment above.  Force the
-     * sysmem branch by clearing this on entry; we still hold d3d_device_
-     * elsewhere if we ever re-enable. */
-    ID3D11Device *use_d3d = nullptr;
+    /* D3D11 output path: allocate a fresh NV12 ID3D11Texture2D per
+     * sample, populate via UpdateSubresource, hand to EVR via
+     * MFCreateDXGISurfaceBuffer.  No texture pool / no KeyedMutex sync
+     * is needed because each frame gets its own texture; EVR holds the
+     * sole reference via the IMFSample, and releases when done.  We
+     * pay one CreateTexture2D per frame (~tens of µs on real GPU,
+     * higher on WARP) but skip EVR's sysmem→GPU upload entirely.
+     *
+     * At 1440p / 4K with the sysmem path, EVR's render-side GPU
+     * upload + stride-convert was the dominant remaining bottleneck
+     * (CPU only ~15% busy, drop_mode pinned).  Going DXGI-direct
+     * gives EVR a GPU-resident texture — its only work is the
+     * NV12→RGB shader and present. */
+    ID3D11Device *use_d3d = d3d_device_;
+    /* One-shot log of which output-buffer mode actually fires.  Emits a
+     * reason when on sysmem so the trace is self-explanatory:
+     *   - "no SET_D3D_MANAGER" — host (e.g. mft_play) didn't inject a
+     *     device manager into EVR's topology, so EVR never forwarded
+     *     one to us.  Fix is on the host side, not in the MFT.
+     *   - "QI/GVS failed"      — manager was sent but didn't expose
+     *     ID3D11Device or even IMFDXGIDeviceManager.
+     *   - file consumer        — non-EVR path (mft_decode → file). */
+    {
+        static bool logged = false;
+        if (!logged) {
+            if (use_d3d && width_ && height_) {
+                std::fprintf(stderr,
+                    "rkmpp MFT: output mode = D3D11_SURFACE_BUFFER\n");
+            } else if (dxgi_manager_) {
+                std::fprintf(stderr,
+                    "rkmpp MFT: output mode = 2D_MEDIA_BUFFER (EVR, "
+                    "D3D9-backed manager — no D3D11 device available)\n");
+            } else {
+                std::fprintf(stderr,
+                    "rkmpp MFT: output mode = SYSMEM_1D_BUFFER "
+                    "(no SET_D3D_MANAGER from host — EVR's GPU upload "
+                    "still happens but in EVR-internal sysmem path)\n");
+            }
+            std::fflush(stderr);
+            logged = true;
+        }
+    }
+
     if (use_d3d && width_ && height_) {
         /* D3D11 output path: allocate an NV12 ID3D11Texture2D, copy
          * the engine's NV12 frame into it via Map() (works on WARP and
@@ -715,14 +850,60 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
          * 1D + correct attributes is the safer default; if EVR shows
          * scanline issues again we can re-introduce 2D for the
          * SET_D3D_MANAGER path only. */
-        hr = MFCreateMemoryBuffer((DWORD)frame.yuv.size(), &mbuf);
-        if (FAILED(hr)) return hr;
-        BYTE *dst = nullptr; DWORD cap = 0, cur = 0;
-        hr = mbuf->Lock(&dst, &cap, &cur);
-        if (FAILED(hr)) { mbuf->Release(); return hr; }
-        std::memcpy(dst, frame.yuv.data(), frame.yuv.size());
-        mbuf->Unlock();
-        mbuf->SetCurrentLength((DWORD)frame.yuv.size());
+        /* When EVR is the consumer (signalled by SET_D3D_MANAGER having
+         * been called), use MFCreate2DMediaBuffer.  EVR then accesses
+         * the buffer via IMF2DBuffer::Lock2D with the buffer's natural
+         * pitch — saving EVR an internal stride-conversion sysmem copy
+         * before its GPU upload.  For non-EVR consumers (mft_decode →
+         * file → ffplay/PSNR), stick with MFCreateMemoryBuffer (packed
+         * NV12 stride=width) since byte-exact bitstream comparison
+         * relies on that layout.
+         *
+         * IMF2DBuffer pitch may exceed width_ for hardware alignment,
+         * so the copy is row-by-row from our packed `frame.yuv` source
+         * into the 2D buffer's possibly-padded layout. */
+        const DWORD y_bytes  = (DWORD)width_ * height_;
+        const DWORD uv_bytes = (DWORD)width_ * (height_ / 2u);
+        const DWORD nv12_bytes = y_bytes + uv_bytes;
+        const bool  use_2d   = (dxgi_manager_ != nullptr);
+        if (use_2d) {
+            hr = MFCreate2DMediaBuffer(width_, height_,
+                                       MAKEFOURCC('N','V','1','2'),
+                                       FALSE /* top-down */,
+                                       &mbuf);
+            if (FAILED(hr)) return hr;
+            IMF2DBuffer *buf2d = nullptr;
+            hr = mbuf->QueryInterface(IID_PPV_ARGS(&buf2d));
+            if (FAILED(hr) || !buf2d) { mbuf->Release(); return FAILED(hr)?hr:E_NOINTERFACE; }
+            BYTE *dst = nullptr; LONG pitch = 0;
+            hr = buf2d->Lock2D(&dst, &pitch);
+            if (FAILED(hr)) { buf2d->Release(); mbuf->Release(); return hr; }
+            int64_t cp_t0 = MftTimingEnabled() ? MftQpcNow() : 0;
+            const uint8_t *src_y  = frame.yuv.data();
+            const uint8_t *src_uv = src_y + (size_t)y_bytes;
+            for (UINT32 r = 0; r < height_; r++) {
+                std::memcpy(dst + (size_t)r * pitch, src_y + (size_t)r * width_, width_);
+            }
+            BYTE *dst_uv = dst + (size_t)pitch * height_;
+            for (UINT32 r = 0; r < height_ / 2; r++) {
+                std::memcpy(dst_uv + (size_t)r * pitch, src_uv + (size_t)r * width_, width_);
+            }
+            if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
+            buf2d->Unlock2D();
+            buf2d->Release();
+            mbuf->SetCurrentLength(nv12_bytes);
+        } else {
+            hr = MFCreateMemoryBuffer(nv12_bytes, &mbuf);
+            if (FAILED(hr)) return hr;
+            BYTE *dst = nullptr; DWORD cap = 0, cur = 0;
+            hr = mbuf->Lock(&dst, &cap, &cur);
+            if (FAILED(hr)) { mbuf->Release(); return hr; }
+            int64_t cp_t0 = MftTimingEnabled() ? MftQpcNow() : 0;
+            std::memcpy(dst, frame.yuv.data(), nv12_bytes);
+            if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
+            mbuf->Unlock();
+            mbuf->SetCurrentLength(nv12_bytes);
+        }
     }
 
     IMFSample *out_sample = nullptr;
@@ -736,18 +917,30 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
     mbuf->Release();
     if (texture) texture->Release();
 
-    /* PTS / duration: the engine's reorder window emits frames in
-     * display order, but the per-frame pts forwarded from ProcessInput
-     * is the source's *decode-order* PTS — handing those to EVR causes
-     * out-of-order timestamps on B-frame streams and the renderer
-     * silently drops samples. Use a monotonic synthetic PTS based on
-     * the negotiated frame rate, which is what every other software
-     * MFT does for decode-then-render scenarios. */
+    /* Release the DPB external-hold taken when this frame entered the
+     * reorder window.  We've finished extracting the data into the
+     * IMFMediaBuffer (sysmem) or D3D11 texture (the other branch above)
+     * by this point, so the codec is free to reuse the slot. */
+    DecodeEngine_ReleaseFrame(eng, &frame);
+
+    /* PTS / duration: forward the container's per-sample PTS through
+     * decode → display reorder → output.  The engine's reorder window
+     * emits frames in POC ascending order (display order), so the
+     * popped entry's pts_hns is the correct display-time PTS for that
+     * frame.  Container PTS lets EVR's clock-paced rendering work
+     * naturally — non-ref frames are skipped above (drop mode), refs
+     * carry true content time, audio + video stay synced.  Falls back
+     * to a synthetic monotonic stamp if the engine handed us pts<0. */
     const uint32_t fpsn = fps_num_ ? fps_num_ : 30;
     const uint32_t fpsd = fps_den_ ? fps_den_ : 1;
     const LONGLONG dur  = (LONGLONG)((10'000'000ULL * fpsd) / fpsn);
-    const LONGLONG pts  = (LONGLONG)((uint64_t)frames_emitted_
-                                     * 10'000'000ULL * fpsd / fpsn);
+    LONGLONG pts;
+    if (frame.pts_hns >= 0) {
+        pts = (LONGLONG)frame.pts_hns;
+    } else {
+        pts = (LONGLONG)((uint64_t)frames_emitted_
+                         * 10'000'000ULL * fpsd / fpsn);
+    }
     out_sample->SetSampleTime(pts);
     out_sample->SetSampleDuration(dur);
     /* Output samples are decoded NV12 — every frame is a valid clean
@@ -761,7 +954,81 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
     buf[0].dwStatus = 0;
     if (status) *status = 0;
     frames_emitted_++;
+
+    MaybeLogFrameStats();
+
+    if (MftTimingEnabled()) {
+        static bool hdr = false;
+        if (!hdr) {
+            std::fprintf(stderr,
+                "MFT_TIMING,frame,po_total_us,po_copy_us\n");
+            hdr = true;
+        }
+        std::fprintf(stderr, "MFT_TIMING,%llu,%lld,%lld\n",
+                     (unsigned long long)frames_emitted_,
+                     (long long)MftQpcUs(mft_t0, MftQpcNow()),
+                     (long long)mft_copy_us);
+        std::fflush(stderr);
+    }
     return S_OK;
+}
+
+void DecoderMFT::MaybeLogFrameStats() {
+    /* Total frames the engine handed us this stream (emitted + dropped). */
+    uint64_t total = frames_emitted_ + frames_skipped_dropmode_;
+    if (total == 0 || (total % 15) != 0) return;
+    std::fprintf(stderr,
+                 "rkmpp MFT: total=%llu emitted=%llu skipped(drop)=%llu "
+                 "decode_errors=%llu drop_mode=%d\n",
+                 (unsigned long long)total,
+                 (unsigned long long)frames_emitted_,
+                 (unsigned long long)frames_skipped_dropmode_,
+                 (unsigned long long)decode_errors_,
+                 (int)drop_mode_);
+    std::fflush(stderr);
+}
+
+/* ---------- IMFQualityAdvise --------------------------------------- */
+
+STDMETHODIMP DecoderMFT::SetDropMode(MF_QUALITY_DROP_MODE eDropMode) {
+    if ((int)eDropMode < (int)MF_DROP_MODE_NONE ||
+        (int)eDropMode > (int)MF_DROP_MODE_5) {
+        return MF_E_NO_MORE_DROP_MODES;
+    }
+    std::lock_guard<std::mutex> g(lock_);
+    drop_mode_ = eDropMode;
+    /* Acknowledge the request but don't propagate to the engine.
+     * Engine-side skipping non-ref memcpys made the output rate halve
+     * and kept EVR locked in drop_mode — see ProcessOutput comment. */
+    return S_OK;
+}
+
+STDMETHODIMP DecoderMFT::SetQualityLevel(MF_QUALITY_LEVEL eQualityLevel) {
+    /* We don't tune internal quality (the codec is fixed-function); accept
+     * any level as a no-op so EVR doesn't think we lack the interface. */
+    (void)eQualityLevel;
+    return S_OK;
+}
+
+STDMETHODIMP DecoderMFT::GetDropMode(MF_QUALITY_DROP_MODE *peDropMode) {
+    if (!peDropMode) return E_POINTER;
+    std::lock_guard<std::mutex> g(lock_);
+    *peDropMode = drop_mode_;
+    return S_OK;
+}
+
+STDMETHODIMP DecoderMFT::GetQualityLevel(MF_QUALITY_LEVEL *peQualityLevel) {
+    if (!peQualityLevel) return E_POINTER;
+    *peQualityLevel = MF_QUALITY_NORMAL;
+    return S_OK;
+}
+
+STDMETHODIMP DecoderMFT::DropTime(LONGLONG /*hnsAmountToDrop*/) {
+    /* Time-based drop isn't supported — would require coordinating with
+     * the engine's reorder window per timestamp, which we don't expose
+     * yet.  EVR falls back to drop-mode-based throttling when this
+     * returns NOT_SUPPORTED. */
+    return MF_E_DROPTIME_NOT_SUPPORTED;
 }
 
 } /* namespace rkmpp */

@@ -94,6 +94,13 @@ typedef struct DpbCtx {
         uint8_t  in_use   : 1;
         uint8_t  is_ref   : 1;
         uint8_t  long_term: 1;
+        /* External hold count — incremented by `Dpb_AddExternalHold`
+         * when a downstream consumer (MFT reorder_q / ready_q entry)
+         * pins the slot's contents.  Slot pickers treat external_hold>0
+         * the same as in_use, so the codec won't write a new picture
+         * over data the consumer is still reading.  Decremented via
+         * `Dpb_ReleaseExternalHold` when the consumer is done. */
+        uint8_t  external_hold : 4;
         uint8_t  fields;        /* V4L2_H264_*_REF */
         uint16_t frame_num;
         int32_t  top_poc;
@@ -117,6 +124,14 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
  * as a short-term reference; if the DPB is full, the oldest short-term
  * ref is evicted (sliding window, H.264 8.2.5.3). */
 void Dpb_OnDecodeComplete(DpbCtx *ctx);
+
+/* External-hold ref counting.  Lets a downstream consumer (the MFT
+ * reorder/ready queue) pin a pool slot's contents while the codec
+ * picks new slots for subsequent decodes.  Used to make a future
+ * zero-copy readout path safe — without this, a slot can be reassigned
+ * to a new decode while a queued frame still references its data. */
+void Dpb_AddExternalHold     (DpbCtx *ctx, uint32_t slot_idx);
+void Dpb_ReleaseExternalHold (DpbCtx *ctx, uint32_t slot_idx);
 
 /* =====================================================================
  * H.265 (HEVC) DPB — RPS-driven reference marking.
@@ -180,6 +195,10 @@ typedef struct H265DpbCtx {
     struct {
         uint8_t  in_use : 1;
         uint8_t  is_ref : 1;     /* "used for reference" — RPS-driven */
+        /* See DpbCtx::slots::external_hold — same purpose: protects this
+         * slot from re-use while a downstream consumer still references
+         * its decoded contents. */
+        uint8_t  external_hold : 4;
         int32_t  poc;            /* signed: HEVC POC may be negative */
     } slots[DPB_MAX_SLOTS];
 } H265DpbCtx;
@@ -198,6 +217,10 @@ DpbStatus H265Dpb_Init(H265DpbCtx *ctx, const DpbPoolEntry *pool,
  *     then take a free slot for the current picture. */
 DpbStatus H265Dpb_Select(H265DpbCtx *ctx, const H265ParseResult *parsed,
                          H265DpbSelection *out);
+
+/* External hold ref-counting — see Dpb_AddExternalHold for rationale. */
+void H265Dpb_AddExternalHold     (H265DpbCtx *ctx, uint32_t slot_idx);
+void H265Dpb_ReleaseExternalHold (H265DpbCtx *ctx, uint32_t slot_idx);
 
 /* Finalise current pic.  For HEVC the RPS marking already evicted stale
  * slots; this just clears current_idx (and releases the slot if the

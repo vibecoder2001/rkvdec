@@ -28,6 +28,58 @@ static bool DecodeDebugEnabled() {
     return cached != 0;
 }
 
+/* Per-stage timing: gated on RKMPP_TIMING=1.  Prints one CSV line per
+ * decode with microseconds spent in each engine stage so the overall
+ * frame budget can be apportioned (parser / regbuilder / kernel kick /
+ * codec wait / kernel→vector copy).  Header line printed on first call. */
+static bool TimingEnabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        char buf[8] = {};
+        DWORD n = GetEnvironmentVariableA("RKMPP_TIMING", buf, sizeof(buf));
+        cached = (n > 0 && buf[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static int64_t QpcNow() {
+    LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart;
+}
+static int64_t QpcFreq() {
+    static int64_t f = 0;
+    if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = q.QuadPart; }
+    return f;
+}
+static int64_t QpcUs(int64_t a, int64_t b) {
+    return (b - a) * 1'000'000LL / QpcFreq();
+}
+
+struct StageTimes {
+    int64_t parse_us  = 0;
+    int64_t pack_us   = 0;  /* DPB select + pack PPS/RPS/scaling */
+    int64_t regbuild_us = 0;
+    int64_t submit_us = 0;
+    int64_t wait_us   = 0;
+    int64_t copy_us   = 0;  /* kernel → out_yuv */
+};
+
+static void EmitTimingCsv(const StageTimes &t, const char *codec, int32_t poc) {
+    static bool header_printed = false;
+    if (!header_printed) {
+        std::fprintf(stderr,
+            "TIMING,codec,poc,parse_us,pack_us,regbuild_us,submit_us,wait_us,copy_us,total_us\n");
+        header_printed = true;
+    }
+    int64_t total = t.parse_us + t.pack_us + t.regbuild_us +
+                    t.submit_us + t.wait_us + t.copy_us;
+    std::fprintf(stderr,
+        "TIMING,%s,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n",
+        codec, poc,
+        t.parse_us, t.pack_us, t.regbuild_us,
+        t.submit_us, t.wait_us, t.copy_us, total);
+    std::fflush(stderr);
+}
+
 static int OpenDevice(HANDLE *out, Codec codec) {
     HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_RKMPP, nullptr, nullptr,
                                         DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
@@ -113,8 +165,17 @@ int DecodeEngine_Init(DecodeEngine *e, Codec codec,
      * register indices match on the HEVC path. */
     uint32_t rcb_total = H264GetRcbBufferSizes(e->rcb_info, width, height);
 
-    /* NV12 + small slack for stride alignment. */
-    uint32_t frame_bytes = width * height * 3u / 2u;
+    /* NV12 with codec-internal MB (16-row) height padding.  The vdpu34x
+     * codec writes the full coded raster — height is padded up to a 16-row
+     * multiple regardless of the displayed height — so the output buffer
+     * must be sized to padded height, not displayed height.  Confirmed by
+     * MMIO trace at 1080p: reg[020] = 0x1fe00 = width*1088/16 (padded),
+     * not width*1080/16 (displayed).  Under-sized allocation here at
+     * 1080p produced the dark-green top bar in 1080p HEVC playback (UV
+     * plane was read 8 luma rows before codec's actual UV start). */
+    auto align16 = [](uint32_t v) { return (v + 15u) & ~15u; };
+    uint32_t height_pad  = align16(height);
+    uint32_t frame_bytes = width * height_pad * 3u / 2u;
 
     /* Colmv buffer geometry — same compressed path as H.264 (vdpu34x is
      * codec-agnostic for colmv on rk3588). */
@@ -266,6 +327,9 @@ static int DecodeOne_H264(DecodeEngine *e,
                           const uint8_t *au, size_t au_len,
                           std::vector<uint8_t> *out_yuv)
 {
+    StageTimes timing{};
+    int64_t t0 = TimingEnabled() ? QpcNow() : 0;
+
     /* 1. Locate the slice NAL. */
     size_t slice_off = 0, slice_size = 0;
     if (find_slice_nal_h264(au, au_len, &slice_off, &slice_size) != 0)
@@ -294,7 +358,16 @@ static int DecodeOne_H264(DecodeEngine *e,
 
     uint32_t w_px = ((uint32_t)parsed.sps.pic_width_in_mbs_minus1 + 1) * 16;
     uint32_t h_px = ((uint32_t)parsed.sps.pic_height_in_map_units_minus1 + 1) * 16;
-    if (w_px != e->frame_width || h_px != e->frame_height) {
+    /* The SPS-derived dims are the coded raster, 16-aligned by H.264
+     * construction.  The harness was initialised with the *display* size
+     * (typically from container metadata), which can be smaller when the
+     * stream uses frame_cropping (e.g. 1080p coded as 1920x1088 with the
+     * bottom 8 rows cropped).  Engine geometry already sizes the output
+     * frame buffer for the coded raster via align16(frame_height), so
+     * accept any display height that's within one MB row of the coded
+     * height. */
+    auto align_up16 = [](uint32_t v) { return (v + 15u) & ~15u; };
+    if (w_px != align_up16(e->frame_width) || h_px != align_up16(e->frame_height)) {
         std::fprintf(stderr, "stream %ux%u, harness inited for %ux%u\n",
                      w_px, h_px, e->frame_width, e->frame_height);
         return Fail("dim mismatch");
@@ -354,6 +427,8 @@ static int DecodeOne_H264(DecodeEngine *e,
     }
 
     DpbSelection sel{};
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.parse_us = QpcUs(t0, t); t0 = t; }
+
     if (Dpb_Select(&e->dpb_h264, &parsed, &sel) != DPB_OK)
         return Fail("Dpb_Select failed");
 
@@ -399,6 +474,8 @@ static int DecodeOne_H264(DecodeEngine *e,
         std::printf("dumped win_{pps,rps,cabac,bitstream}.bin\n");
     }
 
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.pack_us = QpcUs(t0, t); t0 = t; }
+
     H264BufferRefs refs{};
     refs.bitstream        = e->bitstream.handle;
     refs.bitstream_offset = 0;
@@ -427,6 +504,8 @@ static int DecodeOne_H264(DecodeEngine *e,
         return Fail("regbuilder failed");
     }
 
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.regbuild_us = QpcUs(t0, t); t0 = t; }
+
     RKMPP_SUBMIT_JOB_IN  sin{};
     RKMPP_SUBMIT_JOB_OUT sout{};
     sin.StructSize    = sizeof(sin);
@@ -438,6 +517,8 @@ static int DecodeOne_H264(DecodeEngine *e,
     if (!DeviceIoControl(e->device, IOCTL_RKMPP_SUBMIT_JOB, &sin, sizeof(sin),
                          &sout, sizeof(sout), &got, nullptr))
         return Fail("SUBMIT_JOB", GetLastError());
+
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.submit_us = QpcUs(t0, t); t0 = t; }
 
     if (DecodeDebugEnabled()) {
         RKMPP_PEEK_JOB_IN  pin{ sout.JobId };
@@ -461,6 +542,9 @@ static int DecodeOne_H264(DecodeEngine *e,
     if (!DeviceIoControl(e->device, IOCTL_RKMPP_WAIT_JOB, &win, sizeof(win),
                          &wout, sizeof(wout), &got, nullptr))
         return Fail("WAIT_JOB", GetLastError());
+
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.wait_us = QpcUs(t0, t); t0 = t; }
+
     if (DecodeDebugEnabled())
         std::printf("decode: jobid=%llu status=0x%08x hwstatus=0x%08x writes=%u\n",
                     (unsigned long long)sout.JobId, wout.Status,
@@ -490,11 +574,28 @@ static int DecodeOne_H264(DecodeEngine *e,
         std::printf("nonzero bytes: decout=%zu error_ref=%zu colmv_cur=%zu\n",
                     nz_dec, nz_err, nz_cmv);
     }
-    if (out_yuv) {
-        uint32_t bytes = e->frame_width * e->frame_height * 3u / 2u;
+    e->last_decoded_slot = (int)sel.current_slot;
+
+    /* Skip the per-frame memcpy when (a) zero-copy mode is enabled
+     * globally (populate_yuv=false), or (b) this is a non-ref frame
+     * and the consumer asked for the non-ref skip path.  Skipping
+     * leaves frame.yuv empty; consumer either reads via src_ptr (zero-
+     * copy mode) or skips emitting (non-ref drop mode). */
+    bool is_ref_h264 = e->dpb_h264.slots[sel.current_slot].is_ref ? true : false;
+    if (out_yuv && e->populate_yuv &&
+        (is_ref_h264 || e->populate_yuv_nonrefs)) {
+        /* Codec writes Y for the full padded raster (height aligned up to
+         * 16) followed by UV.  Repack as packed display-height NV12: copy
+         * `height` Y rows from offset 0, then `height/2` UV rows from
+         * offset `width * height_pad` (skipping the Y padding rows). */
+        uint32_t height_pad = (e->frame_height + 15u) & ~15u;
+        uint32_t y_disp     = e->frame_width * e->frame_height;
+        uint32_t uv_disp    = e->frame_width * (e->frame_height / 2u);
+        uint32_t bytes      = y_disp + uv_disp;
         out_yuv->resize(bytes);
-        std::memcpy(out_yuv->data(), e->pool_output[sel.current_slot].user_va,
-                    bytes);
+        const uint8_t *src = (const uint8_t *)e->pool_output[sel.current_slot].user_va;
+        std::memcpy(out_yuv->data(),         src,                           y_disp);
+        std::memcpy(out_yuv->data() + y_disp, src + e->frame_width * height_pad, uv_disp);
         /* Localize "garbage YUV" issues: hash the first 4 KiB of the
          * post-memcpy buffer.  Distinct hashes here but recurring hashes
          * in the final file = reorder window bug; recurring hashes here
@@ -513,6 +614,11 @@ static int DecodeOne_H264(DecodeEngine *e,
         }
     }
 
+    if (TimingEnabled()) {
+        timing.copy_us = QpcUs(t0, QpcNow());
+        EmitTimingCsv(timing, "h264", parsed.decode.top_field_order_cnt);
+    }
+
     Dpb_OnDecodeComplete(&e->dpb_h264);
     return 0;
 }
@@ -522,6 +628,9 @@ static int DecodeOne_H265(DecodeEngine *e,
                           const uint8_t *au, size_t au_len,
                           std::vector<uint8_t> *out_yuv)
 {
+    StageTimes timing{};
+    int64_t t0 = TimingEnabled() ? QpcNow() : 0;
+
     /* 1. Parse the AU first — VPS/SPS/PPS state needs to land before we
      * dimension anything off it.  H265ParseAccessUnit also resolves
      * slice_data + slice_data_size for the *RBSP* slice; we still want
@@ -574,6 +683,8 @@ static int DecodeOne_H265(DecodeEngine *e,
 
     /* 3. DPB selection. */
     H265DpbSelection sel{};
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.parse_us = QpcUs(t0, t); t0 = t; }
+
     if (H265Dpb_Select(&e->dpb_h265, &parsed, &sel) != DPB_OK)
         return Fail("H265Dpb_Select failed");
 
@@ -617,6 +728,8 @@ static int DecodeOne_H265(DecodeEngine *e,
     }
 
     /* 5. Compose buffer-refs for the regbuilder. */
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.pack_us = QpcUs(t0, t); t0 = t; }
+
     H265BufferRefs refs{};
     refs.bitstream        = e->bitstream.handle;
     refs.bitstream_offset = 0;
@@ -649,6 +762,8 @@ static int DecodeOne_H265(DecodeEngine *e,
         return Fail("h265 regbuilder failed");
     }
 
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.regbuild_us = QpcUs(t0, t); t0 = t; }
+
     /* 7. Submit. */
     RKMPP_SUBMIT_JOB_IN  sin{};
     RKMPP_SUBMIT_JOB_OUT sout{};
@@ -661,6 +776,8 @@ static int DecodeOne_H265(DecodeEngine *e,
     if (!DeviceIoControl(e->device, IOCTL_RKMPP_SUBMIT_JOB, &sin, sizeof(sin),
                          &sout, sizeof(sout), &got, nullptr))
         return Fail("SUBMIT_JOB", GetLastError());
+
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.submit_us = QpcUs(t0, t); t0 = t; }
 
     if (DecodeDebugEnabled()) {
         RKMPP_PEEK_JOB_IN  pin{ sout.JobId };
@@ -685,6 +802,9 @@ static int DecodeOne_H265(DecodeEngine *e,
     if (!DeviceIoControl(e->device, IOCTL_RKMPP_WAIT_JOB, &win, sizeof(win),
                          &wout, sizeof(wout), &got, nullptr))
         return Fail("WAIT_JOB", GetLastError());
+
+    if (TimingEnabled()) { int64_t t = QpcNow(); timing.wait_us = QpcUs(t0, t); t0 = t; }
+
     if (DecodeDebugEnabled())
         std::printf("h265 decode: jobid=%llu status=0x%08x hwstatus=0x%08x writes=%u\n",
                     (unsigned long long)sout.JobId, wout.Status,
@@ -714,11 +834,28 @@ static int DecodeOne_H265(DecodeEngine *e,
         std::printf("nonzero bytes: decout=%zu error_ref=%zu colmv_cur=%zu\n",
                     nz_dec, nz_err, nz_cmv);
     }
-    if (out_yuv) {
-        uint32_t bytes = e->frame_width * e->frame_height * 3u / 2u;
+    e->last_decoded_slot = (int)sel.current_slot;
+
+    /* See H.264 path: skip the memcpy on non-ref when consumer asks. */
+    bool is_ref_h265 = e->dpb_h265.slots[sel.current_slot].is_ref ? true : false;
+    if (out_yuv && e->populate_yuv &&
+        (is_ref_h265 || e->populate_yuv_nonrefs)) {
+        /* See H.264 path: repack codec's padded-height NV12 (height padded
+         * up to 16) into packed display-height NV12 by skipping the Y
+         * padding rows when locating the UV plane. */
+        uint32_t height_pad = (e->frame_height + 15u) & ~15u;
+        uint32_t y_disp     = e->frame_width * e->frame_height;
+        uint32_t uv_disp    = e->frame_width * (e->frame_height / 2u);
+        uint32_t bytes      = y_disp + uv_disp;
         out_yuv->resize(bytes);
-        std::memcpy(out_yuv->data(), e->pool_output[sel.current_slot].user_va,
-                    bytes);
+        const uint8_t *src = (const uint8_t *)e->pool_output[sel.current_slot].user_va;
+        std::memcpy(out_yuv->data(),         src,                           y_disp);
+        std::memcpy(out_yuv->data() + y_disp, src + e->frame_width * height_pad, uv_disp);
+    }
+
+    if (TimingEnabled()) {
+        timing.copy_us = QpcUs(t0, QpcNow());
+        EmitTimingCsv(timing, "h265", parsed.poc);
     }
 
     H265Dpb_OnDecodeComplete(&e->dpb_h265);
@@ -856,6 +993,22 @@ int DecodeEngine_Submit(DecodeEngine *e,
     int rc = DecodeEngine_DecodeOne(e, au, au_len, &entry.yuv);
     if (rc != 0) return rc;
 
+    /* Take an external hold on the slot we just decoded into so that any
+     * subsequent decode can't overwrite it while this entry sits in the
+     * reorder queue.  Released in DecodeEngine_ReleaseFrame (called by
+     * the consumer after the DecodedFrame has been copied/consumed). */
+    if (e->last_decoded_slot >= 0 &&
+        e->last_decoded_slot < DecodeEngine::kPoolSize) {
+        entry.slot_idx = e->last_decoded_slot;
+        if (e->codec == Codec::H265) {
+            H265Dpb_AddExternalHold(&e->dpb_h265, (uint32_t)entry.slot_idx);
+            entry.is_ref = e->dpb_h265.slots[entry.slot_idx].is_ref ? true : false;
+        } else {
+            Dpb_AddExternalHold(&e->dpb_h264, (uint32_t)entry.slot_idx);
+            entry.is_ref = e->dpb_h264.slots[entry.slot_idx].is_ref ? true : false;
+        }
+    }
+
     entry.poc = current_poc(e);
     if (pts_hns < 0) {
         /* Synthetic monotonic timeline if caller doesn't supply pts. */
@@ -898,11 +1051,42 @@ int DecodeEngine_PollFrame(DecodeEngine *e, DecodedFrame *out)
     if (e->ready_q.empty()) return 0;
     DecodeEngine::ReorderEntry entry = std::move(e->ready_q.front());
     e->ready_q.erase(e->ready_q.begin());
-    out->poc     = entry.poc;
-    out->pts_hns = entry.pts_hns;
-    out->dur_hns = entry.dur_hns;
-    out->yuv     = std::move(entry.yuv);
+    out->poc      = entry.poc;
+    out->pts_hns  = entry.pts_hns;
+    out->dur_hns  = entry.dur_hns;
+    out->yuv      = std::move(entry.yuv);
+    /* Transfer the external hold from the queue entry to the
+     * DecodedFrame.  Consumer must call DecodeEngine_ReleaseFrame to
+     * decrement; failing to do so would leak holds and eventually
+     * exhaust the slot pool. */
+    out->slot_idx = entry.slot_idx;
+    entry.slot_idx = -1;
+    out->is_ref   = entry.is_ref;
+    /* Zero-copy fields — valid in either populate_yuv mode but only
+     * load-bearing when populate_yuv=false (yuv is empty in that case). */
+    if (out->slot_idx >= 0 && out->slot_idx < DecodeEngine::kPoolSize) {
+        out->src_ptr        = e->pool_output[out->slot_idx].user_va;
+        out->src_width      = e->frame_width;
+        out->src_height_pad = (e->frame_height + 15u) & ~15u;
+    }
     return 1;
+}
+
+size_t DecodeEngine_QueueDepth(const DecodeEngine *e)
+{
+    if (!e) return 0;
+    return e->reorder_q.size() + e->ready_q.size();
+}
+
+void DecodeEngine_ReleaseFrame(DecodeEngine *e, DecodedFrame *f)
+{
+    if (!e || !f) return;
+    if (f->slot_idx < 0 || f->slot_idx >= DecodeEngine::kPoolSize) return;
+    if (e->codec == Codec::H265)
+        H265Dpb_ReleaseExternalHold(&e->dpb_h265, (uint32_t)f->slot_idx);
+    else
+        Dpb_ReleaseExternalHold(&e->dpb_h264, (uint32_t)f->slot_idx);
+    f->slot_idx = -1;
 }
 
 /* C++ linkage */
@@ -916,7 +1100,18 @@ void DecodeEngine_Drain(DecodeEngine *e)
 int DecodeEngine_Flush(DecodeEngine *e)
 {
     /* Drop any pending reorder window — flush in MFT terms means "the
-     * caller is dropping output and starting fresh from the next IDR". */
+     * caller is dropping output and starting fresh from the next IDR".
+     * Release the per-entry external holds before clearing so the DPB
+     * doesn't see leaked refcounts after the re-init below. */
+    auto release_hold = [&](int slot_idx) {
+        if (slot_idx < 0 || slot_idx >= DecodeEngine::kPoolSize) return;
+        if (e->codec == Codec::H265)
+            H265Dpb_ReleaseExternalHold(&e->dpb_h265, (uint32_t)slot_idx);
+        else
+            Dpb_ReleaseExternalHold(&e->dpb_h264, (uint32_t)slot_idx);
+    };
+    for (auto &entry : e->reorder_q) release_hold(entry.slot_idx);
+    for (auto &entry : e->ready_q)   release_hold(entry.slot_idx);
     e->reorder_q.clear();
     e->ready_q.clear();
     e->submit_count = 0;

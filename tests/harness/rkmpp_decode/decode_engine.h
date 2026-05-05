@@ -63,6 +63,26 @@ struct DecodeEngine {
     Buf pool_output[kPoolSize]; /* DPB output frames */
     Buf pool_colmv[kPoolSize];  /* per-slot colmv */
 
+    /* Slot of the most-recent successful DecodeOne_* — captured so
+     * Submit can stash it in the queued ReorderEntry and PollFrame can
+     * surface it to the consumer. */
+    int last_decoded_slot = -1;
+
+    /* Zero-copy readout opt-in (default: false → engine memcpys output
+     * into a per-frame vector for the consumer).  When true, DecodeOne_*
+     * skips the kernel→vector memcpy; consumers read directly from
+     * pool_output[slot_idx].user_va via DecodedFrame.slot_idx and call
+     * DecodeEngine_ReleaseFrame when done.  Safety guaranteed by the
+     * DPB external-hold counter (see dpb.h Dpb_AddExternalHold). */
+    bool populate_yuv = true;
+
+    /* Per-class skip flag for non-reference frames.  When false, the
+     * engine still decodes a non-ref AU (so the codec's internal state
+     * advances) but skips the kernel→vector memcpy — leaving frame.yuv
+     * empty.  The MFT consumer must skip emitting such frames.  Used
+     * in concert with IMFQualityAdvise drop-mode handling. */
+    bool populate_yuv_nonrefs = true;
+
     /* DPB context — codec-specific, only one is used per Init. */
     DpbCtx     dpb_h264{};
     H265DpbCtx dpb_h265{};
@@ -108,7 +128,17 @@ struct DecodeEngine {
         int32_t                poc;
         int64_t                pts_hns;
         int64_t                dur_hns;
-        std::vector<uint8_t>   yuv;
+        std::vector<uint8_t>   yuv;       /* empty when populate_yuv=false */
+        /* Slot the codec wrote this picture into — held via the DPB's
+         * external_hold counter for the lifetime of this entry, so the
+         * codec can't reuse the slot while it sits in reorder_q/ready_q.
+         * -1 if no hold is taken. */
+        int                    slot_idx = -1;
+        /* True if this picture is a reference frame (nal_ref_flag for
+         * HEVC, nal_ref_idc != 0 for H.264).  Consumed by consumer-side
+         * drop-mode logic to skip non-ref outputs without breaking
+         * inter-prediction for the rest of the GOP. */
+        bool                   is_ref = false;
     };
     std::vector<ReorderEntry>  reorder_q;
     std::vector<ReorderEntry>  ready_q;
@@ -197,7 +227,24 @@ struct DecodedFrame {
     int32_t              poc;
     int64_t              pts_hns;
     int64_t              dur_hns;
+    /* `yuv` is populated only when DecodeEngine.populate_yuv is true.
+     * In zero-copy mode the buffer is empty and the consumer reads via
+     * src_ptr instead. */
     std::vector<uint8_t> yuv;
+    /* Slot index of the codec's pool_output for this frame — the same
+     * slot is held via the DPB external-hold mechanism while this
+     * DecodedFrame is alive.  Consumer must call DecodeEngine_ReleaseFrame
+     * when done so the codec can reuse the slot for a future decode. */
+    int                  slot_idx = -1;
+    /* Reference-picture flag (consumer drop-mode hint). */
+    bool                 is_ref = false;
+    /* Zero-copy readout fields.  Layout is codec-padded NV12: Y plane
+     * occupies (src_width × src_height_pad) bytes at offset 0, UV plane
+     * starts at offset (src_width × src_height_pad).  Valid until
+     * DecodeEngine_ReleaseFrame is called. */
+    void                *src_ptr        = nullptr;
+    uint32_t             src_width      = 0;
+    uint32_t             src_height_pad = 0;
 };
 int DecodeEngine_Submit(DecodeEngine *e,
                         const uint8_t *au, size_t au_len,
@@ -208,3 +255,15 @@ int DecodeEngine_SubmitFramed(DecodeEngine *e,
                               int64_t pts_hns);
 int DecodeEngine_PollFrame(DecodeEngine *e, DecodedFrame *out);
 void DecodeEngine_Drain(DecodeEngine *e);
+
+/* Release the DPB external-hold for a previously-polled DecodedFrame.
+ * Must be called after the consumer has copied / consumed the frame's
+ * data.  Idempotent; sets f->slot_idx to -1.  Safe to skip when the
+ * DecodedFrame has already been moved-from. */
+void DecodeEngine_ReleaseFrame(DecodeEngine *e, DecodedFrame *f);
+
+/* Total queued frames currently holding pool slots — reorder_q + ready_q.
+ * MFT layer uses this to backpressure ProcessInput so the slot pool
+ * doesn't get exhausted when the engine pumps faster than the consumer
+ * (audio-locked EVR) drains.  Read only; does not lock. */
+size_t DecodeEngine_QueueDepth(const DecodeEngine *e);

@@ -83,6 +83,10 @@ static bool ParseArgs(int argc, wchar_t **argv, Args *out) {
         }
         else if (!wcscmp(argv[i], L"--no-render")) out->no_render = true;
         else if (!wcscmp(argv[i], L"--use-evr"))   out->use_evr   = true;
+        /* Anything else (e.g. a file path passed via Explorer
+         * drag-and-drop or as a bare positional arg) is treated as the
+         * input path.  Last one wins. */
+        else if (argv[i][0] != L'-')               out->in_path   = argv[i];
         else return false;
     }
     return out->in_path != nullptr;

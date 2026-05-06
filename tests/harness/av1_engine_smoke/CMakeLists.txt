@@ -1,0 +1,2 @@
+add_executable(av1_engine_smoke av1_engine_smoke.cpp)
+target_link_libraries(av1_engine_smoke PRIVATE rkmpp_decode_engine)

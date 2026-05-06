@@ -47,7 +47,7 @@
 
 typedef HRESULT (__stdcall *PFN_DllGetClassObject)(REFCLSID, REFIID, void **);
 
-enum class CodecCli { H264, H265 };
+enum class CodecCli { H264, H265, AV1 };
 
 /* -------- Annex-B AU walker (same logic as rkmpp_decode/main.cpp) -------- */
 
@@ -122,10 +122,28 @@ static bool au_next_h265(const uint8_t *buf, size_t len, size_t *pos,
     return true;
 }
 
+/* IVF temporal-unit walker: each frame in an IVF stream is preceded by
+ * a 12-byte header (4-byte LE size, 8-byte LE pts) followed by the OBU
+ * bytes.  The 32-byte file header (DKIF...) is skipped on the first call
+ * by setting *pos = 32 before invoking.  Returns the OBU payload range. */
+static bool au_next_av1(const uint8_t *b, size_t l, size_t *pos,
+                        size_t *off, size_t *len) {
+    if (*pos + 12 > l) return false;
+    uint32_t sz = (uint32_t)b[*pos] | ((uint32_t)b[*pos+1] << 8) |
+                  ((uint32_t)b[*pos+2] << 16) | ((uint32_t)b[*pos+3] << 24);
+    *pos += 12;
+    if (*pos + sz > l) return false;
+    *off = *pos;
+    *len = sz;
+    *pos += sz;
+    return true;
+}
+
 static bool au_next(CodecCli c, const uint8_t *b, size_t l, size_t *pos,
                     size_t *off, size_t *len) {
-    return (c == CodecCli::H265) ? au_next_h265(b, l, pos, off, len)
-                                 : au_next_h264(b, l, pos, off, len);
+    if (c == CodecCli::AV1)  return au_next_av1 (b, l, pos, off, len);
+    if (c == CodecCli::H265) return au_next_h265(b, l, pos, off, len);
+    return au_next_h264(b, l, pos, off, len);
 }
 
 /* -------- IMFSample helpers -------- */
@@ -209,13 +227,16 @@ int wmain(int argc, wchar_t **argv) {
             if      (!wcscmp(c, L"h264") || !wcscmp(c, L"H264")) codec = CodecCli::H264;
             else if (!wcscmp(c, L"h265") || !wcscmp(c, L"H265") ||
                      !wcscmp(c, L"hevc") || !wcscmp(c, L"HEVC")) codec = CodecCli::H265;
+            else if (!wcscmp(c, L"av1")  || !wcscmp(c, L"AV1"))  codec = CodecCli::AV1;
             else {
                 std::printf("unknown codec: %ls\n", c);
                 return 1;
             }
         } else {
-            std::printf("usage: mft_decode --codec h264|h265 --in <file> "
-                        "--out <yuv> [--width W --height H]\n");
+            std::printf("usage: mft_decode --codec h264|h265|av1 --in <file> "
+                        "--out <yuv> [--width W --height H]\n"
+                        "  h264/h265: input is Annex-B bitstream\n"
+                        "  av1:       input is an IVF file (DKIF header + OBU TUs)\n");
             return 1;
         }
     }
@@ -236,8 +257,11 @@ int wmain(int argc, wchar_t **argv) {
     std::vector<uint8_t> bs(fsize);
     std::fread(bs.data(), 1, fsize, f);
     std::fclose(f);
+    const char *codec_str = (codec == CodecCli::AV1)  ? "av1"
+                          : (codec == CodecCli::H265) ? "h265"
+                                                      : "h264";
     std::printf("input: %ls (%ld bytes) codec=%s %ux%u\n", in_path, fsize,
-                codec == CodecCli::H265 ? "h265" : "h264", width, height);
+                codec_str, width, height);
 
     HR(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
     HR(MFStartup(MF_VERSION, MFSTARTUP_LITE));
@@ -255,12 +279,12 @@ int wmain(int argc, wchar_t **argv) {
         return 3;
     }
 
-    REFCLSID clsid = (codec == CodecCli::H265)
-                     ? CLSID_RkmppHevcDecoder
-                     : CLSID_RkmppH264Decoder;
-    GUID input_subtype = (codec == CodecCli::H265)
-                         ? MFVideoFormat_HEVC
-                         : MFVideoFormat_H264;
+    REFCLSID clsid = (codec == CodecCli::AV1)  ? CLSID_RkmppAv1Decoder
+                   : (codec == CodecCli::H265) ? CLSID_RkmppHevcDecoder
+                                               : CLSID_RkmppH264Decoder;
+    GUID input_subtype = (codec == CodecCli::AV1)  ? MFVideoFormat_AV1
+                       : (codec == CodecCli::H265) ? MFVideoFormat_HEVC
+                                                   : MFVideoFormat_H264;
 
     IClassFactory *cf = nullptr;
     HR(get_class_obj(clsid, IID_IClassFactory, (void**)&cf));
@@ -293,8 +317,18 @@ int wmain(int argc, wchar_t **argv) {
         }
     }
 
-    /* Push AUs.  Each AU = one IMFSample with PTS = idx*(10M/30) HNS. */
+    /* Push AUs.  Each AU = one IMFSample with PTS = idx*(10M/30) HNS.
+     * AV1 input is IVF: skip the 32-byte DKIF header.  Pull the actual
+     * picture dimensions from the IVF header so the MFT's output type
+     * matches the bitstream regardless of --width/--height defaults. */
     size_t pos = 0;
+    if (codec == CodecCli::AV1) {
+        if (bs.size() < 32 || std::memcmp(bs.data(), "DKIF", 4) != 0) {
+            std::printf("FAIL: not an IVF file (missing DKIF header)\n");
+            return 7;
+        }
+        pos = 32;
+    }
     int au_idx = 0, frames_out = 0;
     while (true) {
         size_t au_off = 0, au_len = 0;

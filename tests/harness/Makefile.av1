@@ -1,0 +1,42 @@
+# Makefile.av1 — Linux/host build of AV1 harness binaries.
+#
+# Mirrors the winreplay_h264_diff pattern: a small Makefile invoked
+# directly via `make -f Makefile.av1` on the rk3588 board (Ubuntu).
+# The Windows-side equivalent is the rkvdec MSBuild/CMake projects;
+# we keep this Linux build alongside it so dav1d-driven parsing and
+# regbuilder cross-checks can be validated against the live BSP
+# decoder on the same host.
+#
+# Build prerequisites on the rk box:
+#   sudo apt-get install -y libdav1d-dev meson ninja-build pkg-config
+# (libdav1d-dev satisfies dav1d/dav1d.h via /usr/include/dav1d.)
+
+MFT      ?= ../../mft
+
+CC       ?= gcc
+CXX      ?= g++
+CFLAGS   ?= -O2 -g -Wall -Wno-unused-parameter
+CXXFLAGS  = $(CFLAGS) -std=c++17
+INCS      = -I$(MFT) $(shell pkg-config --cflags dav1d)
+LDLIBS    = $(shell pkg-config --libs dav1d)
+
+BINS = bin/av1_parse_smoke bin/av1_regbuild_diff bin/av1_hw_inject
+
+all: $(BINS)
+
+bin/av1_parse_smoke: av1_parse_smoke/av1_parse_smoke.cpp | bin
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ $< $(LDLIBS)
+
+bin/av1_regbuild_diff: av1_regbuild_diff/av1_regbuild_diff.cpp $(MFT)/regbuilder_av1.cpp $(MFT)/regbuilder_av1.h $(MFT)/regbuilder_av1_reg.h | bin
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ av1_regbuild_diff/av1_regbuild_diff.cpp $(MFT)/regbuilder_av1.cpp $(LDLIBS)
+
+bin/av1_hw_inject: av1_regbuild_diff/av1_hw_inject.cpp $(MFT)/regbuilder_av1.cpp $(MFT)/regbuilder_av1.h $(MFT)/regbuilder_av1_reg.h | bin
+	$(CXX) $(CXXFLAGS) $(INCS) -o $@ av1_regbuild_diff/av1_hw_inject.cpp $(MFT)/regbuilder_av1.cpp $(LDLIBS)
+
+bin:
+	mkdir -p $@
+
+clean:
+	rm -rf bin
+
+.PHONY: all clean

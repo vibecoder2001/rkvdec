@@ -17,6 +17,11 @@ option(RKMPP_HARNESS_TESTS "Build the host-runnable unit tests" ${_default_tests
 
 message(STATUS "rkmpp_harness: target=${CMAKE_VS_PLATFORM_NAME} host=${CMAKE_HOST_SYSTEM_PROCESSOR} tests=${RKMPP_HARNESS_TESTS}")
 
+# dav1d static lib (third_party submodule; built externally via meson —
+# see third_party/build_dav1d.bat).  Imported BEFORE rkmpp_mft so the
+# AV1 regbuilder source (which #includes <dav1d/headers.h>) can compile.
+include(${CMAKE_SOURCE_DIR}/../../third_party/dav1d.cmake)
+
 # Pull in the user-mode helper library (parser_glue, regbuilder, …).
 add_subdirectory(${CMAKE_SOURCE_DIR}/../../mft ${CMAKE_BINARY_DIR}/mft)
 
@@ -27,6 +32,10 @@ add_subdirectory(rkmpp_decode)
 
 # IMFTransform DLL (Phase 2B — wired through decode_engine).
 add_subdirectory(${CMAKE_SOURCE_DIR}/../../mft/dll ${CMAKE_BINARY_DIR}/mft_dll)
+
+add_subdirectory(av1_parse_smoke)
+add_subdirectory(av1_regbuild_diff)
+add_subdirectory(av1_engine_smoke)
 
 add_subdirectory(rkmpp_caps_dump)
 add_subdirectory(rkmpp_smoke)

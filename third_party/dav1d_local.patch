@@ -1,0 +1,58 @@
+diff --git a/include/dav1d/headers.h b/include/dav1d/headers.h
+index 0fab9938..d54095e7 100644
+--- a/include/dav1d/headers.h
++++ b/include/dav1d/headers.h
+@@ -431,6 +431,13 @@ typedef struct Dav1dFrameHeader {
+     uint8_t warp_motion;
+     uint8_t reduced_txtp_set;
+     Dav1dWarpedMotionParams gmv[DAV1D_REFS_PER_FRAME];
++    /* Local extension (rkvdec project): byte length of the frame_header_obu
++     * portion of the containing OBU_FRAME / OBU_FRAME_HDR — i.e. bytes from
++     * the first byte after the OBU header + leb128 size field, through the
++     * trailing byte_alignment(). Hardware decoders that don't run their
++     * own OBU parser need this to point their entropy cursor at the start
++     * of tile_group_obu (see "frame_tag_size" in Rockchip MPP). */
++    uint32_t frame_hdr_obu_size_bytes;
+ } Dav1dFrameHeader;
+ 
+ #ifdef __cplusplus
+diff --git a/src/obu.c b/src/obu.c
+index da5002ae..5fe77122 100644
+--- a/src/obu.c
++++ b/src/obu.c
+@@ -1280,6 +1280,11 @@ ptrdiff_t dav1d_parse_obus(Dav1dContext *const c, Dav1dData *const in) {
+         memset(c->frame_hdr, 0, sizeof(*c->frame_hdr));
+         c->frame_hdr->temporal_id = temporal_id;
+         c->frame_hdr->spatial_id = spatial_id;
++        /* rkvdec local extension: capture byte position at the start of
++         * frame_header_obu so we can later compute its byte length. We are
++         * byte-aligned here per the assertion at the top of parse_obus
++         * (after obu_header + leb128 read). */
++        const ptrdiff_t fh_obu_byte_start = gb.ptr - gb.ptr_start;
+         if ((res = parse_frame_hdr(c, &gb)) < 0) {
+             c->frame_hdr = NULL;
+             goto error;
+@@ -1295,6 +1300,11 @@ ptrdiff_t dav1d_parse_obus(Dav1dContext *const c, Dav1dData *const in) {
+                 c->frame_hdr = NULL;
+                 goto error;
+             }
++            /* rkvdec local extension: trailing-bit + bytealign happened
++             * inside check_trailing_bits; gb.ptr is now at the byte after
++             * frame_header_obu. */
++            c->frame_hdr->frame_hdr_obu_size_bytes =
++                (uint32_t)((gb.ptr - gb.ptr_start) - fh_obu_byte_start);
+         }
+ 
+         if (c->frame_size_limit && (int64_t)c->frame_hdr->width[1] *
+@@ -1318,6 +1328,11 @@ ptrdiff_t dav1d_parse_obus(Dav1dContext *const c, Dav1dData *const in) {
+         // There's no trailing bit at the end to skip, but we do need
+         // to align to the next byte.
+         dav1d_bytealign_get_bits(&gb);
++        /* rkvdec local extension: gb.ptr now points at the first byte of
++         * tile_group_obu within this OBU_FRAME. Record the frame_header_obu
++         * byte length for downstream HW decoders. */
++        c->frame_hdr->frame_hdr_obu_size_bytes =
++            (uint32_t)((gb.ptr - gb.ptr_start) - fh_obu_byte_start);
+         // fall-through
+     case DAV1D_OBU_TILE_GRP: {
+         if (!c->frame_hdr) goto error;

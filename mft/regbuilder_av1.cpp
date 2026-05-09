@@ -119,50 +119,46 @@ void emit_dma(uint32_t *msb, uint32_t *lsb, int fd, uint32_t offset) {
 
 /* --- main entry ------------------------------------------------------ */
 
-/* Helpers to set the strange split-across-swregs per-ref fields. */
-static void set_ref_width(VdpuAv1dRegSet *r, int i, uint32_t v) {
-    switch (i) {
-    case 0: r->swreg33.sw_ref0_width = v; break;
-    case 1: r->swreg34.sw_ref1_width = v; break;
-    case 2: r->swreg35.sw_ref2_width = v; break;
-    case 3: r->swreg43.sw_ref3_width = v; break;
-    case 4: r->swreg44.sw_ref4_width = v; break;
-    case 5: r->swreg45.sw_ref5_width = v; break;
-    case 6: r->swreg46.sw_ref6_width = v; break;
-    }
+/* Per-ref field setters.
+ *
+ * The width/height/hor_scale/ver_scale fields land in swregs 33-46 in a
+ * regular pattern: refs 0..2 share swregs 33/34/35 (width+height) and
+ * 36/37/38 (hor+ver scale); refs 3..6 jump to 43/44/45/46 and 39/40/41/42.
+ * Bitfield layout within each swreg is identical for width vs height
+ * (and hor vs ver) — only which 32-bit word it lands in differs.  So we
+ * can walk a const offset table from the start of VdpuAv1dRegSet
+ * indexed by ref number and write through a uint32_t* with a mask+shift.
+ *
+ * Bitfield layout within each ref-config swreg (MSVC/clang LSB-first
+ * packing; verified against regbuilder_av1_reg.h):
+ *   swreg33: { height : 16; width : 16; }     -> width hi, height lo
+ *   swreg36: { ver_scale : 16; hor_scale : 16; } -> hor hi, ver lo
+ * sign_bias splits across swreg59 (refs 0-3) and swreg9 (refs 4-6) so
+ * keeps a tiny switch.
+ */
+static const uint16_t kRefDimRegIdx[7]   = { 33, 34, 35, 43, 44, 45, 46 };
+static const uint16_t kRefScaleRegIdx[7] = { 36, 37, 38, 39, 40, 41, 42 };
+
+static inline void set_field_lo16(uint32_t *reg, uint32_t v) {
+    *reg = (*reg & 0xFFFF0000u) | (v & 0xFFFFu);
 }
-static void set_ref_height(VdpuAv1dRegSet *r, int i, uint32_t v) {
-    switch (i) {
-    case 0: r->swreg33.sw_ref0_height = v; break;
-    case 1: r->swreg34.sw_ref1_height = v; break;
-    case 2: r->swreg35.sw_ref2_height = v; break;
-    case 3: r->swreg43.sw_ref3_height = v; break;
-    case 4: r->swreg44.sw_ref4_height = v; break;
-    case 5: r->swreg45.sw_ref5_height = v; break;
-    case 6: r->swreg46.sw_ref6_height = v; break;
-    }
+static inline void set_field_hi16(uint32_t *reg, uint32_t v) {
+    *reg = (*reg & 0x0000FFFFu) | ((v & 0xFFFFu) << 16);
+}
+static inline uint32_t *reg_word(VdpuAv1dRegSet *r, int idx) {
+    return reinterpret_cast<uint32_t *>(r) + idx;
+}
+static void set_ref_width    (VdpuAv1dRegSet *r, int i, uint32_t v) {
+    set_field_hi16(reg_word(r, kRefDimRegIdx[i]),   v);
+}
+static void set_ref_height   (VdpuAv1dRegSet *r, int i, uint32_t v) {
+    set_field_lo16(reg_word(r, kRefDimRegIdx[i]),   v);
 }
 static void set_ref_hor_scale(VdpuAv1dRegSet *r, int i, uint32_t v) {
-    switch (i) {
-    case 0: r->swreg36.sw_ref0_hor_scale = v; break;
-    case 1: r->swreg37.sw_ref1_hor_scale = v; break;
-    case 2: r->swreg38.sw_ref2_hor_scale = v; break;
-    case 3: r->swreg39.sw_ref3_hor_scale = v; break;
-    case 4: r->swreg40.sw_ref4_hor_scale = v; break;
-    case 5: r->swreg41.sw_ref5_hor_scale = v; break;
-    case 6: r->swreg42.sw_ref6_hor_scale = v; break;
-    }
+    set_field_hi16(reg_word(r, kRefScaleRegIdx[i]), v);
 }
 static void set_ref_ver_scale(VdpuAv1dRegSet *r, int i, uint32_t v) {
-    switch (i) {
-    case 0: r->swreg36.sw_ref0_ver_scale = v; break;
-    case 1: r->swreg37.sw_ref1_ver_scale = v; break;
-    case 2: r->swreg38.sw_ref2_ver_scale = v; break;
-    case 3: r->swreg39.sw_ref3_ver_scale = v; break;
-    case 4: r->swreg40.sw_ref4_ver_scale = v; break;
-    case 5: r->swreg41.sw_ref5_ver_scale = v; break;
-    case 6: r->swreg42.sw_ref6_ver_scale = v; break;
-    }
+    set_field_lo16(reg_word(r, kRefScaleRegIdx[i]), v);
 }
 static void set_ref_sign_bias(VdpuAv1dRegSet *r, int i, uint32_t v) {
     /* ref_sign_bias for ref0..3 lives in swreg59, ref4..6 in swreg9. */
@@ -263,7 +259,16 @@ RkmppAv1Status rkmpp_av1_build_regs(
     out->swreg5.sw_show_frame                 = hdr->show_frame;
     out->swreg5.sw_disable_cdf_update         = hdr->disable_cdf_update;
     out->swreg5.sw_error_resilient            = hdr->error_resilient_mode;
-    out->swreg5.sw_force_interger_mv          = hdr->force_integer_mv;
+    /* DXVA semantic (matches BSP capture): the coded/transmitted bit
+     * only — 0 for key/intra (where force_integer_mv is implicitly 1
+     * but the field isn't transmitted), 0 or 1 for inter.  dav1d's
+     * `hdr->force_integer_mv` reflects the *effective* value (always 1
+     * for key/intra), which differs from the DXVA convention BSP HAL
+     * captures.  Match BSP. */
+    out->swreg5.sw_force_interger_mv =
+        (hdr->frame_type != DAV1D_FRAME_TYPE_KEY &&
+         hdr->frame_type != DAV1D_FRAME_TYPE_INTRA &&
+         hdr->force_integer_mv) ? 1u : 0u;
     out->swreg5.sw_allow_intrabc              = hdr->allow_intrabc;
     out->swreg5.sw_allow_screen_content_tools = hdr->allow_screen_content_tools;
     out->swreg5.sw_reduced_tx_set_used        = hdr->reduced_txtp_set;
@@ -281,6 +286,19 @@ RkmppAv1Status rkmpp_av1_build_regs(
 
     /* swreg6: bitstream length in bytes */
     out->swreg6.sw_stream_len = bufs->bitstream_length;
+
+    /* swreg5.sw_strm_start_bit: bit offset within the first stream byte
+     * where the codec should begin entropy decoding.  Per BSP HAL line
+     * 2119: `(frame_tag_size & 0xf) * 8`.  In the AV1 OBU container,
+     * the bitstream pointer starts at the FRAME OBU's tile-group payload;
+     * frame_tag_size is the byte length of the OBU header + frame_header
+     * which the codec's hardware-side bitstream cursor advances past
+     * before consuming tile data.  When stream_base points to the start
+     * of the OBU sequence (offset 0), the bit position aligned to byte
+     * boundary is 0 — we currently feed the OBU bytes raw, so 0 is the
+     * correct value.  TODO: when we strip OBU framing in user mode, this
+     * needs to encode the residual bit offset. */
+    out->swreg5.sw_strm_start_bit = 0;
 
     /* ====================================================================
      * Batch 2c: misc per-frame (swreg7, swreg8)
@@ -322,6 +340,22 @@ RkmppAv1Status rkmpp_av1_build_regs(
     out->swreg10.sw_num_tile_cols_8k     = hdr->tiling.cols;
     out->swreg10.sw_num_tile_rows_8k_av1 = hdr->tiling.rows;
 
+    /* swreg9.sw_context_update_tile_id — raster-id of the tile whose
+     * post-decode CDFs become next frame's context.  With sw_tile_transpose=1
+     * the codec walks tile_info entries in column-major order, so BSP
+     * HAL line 1473 remaps the raster id into the column-major buffer
+     * index: id_remap = update_x * rows + update_y.  Required for any
+     * stream where context_update_tile_id != 0; default tile-0 streams
+     * happen to remap to 0 either way. */
+    {
+        const uint32_t cols = (uint32_t)hdr->tiling.cols;
+        const uint32_t rows = (uint32_t)hdr->tiling.rows;
+        const uint32_t update_id = (cols > 0) ? (uint32_t)hdr->tiling.update : 0u;
+        const uint32_t update_x  = (cols > 0) ? (update_id % cols) : 0u;
+        const uint32_t update_y  = (cols > 0) ? (update_id / cols) : 0u;
+        out->swreg9.sw_context_update_tile_id = update_x * rows + update_y;
+    }
+
     /* ====================================================================
      * Batch 4: temporal MVs + comp pred + transform mode (swreg11)
      *   sw_use_temporal0_mvs..3_mvs — per-ref active flag, requires
@@ -345,9 +379,15 @@ RkmppAv1Status rkmpp_av1_build_regs(
         uint32_t tx = (uint32_t)hdr->txfm_mode;
         out->swreg11.sw_transform_mode = tx ? tx + 2u : 0u;
     }
-    /* Single-core decode: BSP HAL line 1480 sets this to (0 == context_update_x)
-     * which is true for our use case (no multi-core tile context handoff). */
-    out->swreg11.sw_multicore_expect_context_update = 1;
+    /* BSP HAL line 1471 sets this to (0 == context_update_x).  Default
+     * for tile-0 context update is 1; mirror that for any update tile
+     * whose column index is 0. */
+    {
+        const uint32_t cols = (uint32_t)hdr->tiling.cols;
+        const uint32_t update_x = (cols > 0)
+            ? ((uint32_t)hdr->tiling.update % cols) : 0u;
+        out->swreg11.sw_multicore_expect_context_update = (update_x == 0) ? 1 : 0;
+    }
     /* dec_tile_size_mag = tile_size_bytes_minus_1 (0..3).  dav1d only sets
      * n_bytes when tiling.update is parsed (multi-tile streams); single-tile
      * streams leave n_bytes=0.  BSP captures 3 in that case (the AV1 default
@@ -441,6 +481,15 @@ RkmppAv1Status rkmpp_av1_build_regs(
         hdr->frame_type != DAV1D_FRAME_TYPE_INTRA &&
         !hdr->allow_intrabc) {
 
+        /* BSP HAL unconditionally sets sw_ref_scaling_enable on every
+         * inter frame, even at 1:1 resolution. The bit appears to gate
+         * the MC/subpel path generally rather than literal upscaling —
+         * leaving it 0 corrupts inter decode despite refs matching the
+         * current frame's dimensions. The dimension-based override
+         * below stays as documentation of *why* it would conditionally
+         * be needed; the unconditional enable matches BSP captures. */
+        out->swreg5.sw_ref_scaling_enable = 1;
+
         const uint32_t cur_w = (uint32_t)hdr->width[0];
         const uint32_t cur_h = (uint32_t)hdr->height;
         /* HAL counts UNIQUE DPB slots referenced by hdr->refidx[],
@@ -518,18 +567,53 @@ RkmppAv1Status rkmpp_av1_build_regs(
      * shared); mirror UV to V.  When restoration disabled, BSP captures
      * sw_lr_unit_size = 0x3f (max) — match that for diff parity. */
     {
+        /* AV1 bitstream frame_restoration_type values (spec §5.9.20):
+         *   0 = RESTORE_NONE
+         *   1 = RESTORE_WIENER
+         *   2 = RESTORE_SGRPROJ
+         *   3 = RESTORE_SWITCHABLE
+         *
+         * RK rkvdec2 sw_lr_type field expects (verified against BSP
+         * /tmp/mpp-src/mpp/codec/dec/av1/av1d_parser.c `av1_remap_lr_type`
+         * + `mpp/hal/vpu/av1d/hal_av1d_vdpu.c` swreg18 packing):
+         *   NONE       -> 0
+         *   WIENER     -> 3
+         *   SGRPROJ    -> 1
+         *   SWITCHABLE -> 2
+         *
+         * Do NOT remove this remap; it is bitstream-spec -> RK HW encoding,
+         * not a dav1d enum compatibility shim.  Dropping it produces
+         * blanket corruption on every stream with non-NONE LR (verified
+         * 2026-05-08). */
+        static const uint8_t av1_spec_lr_type_to_rk_hw_lr_type[4] = {
+            0, /* NONE       */
+            3, /* WIENER     */
+            1, /* SGRPROJ    */
+            2, /* SWITCHABLE */
+        };
         uint32_t lr_type = 0;
         bool any_restoration = false;
         for (int i = 0; i < 3; i++) {
-            uint32_t t = (uint32_t)hdr->restoration.type[i] & 0x3;
+            uint32_t t = av1_spec_lr_type_to_rk_hw_lr_type[(uint32_t)hdr->restoration.type[i] & 0x3u];
             lr_type |= t << (i * 2);
             if (t) any_restoration = true;
         }
-        uint32_t us_y  = hdr->restoration.unit_size[0] & 0x3;
-        uint32_t us_uv = hdr->restoration.unit_size[1] & 0x3;
-        uint32_t lr_unit_size = us_y | (us_uv << 2) | (us_uv << 4);
+        /* BSP HAL encodes per-plane sw_lr_unit_size as `1 + lr_unit_shift`
+         * (not raw log2-pixels-per-unit).  dav1d's `restoration.unit_size[i]`
+         * is `6 + sb128 + lr_unit_shift` (Y) or with -lr_uv_shift adjustment
+         * (UV).  Translate.  When restoration is disabled BSP packs 3 in
+         * each pair → final value 0x3f; we mirror that. */
+        uint32_t lr_unit_size;
+        if (any_restoration) {
+            const uint32_t base = 5u + (uint32_t)seq->sb128;
+            const uint32_t us_y  = ((uint32_t)hdr->restoration.unit_size[0] - base) & 0x3u;
+            const uint32_t us_uv = ((uint32_t)hdr->restoration.unit_size[1] - base) & 0x3u;
+            lr_unit_size = us_y | (us_uv << 2) | (us_uv << 4);
+        } else {
+            lr_unit_size = 0x3fu;
+        }
         out->swreg18.sw_lr_type      = lr_type;
-        out->swreg19.sw_lr_unit_size = any_restoration ? lr_unit_size : 0x3fu;
+        out->swreg19.sw_lr_unit_size = lr_unit_size;
     }
 
     /* ====================================================================
@@ -777,18 +861,27 @@ RkmppAv1Status rkmpp_av1_build_regs(
      *             swreg332 = 0x050002d0 (out_width=1280, out_height=720)
      *             swreg394 = 0x01010000 (pp0_dup_hor=1, pp0_dup_ver=1) */
     {
-        const uint32_t w = (uint32_t)hdr->width[0];
-        const uint32_t h = (uint32_t)hdr->height;
+        const uint32_t w  = (uint32_t)hdr->width[0];
+        const uint32_t h  = (uint32_t)hdr->height;
+        /* PP raster output requires the storage stride to be 64-aligned
+         * regardless of the display width.  When the stream's display
+         * width is already 64-aligned (e.g. 1280) coded == display and
+         * the captured BSP values match w directly; for non-aligned
+         * widths (e.g. 1270) PP fails to write most superblocks unless
+         * the stride is rounded up.  PP's "in" side reads from the
+         * codec's internal layout, which is also at coded stride. */
+        const uint32_t cw = (w + 63u) & ~63u;
+        const uint32_t ch = (h +  7u) & ~7u;
         out->vdpu_av1d_pp_cfg.swreg320.sw_pp_out_e   = 1;
         out->vdpu_av1d_pp_cfg.swreg322.sw_pp_in_format  = 0;
         /* sw_pp_out_format=3 selects NV12 output (captured 0x000c0000
          * has bits 18-19 set in swreg322 = pp_out_format value 3). */
         out->vdpu_av1d_pp_cfg.swreg322.sw_pp_out_format = 3;
         /* HAL writes hor_stride for both luma and chroma stride. */
-        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_y_stride = w;
-        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_c_stride = w;
-        out->vdpu_av1d_pp_cfg.swreg331.sw_pp_in_width    = w / 2;
-        out->vdpu_av1d_pp_cfg.swreg331.sw_pp_in_height   = h / 2;
+        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_y_stride = cw;
+        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_c_stride = cw;
+        out->vdpu_av1d_pp_cfg.swreg331.sw_pp_in_width    = cw / 2;
+        out->vdpu_av1d_pp_cfg.swreg331.sw_pp_in_height   = ch / 2;
         out->vdpu_av1d_pp_cfg.swreg332.sw_pp_out_width   = w;
         out->vdpu_av1d_pp_cfg.swreg332.sw_pp_out_height  = h;
         out->vdpu_av1d_pp_cfg.swreg394.sw_pp0_dup_hor    = 1;

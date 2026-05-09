@@ -89,6 +89,12 @@ typedef struct DpbCtx {
     /* Captured at Select time so OnDecodeComplete can resolve PicNumX. */
     uint16_t     pending_curr_pic_num;
 
+    /* POC of the most recently evicted short-term reference, set by
+     * Dpb_OnDecodeComplete when sliding-window or MMCO fires.  Reset to
+     * INT32_MIN at the start of each Dpb_OnDecodeComplete call.
+     * Exposed for parser_dump --trace to print bump order. */
+    int32_t      last_bumped_poc;
+
     /* Per-slot state. */
     struct {
         uint8_t  in_use   : 1;

@@ -11,7 +11,7 @@
 #include "registration.h"
 
 /* Instantiate driver-side device-interface GUIDs that decode_engine
- * (linked from tests/harness/rkmpp_decode/) references via SetupDi. */
+ * (linked from mft/engine/) references via SetupDi. */
 #include "../../shared/rkmpp_ioctl.h"
 
 static HMODULE g_self = nullptr;

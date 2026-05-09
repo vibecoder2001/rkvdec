@@ -183,11 +183,10 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
      * single-slot setup.  poc_only_highbit_flag (bit 10) goes with the
      * reg200..204 high-bit POC bank; we keep all-zero high bits, so
      * there's no need to enable that mode. */
-    /* reg028 — BSP shim capture (cmd=0x200 idx 20 in the bframe.h264
-     * log) shows 0x00000000 from user-mode for every AU.  An earlier
-     * kernel-side dmesg trace caught a 0x000b0000 write but that's the
-     * BSP kernel rewriting it before MMIO with sw_film_idx=11; from
-     * user-mode the IOCTL sends 0.  Match the user-mode wire value. */
+    /* reg028: BSP only sets sw_poc_arb_flag=0 (already default).  Earlier
+     * experiment to write `frame_num << 16` here (matching what BSP kernel
+     * rewrites the field to) had zero effect on the B-frame divergence and
+     * is reverted.  Match the user-mode wire value. */
     (void)current_pic_index;
     EMIT_P(RKVDEC2_REG_FILM_IDX, 0u);
     /* reg032 (timeout_thresh) — BSP shim capture writes 0x0003ffff for

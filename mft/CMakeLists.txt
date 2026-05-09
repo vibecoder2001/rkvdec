@@ -9,6 +9,7 @@ add_library(rkmpp_mft STATIC
     regbuilder_h264.cpp
     regbuilder_h265.cpp
     regbuilder_av1.cpp
+    av1_parser.cpp
     h264_packed_tables.cpp
     h265_packed_tables.cpp
     dpb.cpp
@@ -32,4 +33,16 @@ target_compile_features(rkmpp_mft PUBLIC cxx_std_17)
 
 if(MSVC)
     target_compile_options(rkmpp_mft PRIVATE /W4 /WX)
+    # av1_parser.cpp performs intentional narrowing assignments from int
+    # to uint8_t in tiling-parameter derivation (tile_log2 return → uint8_t
+    # fields).  Suppress C4244 for that file only so the /WX flag on the
+    # rest of the target is not defeated.
+    set_source_files_properties(av1_parser.cpp PROPERTIES
+        COMPILE_FLAGS "/wd4244 /wd4505")
 endif()
+
+# Engine library (decode_engine.* + decode_engine_av1.*) — wraps the
+# parser/dpb/regbuilder pipeline with the rkmpp.sys IOCTL surface.
+# Shared between the production MFT DLL (mft/dll/) and the rkmpp_decode
+# test harness (tests/harness/rkmpp_decode/).
+add_subdirectory(engine)

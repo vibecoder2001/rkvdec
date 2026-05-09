@@ -105,6 +105,16 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
     if (Role != (ULONG)RkMppBufferUsageBitstreamInput)
         pteFlags |= RK_PTE_PAGE_WRITABLE;
 
+    /* AV1 codec needs RW on bitstream too.  Mapping bitstream RO worked
+     * for rkvdec2 H.264/HEVC, but the AV1 IP issues at least some AXI
+     * write transactions to its bitstream region (likely scratch use
+     * of the buffer past the tile data).  With our RO mapping the
+     * IOMMU returns an AXI permission-denial response — no translation
+     * fault (STATUS bits stay 0) but the codec sees a bus error and
+     * reports dec_bus_int (swreg1 bit 13).  BSP maps everything RW.
+     * Promote bitstream to RW for AV1 IOMMU instances. */
+    if (dev->IsAv1d) pteFlags |= RK_PTE_PAGE_WRITABLE;
+
     /* Allocate a contiguous IOVA range */
     ULONG64 baseIova;
     KeAcquireSpinLock(&dev->Domain->Lock, &irql);

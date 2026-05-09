@@ -217,7 +217,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                 ctx->Mmios[ctx->MmioCount].Length = len;
                 ctx->Mmios[ctx->MmioCount].Phys   = start;
                 ctx->MmioCount++;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                            "rkmpp: AV1 window[%u] phys=0x%llx len=0x%x va=%p\n",
                            ctx->MmioCount - 1,
                            (ULONGLONG)start.QuadPart, len, v);

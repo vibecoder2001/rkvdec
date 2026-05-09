@@ -28,6 +28,7 @@
 #include "../../shared/rkmpp_ioctl.h"
 #include "../../shared/rkiommu_ifc.h"
 #include "bufpool.h"
+#include "profile.h"
 
 /* -----------------------------------------------------------------------
  * Forward declarations for the device-context accessor defined in device.c
@@ -239,8 +240,14 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     }
 
     /* --- 5. Map into calling process user space ----------------------- */
+    /* All codecs use cached user-mode mappings.  The poller (job.c
+     * RkMppPollerThread) issues a dummy MMIO read + PERF_WORKING_CNT
+     * poll after DEC_RDY before signalling completion; RkMppJobComplete
+     * then calls KeFlushIoBuffers on DMA-output MDLs to invalidate stale
+     * CPU cache lines before any user-mode read. */
+    MEMORY_CACHING_TYPE userCacheType = MmCached;
     PVOID userVa = MmMapLockedPagesSpecifyCache(
-        mdl, UserMode, MmCached, NULL, FALSE, NormalPagePriority);
+        mdl, UserMode, userCacheType, NULL, FALSE, NormalPagePriority);
     if (!userVa) {
         iommu->UnmapMdl(provCtx, iova);
         IoFreeMdl(mdl);

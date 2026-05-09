@@ -61,6 +61,18 @@ typedef struct _RKMPP_JOB {
     UINT32          CleanMdlCount;
     PMDL            CleanMdls[8];
     PMDL            OutputFrameMdl;
+    /* AV1 only: pool_internal — codec-internal Y/UV/MV in codec-tiled
+     * format (reg65 base).  Codec's VCD writes here; PP reads it and
+     * emits user-visible NV12 to OutputFrameMdl.  Tracked here so the
+     * post-decode KeFlushIoBuffers invalidates stale CPU lines for the
+     * user-mode dump path (RKMPP_AV1_DUMP_DIR) which reads it for
+     * byte-diffing against BSP captures. */
+    PMDL            InternalOutputMdl;
+    /* AV1 only: prob_tbl_out (reg171).  Codec writes post-decode CDF
+     * state here each kick; user-mode reads it to snapshot saved_cdf[]
+     * for the next inter-frame's CDF seed.  Needs dc ivac before user-
+     * mode read, same as OutputFrameMdl. */
+    PMDL            AuxOutputMdl;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------
@@ -84,6 +96,21 @@ typedef struct _RKMPP_JOB_QUEUE {
     KEVENT          KickEvent;      /* signalled after register list written */
     KEVENT          ExitEvent;      /* signalled to terminate poller */
     PETHREAD        PollerThread;   /* referenced; ObDereferenced on teardown */
+
+    /* Per-bit mask of register indices [0..511] that were nonzero in
+     * the most recent kick.  Used to skip MMIO writes for regs that
+     * were zero last kick AND are zero this kick — the hardware retains
+     * their (zero) value so we don't need to re-write them.  Cuts
+     * per-kick MMIO from ~155 (rkvdec2) / ~511 (AV1) total writes down
+     * to ~80 active + a few "clear" writes for regs going nonzero→zero.
+     *
+     * Two separate masks because rkvdec2 (H.264/H.265) and AV1 use
+     * different MMIO windows and bank layouts — though only one mask is
+     * live per device since the codec personality is fixed at
+     * enumeration time.  Both are cleared on reset paths because the
+     * reset returns codec regs to zero. */
+    ULONG           Rkvdec2PrevNonzeroMask[16];
+    ULONG           Av1PrevNonzeroMask[16];
 } RKMPP_JOB_QUEUE, *PRKMPP_JOB_QUEUE;
 
 /* -----------------------------------------------------------------------

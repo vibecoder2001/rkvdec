@@ -17,11 +17,11 @@
 #include <algorithm>
 #include <cstring>
 
-/* The decode engine lives as a static lib in tests/harness/rkmpp_decode/
+/* The decode engine lives as a static lib in mft/engine/
  * so harness binaries and this DLL share one user-mode pipeline.  Codec
  * mapping: rkmpp::CodecKind <-> ::Codec (separate enums, same intent). */
-#include "../../tests/harness/rkmpp_decode/decode_engine.h"
-#include "../../tests/harness/rkmpp_decode/decode_engine_av1.h"
+#include "decode_engine.h"
+#include "decode_engine_av1.h"
 
 namespace rkmpp {
 
@@ -224,16 +224,19 @@ STDMETHODIMP DecoderMFT::AddInputStreams(DWORD, DWORD *)               { return 
 STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
     if (id != 0) return MF_E_INVALIDSTREAMNUMBER;
     if (!flags) return E_POINTER;
-    /* Match the queue cap enforced in ProcessInput so the host knows
-     * when to drain output before pumping more input. */
     std::lock_guard<std::mutex> g(lock_);
     *flags = 0;
-    if (engine_) {
-        const size_t kQueueCap = 4;
-        auto *eng = static_cast<DecodeEngine *>(engine_);
-        if (DecodeEngine_QueueDepth(eng) < kQueueCap) {
+    /* AV1 cap matches ProcessInput's cap (16) so it can hold the
+     * 8-frame reorder buffer plus working margin for hierarchical
+     * streams.  H.264/HEVC keep the smaller cap they were tuned for. */
+    if (engine_av1_) {
+        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+        if (Av1DecodeEngine_QueueDepth(eng) < 24)
             *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
-        }
+    } else if (engine_) {
+        auto *eng = static_cast<DecodeEngine *>(engine_);
+        if (DecodeEngine_QueueDepth(eng) < 4)
+            *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
     } else {
         *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
     }
@@ -241,8 +244,17 @@ STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
 }
 STDMETHODIMP DecoderMFT::GetOutputStatus(DWORD *flags) {
     if (!flags) return E_POINTER;
-    /* Phase 2A: never have a sample ready. */
+    std::lock_guard<std::mutex> g(lock_);
     *flags = 0;
+    if (engine_av1_) {
+        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+        if (Av1DecodeEngine_QueueDepth(eng) > 0)
+            *flags = MFT_OUTPUT_STATUS_SAMPLE_READY;
+    } else if (engine_) {
+        auto *eng = static_cast<DecodeEngine *>(engine_);
+        if (DecodeEngine_QueueDepth(eng) > 0)
+            *flags = MFT_OUTPUT_STATUS_SAMPLE_READY;
+    }
     return S_OK;
 }
 STDMETHODIMP DecoderMFT::SetOutputBounds(LONGLONG, LONGLONG) { return E_NOTIMPL; }
@@ -660,6 +672,8 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
         input_queue_.clear();
         input_timestamps_.clear();
         draining_ = false;
+        last_emitted_pts_ = INT64_MIN;
+        ++stream_epoch_;
         if (engine_) {
             auto *eng = static_cast<DecodeEngine *>(engine_);
             (void)DecodeEngine_Flush(eng);
@@ -690,7 +704,13 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
      * per call which ProcessOutput drains in display order. */
     if (kind_ == CodecKind::AV1) {
         if (!engine_av1_ || engine_init_failed_) return MF_E_NOTACCEPTING;
-        const size_t kQueueCap = 4;
+        /* Cap = engine's max_reorder_pics (8 for hierarchical streams,
+         * 0 for low-delay) + a working margin for the in-flight kick.
+         * Must exceed max_reorder_pics so the bump in DrainPictures can
+         * fire without us first refusing input — otherwise the engine
+         * deadlocks: input refused at kQueueCap, ready_q empty, never
+         * reaches the threshold needed to bump. */
+        const size_t kQueueCap = 24;
         auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
         if (Av1DecodeEngine_QueueDepth(eng) >= kQueueCap) {
             return MF_E_NOTACCEPTING;
@@ -718,6 +738,16 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
             if (FAILED(hr)) return hr;
         }
         samples_received_++;
+        { char _t[2]; bool _on = GetEnvironmentVariableA("RKMPP_AV1_TRACE", _t, 2) > 0; if (_on) {
+            std::fprintf(stderr,
+                "AV1_TRACE pi#%llu pts=%lld bytes=%zu head=",
+                (unsigned long long)samples_received_,
+                (long long)pts, au.size());
+            for (size_t i = 0; i < au.size() && i < 16; ++i)
+                std::fprintf(stderr, "%02x", au[i]);
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }}
         int rc = Av1DecodeEngine_Submit(eng, au.data(), au.size(),
                                         (int64_t)pts);
         if (rc != 0) decode_errors_++;
@@ -772,6 +802,33 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
     }
     samples_received_++;
 
+    /* Per-input trace for diagnosing duplicated/out-of-order MS source
+     * reader feeds.  Gated by sentinel `mft_trace.flag` (same gate as
+     * the per-emit trace).  Logs sample# / pts / first-byte to let us
+     * identify when MS submits the same packet twice. */
+    {
+        static int trace_state_in = -1;
+        if (trace_state_in < 0) {
+            FILE *probe = nullptr;
+            if (fopen_s(&probe, "mft_trace.flag", "rb") == 0 && probe) {
+                trace_state_in = 1;
+                fclose(probe);
+            } else {
+                trace_state_in = 0;
+            }
+        }
+        if (trace_state_in == 1) {
+            uint8_t hdr0 = au.size() > 4 ? au[4] : 0;
+            uint8_t hdr1 = au.size() > 5 ? au[5] : 0;
+            std::fprintf(stderr,
+                "rkmpp MFT TRACE: input#%llu pts=%lld bytes=%zu "
+                "head=%02x%02x epoch=%u\n",
+                (unsigned long long)samples_received_,
+                (long long)pts, au.size(), hdr0, hdr1, stream_epoch_);
+            std::fflush(stderr);
+        }
+    }
+
     /* Decode immediately and push into the engine's reorder window.
      * ProcessOutput drains ready_q via PollFrame; the legacy input_queue_
      * was a vestige from Phase 2B before reorder existed.  Decode-failure
@@ -787,7 +844,8 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
      * the truth). */
     int rc = DecodeEngine_SubmitFramed(eng, framing, len_size,
                                        au.data(), au.size(),
-                                       (int64_t)pts);
+                                       (int64_t)pts,
+                                       stream_epoch_);
     if (rc != 0) {
         decode_errors_++;
         /* Don't fail the whole pipeline; report success but produce
@@ -809,9 +867,9 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
     if (!input_type_ || !output_type_) return MF_E_TRANSFORM_TYPE_NOT_SET;
     if (buf[0].pSample) return E_FAIL;
 
-    /* AV1 path: software-decoded NV12 from dav1d, packed to a sysmem
-     * IMFMediaBuffer.  No D3D11 / DXGI fast path yet — first goal is
-     * to land a working playable AV1 decode in MF, then optimise. */
+    /* AV1 path: hardware (RKCP3560) or software (dav1d).  Same D3D11 /
+     * 2D-buffer / 1D-buffer selection as the H.264/HEVC path below — the
+     * output is identical NV12 packed width*height*3/2. */
     if (kind_ == CodecKind::AV1) {
         if (!engine_av1_ || engine_init_failed_) {
             buf[0].pSample = nullptr;
@@ -825,31 +883,184 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
             buf[0].pSample = nullptr;
             return MF_E_TRANSFORM_NEED_MORE_INPUT;
         }
-        IMFSample *out_sample = nullptr;
-        IMFMediaBuffer *mbuf = nullptr;
-        HRESULT hr = MFCreateMemoryBuffer((DWORD)frame.yuv.size(), &mbuf);
-        if (SUCCEEDED(hr)) {
-            BYTE *p = nullptr; DWORD max = 0;
-            hr = mbuf->Lock(&p, &max, nullptr);
-            if (SUCCEEDED(hr)) {
-                std::memcpy(p, frame.yuv.data(), frame.yuv.size());
-                mbuf->Unlock();
-                mbuf->SetCurrentLength((DWORD)frame.yuv.size());
+
+        IMFMediaBuffer   *mbuf    = nullptr;
+        ID3D11Texture2D  *texture = nullptr;
+        HRESULT hr = S_OK;
+
+        ID3D11Device *use_d3d = d3d_device_;
+        {
+            static bool logged_av1 = false;
+            if (!logged_av1) {
+                if (use_d3d && width_ && height_)
+                    std::fprintf(stderr, "rkmpp MFT(av1): output mode = D3D11_SURFACE_BUFFER\n");
+                else if (dxgi_manager_)
+                    std::fprintf(stderr, "rkmpp MFT(av1): output mode = 2D_MEDIA_BUFFER\n");
+                else
+                    std::fprintf(stderr, "rkmpp MFT(av1): output mode = SYSMEM_1D_BUFFER\n");
+                std::fflush(stderr);
+                logged_av1 = true;
             }
         }
-        if (SUCCEEDED(hr)) hr = MFCreateSample(&out_sample);
-        if (SUCCEEDED(hr)) hr = out_sample->AddBuffer(mbuf);
-        if (SUCCEEDED(hr)) hr = out_sample->SetSampleTime(frame.pts_hns);
-        if (SUCCEEDED(hr)) hr = out_sample->SetSampleDuration(frame.dur_hns);
-        if (mbuf) mbuf->Release();
+
+        if (use_d3d && width_ && height_) {
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width            = width_;
+            td.Height           = height_;
+            td.MipLevels        = 1;
+            td.ArraySize        = 1;
+            td.Format           = DXGI_FORMAT_NV12;
+            td.SampleDesc.Count = 1;
+            td.Usage            = D3D11_USAGE_DEFAULT;
+            td.BindFlags        = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+            hr = d3d_device_->CreateTexture2D(&td, nullptr, &texture);
+            if (FAILED(hr)) {
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                hr = d3d_device_->CreateTexture2D(&td, nullptr, &texture);
+                if (FAILED(hr)) { Av1DecodeEngine_ReleaseFrame(eng, &frame); return hr; }
+            }
+            const UINT row_pitch = width_;
+            d3d_context_->UpdateSubresource(texture, 0, nullptr,
+                                            frame.yuv.data(),
+                                            row_pitch, row_pitch * height_);
+            d3d_context_->UpdateSubresource(texture, 1, nullptr,
+                                            frame.yuv.data() + (size_t)row_pitch * height_,
+                                            row_pitch, row_pitch * (height_ / 2));
+            hr = MFCreateDXGISurfaceBuffer(IID_ID3D11Texture2D, texture,
+                                           0, FALSE, &mbuf);
+            if (FAILED(hr)) {
+                texture->Release();
+                Av1DecodeEngine_ReleaseFrame(eng, &frame);
+                return hr;
+            }
+            mbuf->SetCurrentLength((DWORD)frame.yuv.size());
+        } else {
+            const DWORD y_bytes    = (DWORD)width_ * height_;
+            const DWORD nv12_bytes = y_bytes + (DWORD)width_ * (height_ / 2u);
+            const bool  use_2d     = (dxgi_manager_ != nullptr);
+            if (use_2d) {
+                hr = MFCreate2DMediaBuffer(width_, height_,
+                                           MAKEFOURCC('N','V','1','2'),
+                                           FALSE, &mbuf);
+                if (FAILED(hr)) { Av1DecodeEngine_ReleaseFrame(eng, &frame); return hr; }
+                IMF2DBuffer *buf2d = nullptr;
+                hr = mbuf->QueryInterface(IID_PPV_ARGS(&buf2d));
+                if (FAILED(hr) || !buf2d) {
+                    mbuf->Release();
+                    Av1DecodeEngine_ReleaseFrame(eng, &frame);
+                    return FAILED(hr) ? hr : E_NOINTERFACE;
+                }
+                BYTE *dst = nullptr; LONG pitch = 0;
+                hr = buf2d->Lock2D(&dst, &pitch);
+                if (FAILED(hr)) {
+                    buf2d->Release(); mbuf->Release();
+                    Av1DecodeEngine_ReleaseFrame(eng, &frame);
+                    return hr;
+                }
+                int64_t cp_t0 = MftTimingEnabled() ? MftQpcNow() : 0;
+                const uint8_t *src_y  = frame.yuv.data();
+                const uint8_t *src_uv = src_y + (size_t)y_bytes;
+                for (UINT32 r = 0; r < height_; r++)
+                    std::memcpy(dst + (size_t)r * pitch, src_y + (size_t)r * width_, width_);
+                BYTE *dst_uv = dst + (size_t)pitch * height_;
+                for (UINT32 r = 0; r < height_ / 2; r++)
+                    std::memcpy(dst_uv + (size_t)r * pitch, src_uv + (size_t)r * width_, width_);
+                if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
+                buf2d->Unlock2D();
+                buf2d->Release();
+                mbuf->SetCurrentLength(nv12_bytes);
+            } else {
+                hr = MFCreateMemoryBuffer(nv12_bytes, &mbuf);
+                if (FAILED(hr)) { Av1DecodeEngine_ReleaseFrame(eng, &frame); return hr; }
+                BYTE *dst = nullptr; DWORD cap = 0, cur = 0;
+                hr = mbuf->Lock(&dst, &cap, &cur);
+                if (FAILED(hr)) {
+                    mbuf->Release();
+                    Av1DecodeEngine_ReleaseFrame(eng, &frame);
+                    return hr;
+                }
+                int64_t cp_t0 = MftTimingEnabled() ? MftQpcNow() : 0;
+                std::memcpy(dst, frame.yuv.data(), nv12_bytes);
+                if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
+                mbuf->Unlock();
+                mbuf->SetCurrentLength(nv12_bytes);
+            }
+        }
+
+        IMFSample *out_sample = nullptr;
+        hr = MFCreateSample(&out_sample);
         if (FAILED(hr)) {
-            if (out_sample) out_sample->Release();
+            mbuf->Release();
+            if (texture) texture->Release();
             Av1DecodeEngine_ReleaseFrame(eng, &frame);
             return hr;
         }
-        buf[0].pSample = out_sample;
+        out_sample->AddBuffer(mbuf);
+        mbuf->Release();
+        if (texture) texture->Release();
+
         Av1DecodeEngine_ReleaseFrame(eng, &frame);
+
+        const uint32_t fpsn = fps_num_ ? fps_num_ : 30;
+        const uint32_t fpsd = fps_den_ ? fps_den_ : 1;
+        /* AV1: ignore engine's hardcoded 30fps frame.dur_hns and derive
+         * duration from the MFT's negotiated MF_MT_FRAME_RATE.  At 24fps
+         * the engine's 333333 hns would leave an 83ms gap before the
+         * next sample's PTS at 416666, which the renderer fills with a
+         * stale buffer — visible as glitches every frame, worst on the
+         * alternating HW/dav1d-output show_existing pattern. */
+        const LONGLONG dur  = (LONGLONG)((10'000'000ULL * fpsd) / fpsn);
+        const LONGLONG pts  = (frame.pts_hns >= 0)
+                            ? (LONGLONG)frame.pts_hns
+                            : (LONGLONG)((uint64_t)frames_emitted_
+                                         * 10'000'000ULL * fpsd / fpsn);
+        out_sample->SetSampleTime(pts);
+        out_sample->SetSampleDuration(dur);
+        out_sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+
+        buf[0].pSample  = out_sample;
+        buf[0].dwStatus = 0;
+        if (status) *status = 0;
         frames_emitted_++;
+        { char _t[2]; bool _on = GetEnvironmentVariableA("RKMPP_AV1_TRACE", _t, 2) > 0; if (_on) {
+            const char *mode = (use_d3d && width_ && height_) ? "D3D11"
+                             : (dxgi_manager_ ? "2D" : "SYSMEM");
+            /* Dense fingerprint over the full frame.yuv.  The earlier
+             * every-4096-byte sample only saw 337 of 1.4M bytes per
+             * 720p frame and missed block-level corruption.  This loop
+             * folds every byte (FNV-1a over the whole buffer). */
+            uint32_t h = 2166136261u;
+            const size_t N = frame.yuv.size();
+            const uint8_t *p = frame.yuv.data();
+            for (size_t i = 0; i < N; i++) {
+                h ^= p[i];
+                h *= 16777619u;
+            }
+            std::fprintf(stderr,
+                "AV1_TRACE po#%llu pts=%lld dur=%lld mode=%s ybytes=%zu y0=%02x ymid=%02x ylast=%02x fnv=%08x\n",
+                (unsigned long long)frames_emitted_,
+                (long long)pts, (long long)dur, mode,
+                N,
+                N ? frame.yuv[0] : 0u,
+                N ? frame.yuv[N/2] : 0u,
+                N ? frame.yuv[N-1] : 0u,
+                h);
+            std::fflush(stderr);
+        }}
+        MaybeLogFrameStats();
+
+        if (MftTimingEnabled()) {
+            static bool hdr_av1 = false;
+            if (!hdr_av1) {
+                std::fprintf(stderr, "MFT_TIMING_AV1,frame,po_total_us,po_copy_us\n");
+                hdr_av1 = true;
+            }
+            std::fprintf(stderr, "MFT_TIMING_AV1,%llu,%lld,%lld\n",
+                         (unsigned long long)frames_emitted_,
+                         (long long)MftQpcUs(mft_t0, MftQpcNow()),
+                         (long long)mft_copy_us);
+            std::fflush(stderr);
+        }
         return S_OK;
     }
 
@@ -871,6 +1082,28 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
     if (got <= 0) {
         buf[0].pSample = nullptr;
         return MF_E_TRANSFORM_NEED_MORE_INPUT;
+    }
+    /* Guard against the engine handing us a frame whose yuv vector was
+     * never populated (any code path that skips the kernel→vector
+     * memcpy).  Memcpy below from an empty/undersized vector would
+     * leave the IMFMediaBuffer's tail uninitialised, and Windows' heap
+     * allocator would hand back a region that recently held a prior
+     * IMFMediaBuffer — visible to EVR as a previous-frame flash.  Skip
+     * emission instead so the worst case is a missed frame, not a
+     * delivered-but-wrong frame. */
+    {
+        const size_t expected = (size_t)width_ * height_ * 3u / 2u;
+        if (frame.yuv.size() != expected) {
+            std::fprintf(stderr,
+                "rkmpp MFT: skipping output — yuv size %zu != expected %zu "
+                "(slot=%d poc=%d pts=%lld)\n",
+                frame.yuv.size(), expected, frame.slot_idx, frame.poc,
+                (long long)frame.pts_hns);
+            std::fflush(stderr);
+            DecodeEngine_ReleaseFrame(eng, &frame);
+            buf[0].pSample = nullptr;
+            return MF_E_TRANSFORM_NEED_MORE_INPUT;
+        }
     }
 
     /* IMFQualityAdvise drop-mode acknowledged but no longer acted on:
@@ -1091,8 +1324,82 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
         pts = (LONGLONG)((uint64_t)frames_emitted_
                          * 10'000'000ULL * fpsd / fpsn);
     }
+
+    /* Primary correctness fix: drop frames whose epoch is older than the
+     * current stream epoch.  Epoch is bumped on FLUSH and tagged onto
+     * every Submit; a stale-epoch frame here means decode work that was
+     * in flight when the host called FLUSH completed after the flush
+     * fired and ended up in ready_q with the OLD timeline's tag.
+     * Forwarding it to EVR causes a "previous frame flash": EVR receives
+     * a sample with a pre-flush pts that's now in the past relative to
+     * the new timeline's clock, and presents it for a single vsync.
+     *
+     * Belt-and-suspenders: if epoch matches but pts moves backward by
+     * more than half a frame, also drop.  This catches genuine
+     * pts-discontinuity bugs that aren't accompanied by a flush. */
+    if (frame.epoch != stream_epoch_) {
+        std::fprintf(stderr,
+            "rkmpp MFT: dropping stale-epoch sample — frame.epoch=%u "
+            "stream_epoch=%u (slot=%d poc=%d pts=%lld) "
+            "[survived FLUSH, would flash EVR]\n",
+            frame.epoch, stream_epoch_, frame.slot_idx, frame.poc,
+            (long long)pts);
+        std::fflush(stderr);
+        out_sample->Release();
+        buf[0].pSample = nullptr;
+        return MF_E_TRANSFORM_NEED_MORE_INPUT;
+    }
+    if (last_emitted_pts_ != INT64_MIN) {
+        const LONGLONG half_frame = dur / 2;
+        if (pts + half_frame < last_emitted_pts_) {
+            std::fprintf(stderr,
+                "rkmpp MFT: dropping pts-backward sample — pts=%lld "
+                "< last=%lld (slot=%d poc=%d) [no flush observed]\n",
+                (long long)pts, (long long)last_emitted_pts_,
+                frame.slot_idx, frame.poc);
+            std::fflush(stderr);
+            out_sample->Release();
+            buf[0].pSample = nullptr;
+            return MF_E_TRANSFORM_NEED_MORE_INPUT;
+        }
+    }
+    last_emitted_pts_ = pts;
+
     out_sample->SetSampleTime(pts);
     out_sample->SetSampleDuration(dur);
+
+    /* Per-frame trace — gated by sentinel `mft_trace.flag` in CWD so it's
+     * off by default but easy to enable for diagnosing visual artefacts
+     * like the random previous-frame-flash on non-B-frame H.264.  Logs
+     * frame index, slot, poc, pts, and a 32-bit hash of the first 4 KiB
+     * of the YUV.  When user reports "flash at second N", correlate
+     * against the log around that time: a repeated hash means we
+     * delivered the same content twice; a fresh hash means EVR/sink
+     * showed a stale buffer despite us delivering a unique one. */
+    {
+        static int trace_state = -1;  /* 0=off 1=on, lazy-init */
+        if (trace_state < 0) {
+            FILE *probe = nullptr;
+            if (fopen_s(&probe, "mft_trace.flag", "rb") == 0 && probe) {
+                trace_state = 1;
+                fclose(probe);
+            } else {
+                trace_state = 0;
+            }
+        }
+        if (trace_state == 1) {
+            uint32_t h = 0x811c9dc5u;
+            const uint8_t *p = frame.yuv.data();
+            const size_t n = std::min<size_t>(frame.yuv.size(), 4096);
+            for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+            std::fprintf(stderr,
+                "rkmpp MFT TRACE: emit#%llu slot=%d poc=%d pts=%lld hash=%08x\n",
+                (unsigned long long)frames_emitted_,
+                frame.slot_idx, frame.poc, (long long)pts, h);
+            std::fflush(stderr);
+        }
+    }
+
     /* Output samples are decoded NV12 — every frame is a valid clean
      * point for downstream renderers, regardless of source GOP
      * structure. EVR uses this attribute to decide where it can begin

@@ -151,7 +151,97 @@ static void parse_scaling_list(BitReader *br, uint8_t *list, int size,
 
 /* ============================================================ SPS */
 
-static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps) {
+/* Parse VUI hrd_parameters (E.1.2) — we don't need any of its fields,
+ * just need to advance past them to reach later VUI fields. */
+static void parse_hrd_parameters(BitReader *br) {
+    uint32_t cpb_cnt_minus1 = br_ue(br);
+    if (cpb_cnt_minus1 > 31) cpb_cnt_minus1 = 31;  /* spec cap */
+    (void)br_u(br, 4);                              /* bit_rate_scale */
+    (void)br_u(br, 4);                              /* cpb_size_scale */
+    for (uint32_t i = 0; i <= cpb_cnt_minus1; i++) {
+        (void)br_ue(br);                            /* bit_rate_value_minus1[i] */
+        (void)br_ue(br);                            /* cpb_size_value_minus1[i] */
+        (void)br_u1(br);                            /* cbr_flag[i] */
+    }
+    (void)br_u(br, 5);                              /* initial_cpb_removal_delay_length_minus1 */
+    (void)br_u(br, 5);                              /* cpb_removal_delay_length_minus1 */
+    (void)br_u(br, 5);                              /* dpb_output_delay_length_minus1 */
+    (void)br_u(br, 5);                              /* time_offset_length */
+}
+
+/* Parse VUI parameters (E.1.1).  We're only after
+ * `bitstream_restriction.max_num_reorder_frames` — everything else is
+ * walked with bit-precise field skips so the bit position lands at the
+ * restriction block correctly.  Output goes to *out_*. */
+static void parse_vui_parameters(BitReader *br,
+                                 uint8_t *out_has_reorder,
+                                 uint8_t *out_max_reorder)
+{
+    *out_has_reorder = 0;
+    *out_max_reorder = 0;
+
+    if (br_u1(br)) {                                /* aspect_ratio_info_present */
+        uint32_t idc = br_u(br, 8);                 /* aspect_ratio_idc */
+        if (idc == 255) {
+            (void)br_u(br, 16);                     /* sar_width */
+            (void)br_u(br, 16);                     /* sar_height */
+        }
+    }
+    if (br_u1(br)) {                                /* overscan_info_present */
+        (void)br_u1(br);                            /* overscan_appropriate_flag */
+    }
+    if (br_u1(br)) {                                /* video_signal_type_present */
+        (void)br_u(br, 3);                          /* video_format */
+        (void)br_u1(br);                            /* video_full_range_flag */
+        if (br_u1(br)) {                            /* colour_description_present */
+            (void)br_u(br, 8);                      /* colour_primaries */
+            (void)br_u(br, 8);                      /* transfer_characteristics */
+            (void)br_u(br, 8);                      /* matrix_coefficients */
+        }
+    }
+    if (br_u1(br)) {                                /* chroma_loc_info_present */
+        (void)br_ue(br);                            /* chroma_sample_loc_type_top_field */
+        (void)br_ue(br);                            /* chroma_sample_loc_type_bottom_field */
+    }
+    if (br_u1(br)) {                                /* timing_info_present */
+        (void)br_u(br, 32);                         /* num_units_in_tick */
+        (void)br_u(br, 32);                         /* time_scale */
+        (void)br_u1(br);                            /* fixed_frame_rate_flag */
+    }
+    int nal_hrd = br_u1(br);                        /* nal_hrd_parameters_present */
+    if (nal_hrd) parse_hrd_parameters(br);
+    int vcl_hrd = br_u1(br);                        /* vcl_hrd_parameters_present */
+    if (vcl_hrd) parse_hrd_parameters(br);
+    if (nal_hrd || vcl_hrd) {
+        (void)br_u1(br);                            /* low_delay_hrd_flag */
+    }
+    (void)br_u1(br);                                /* pic_struct_present_flag */
+    if (br_u1(br)) {                                /* bitstream_restriction_flag */
+        (void)br_u1(br);                            /* motion_vectors_over_pic_boundaries_flag */
+        (void)br_ue(br);                            /* max_bytes_per_pic_denom */
+        (void)br_ue(br);                            /* max_bits_per_mb_denom */
+        (void)br_ue(br);                            /* log2_max_mv_length_horizontal */
+        (void)br_ue(br);                            /* log2_max_mv_length_vertical */
+        uint32_t mr = br_ue(br);                    /* max_num_reorder_frames ← target */
+        (void)br_ue(br);                            /* max_dec_frame_buffering */
+        if (mr > 16) mr = 16;                       /* spec cap is implementation but
+                                                     * 16 is the largest H.264 DPB. */
+        *out_has_reorder = 1;
+        *out_max_reorder = (uint8_t)mr;
+    }
+}
+
+/* parse_sps signature:
+ *   sps                — V4L2 control fields (mandatory)
+ *   out_has_reorder    — set to 1 if VUI bitstream_restriction parsed
+ *   out_max_reorder    — VUI max_num_reorder_frames (when has_reorder=1)
+ *   out_has_reorder/out_max_reorder may be nullptr if caller doesn't need
+ *   the VUI bound (full SPS still parses correctly either way). */
+static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps,
+                                 uint8_t *out_has_reorder = nullptr,
+                                 uint8_t *out_max_reorder = nullptr) {
+    if (out_has_reorder) *out_has_reorder = 0;
+    if (out_max_reorder) *out_max_reorder = 0;
     memset(sps, 0, sizeof(*sps));
     sps->profile_idc          = (uint8_t)br_u(br, 8);
     sps->constraint_set_flags = (uint8_t)br_u(br, 8);
@@ -218,7 +308,26 @@ static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps) 
         if (br_u1(br)) sps->flags |= V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD;
     }
     if (br_u1(br)) sps->flags |= V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE;
-    /* frame_cropping + VUI parsing skipped — not needed by regbuilder. */
+
+    /* frame_cropping_flag — skip the crop-offset values when present.
+     * Cropping doesn't affect regbuilder; we just walk the bits to keep
+     * the bit position aligned for downstream VUI parsing. */
+    if (br_u1(br)) {
+        (void)br_ue(br);                            /* frame_crop_left_offset */
+        (void)br_ue(br);                            /* frame_crop_right_offset */
+        (void)br_ue(br);                            /* frame_crop_top_offset */
+        (void)br_ue(br);                            /* frame_crop_bottom_offset */
+    }
+
+    /* VUI parameters — only field the engine actually needs is
+     * `bitstream_restriction.max_num_reorder_frames`, which is the
+     * proper display-reorder bound used by DecodeEngine_OnDecodeComplete
+     * to size the reorder window.  When the VUI is absent (or doesn't
+     * include bitstream_restriction), the caller falls back to a
+     * conservative bound based on max_num_ref_frames. */
+    if (br_u1(br)) {                                /* vui_parameters_present_flag */
+        parse_vui_parameters(br, out_has_reorder, out_max_reorder);
+    }
 
     return H264_PARSE_OK;
 }
@@ -672,7 +781,9 @@ H264ParseStatus H264ParseAccessUnit(const uint8_t *buf, size_t len,
 
         switch (nal_unit_type) {
         case 7: {
-            H264ParseStatus s = parse_sps(&br, &out->sps);
+            H264ParseStatus s = parse_sps(&br, &out->sps,
+                                          &out->has_sps_vui_reorder,
+                                          &out->sps_vui_max_num_reorder_frames);
             if (s != H264_PARSE_OK) return s;
             out->has_sps = 1;
             break;

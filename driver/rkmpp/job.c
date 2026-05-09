@@ -90,27 +90,42 @@ extern VOID RkMppSetNeedsCoreReset(_In_ WDFDEVICE Device);
 #define RKVDEC2_REG_DEC_E_BIT      0x1u
 
 /* AV1 (vdpu / hal_av1d_vdpu — not vdpu383) MMIO offsets, sourced from
- * BSP mpp_av1dec.c and av1_bringup_table memory:
+ * BSP mpp_av1dec.c, hal_av1d_vdpu_reg.h, and av1_bringup_table memory:
  *   - VCD window starts at MmioBase (no SWREG prefix; offset = idx * 4).
- *   - Kick + IRQ status share offset 0x004 (idx 1).
+ *   - REG0 (offset 0x000) is the IP version/build register — read for
+ *     AXI-drain barrier (probe returned 0x80019000).
+ *   - Kick + IRQ status share offset 0x004 (swreg1 = idx 1).
  *   - err_mask 0x7e000 (bits 13..18: BUS_ERROR | BUF_EMPTY | ASO_ERROR |
  *     STRM_ERROR | SLICE | TIMEOUT).
  *   - PIC_INF (frame done) at BIT(24).
- *   - PERF_WORKING_CNT analog at swreg327 = byte offset 0x518 — used for
- *     the same polled AXI-drain trick as rkvdec2. */
+ *   - PERF_WORKING_CNT lives at swreg263 = byte offset 0x41C (matches
+ *     rkvdec2 family convention; vdpu_av1d shares the IP-family stat
+ *     register layout with vdpu38x). The earlier value 0x518 (swreg326)
+ *     pointed at sw_pp_out_ybase_msb — a static PP base address that
+ *     never changes between reads, so the polled drain saw "stable" on
+ *     its first sample and exited after the 200 µs minimum instead of
+ *     waiting for true codec idle. */
+#define AV1D_REVISION_OFFSET          0x000u
 #define AV1D_REG_KICK_OFFSET          0x004u
 #define AV1D_REG_KICK_BIT             0x1u
 #define AV1D_INT_STATUS_OFFSET        0x004u
-#define AV1D_INT_PIC_INF              (1u << 24)
-#define AV1D_INT_TIMEOUT              (1u << 18)
-#define AV1D_INT_SLICE                (1u << 17)
-#define AV1D_INT_STRM_ERROR           (1u << 16)
-#define AV1D_INT_ASO_ERROR            (1u << 15)
-#define AV1D_INT_BUF_EMPTY            (1u << 14)
+#define AV1D_INT_DEC_IRQ              (1u << 8)
+#define AV1D_INT_DEC_RDY_INT          (1u << 12)
 #define AV1D_INT_BUS_ERROR            (1u << 13)
-#define AV1D_INT_DONE_MASK            (AV1D_INT_PIC_INF | 0x7e000u)
+#define AV1D_INT_BUF_EMPTY            (1u << 14)
+#define AV1D_INT_ASO_ERROR            (1u << 15)
+#define AV1D_INT_STRM_ERROR           (1u << 16)
+#define AV1D_INT_SLICE                (1u << 17)
+#define AV1D_INT_TIMEOUT              (1u << 18)
+/* Done = clean RDY (bit 12) OR any error/timeout bit (13..18).  Earlier
+ * mask used bit 24 (PIC_INF) but that's a vdpu383 (newer-IP) signal;
+ * vdpu (RK3588 av1d) reserves bits 24+.  With the old mask, kicks that
+ * completed cleanly with hwstatus=0x1100 (dec_irq + dec_rdy_int) made
+ * the poller time out instead of completing — we observed this in the
+ * 2026-05-05 test on av1_720p.ivf. */
+#define AV1D_INT_DONE_MASK            (AV1D_INT_DEC_RDY_INT | 0x7e000u)
 #define AV1D_INT_ERROR_MASK           (0x7e000u)
-#define AV1D_PERF_WORKING_CNT_OFFSET  0x518u
+#define AV1D_PERF_WORKING_CNT_OFFSET  0x41Cu
 
 /* Per-codec MMIO geometry table.  Job.c's hot path reads from this
  * struct so the kick / poll / drain code stays codec-agnostic. */
@@ -127,6 +142,13 @@ typedef struct _RKMPP_CODEC_OPS {
     ULONG IntErrorMask;
     /* PERF_WORKING_CNT register offset for polled AXI drain. */
     ULONG PerfWorkingCntOffset;
+    /* REVISION/version register — side-effect-free read used to force
+     * AXI drain after DEC_RDY. For rkvdec2 this is SWREG[1] within the
+     * 0x100-prefixed window (= 0x104). For AV1 the IP version lives at
+     * REG0 (offset 0x000). Reading the wrong offset (e.g., the kick
+     * register) doesn't provide AXI ordering and lets stale codec writes
+     * remain in NoC buffers when WAIT_JOB returns. */
+    ULONG RevisionOffset;
     /* Kick (dec_e) register offset and bit. */
     ULONG KickRegOffset;
     ULONG KickRegBit;
@@ -138,6 +160,7 @@ static const RKMPP_CODEC_OPS g_ops_rkvdec2 = {
     .IntDoneMask           = RKVDEC2_INT_DONE_MASK,
     .IntErrorMask          = RKVDEC2_INT_ERROR_MASK,
     .PerfWorkingCntOffset  = RKVDEC2_SWREG_BASE + 0x41c,
+    .RevisionOffset        = RKVDEC2_SWREG_BASE + 0x004,
     .KickRegOffset         = RKVDEC2_REG_DEC_E_OFFSET,
     .KickRegBit            = RKVDEC2_REG_DEC_E_BIT,
 };
@@ -148,6 +171,7 @@ static const RKMPP_CODEC_OPS g_ops_av1d = {
     .IntDoneMask           = AV1D_INT_DONE_MASK,
     .IntErrorMask          = AV1D_INT_ERROR_MASK,
     .PerfWorkingCntOffset  = AV1D_PERF_WORKING_CNT_OFFSET,
+    .RevisionOffset        = AV1D_REVISION_OFFSET,
     .KickRegOffset         = AV1D_REG_KICK_OFFSET,
     .KickRegBit            = AV1D_REG_KICK_BIT,
 };
@@ -174,6 +198,9 @@ extern PRKMPP_JOB_QUEUE    RkMppGetJobQueue(_In_ WDFDEVICE Device);
 extern PRKMPP_CCU_INTERFACE RkMppGetCcuIfc(_In_ WDFDEVICE Device);
 extern PVOID               RkMppGetMmioBase(_In_ WDFDEVICE Device);
 extern ULONG               RkMppGetMmioLength(_In_ WDFDEVICE Device);
+extern PVOID               RkMppGetMmioWindow(_In_ WDFDEVICE Device,
+                                              _In_ UINT32 Index,
+                                              _Out_opt_ PULONG Length);
 
 /* -----------------------------------------------------------------------
  * Queue initialisation
@@ -189,6 +216,10 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     Queue->NextId   = 0;
     Queue->Device   = Device;
     Queue->Interrupt = NULL;
+    RtlZeroMemory(Queue->Av1PrevNonzeroMask,
+                  sizeof(Queue->Av1PrevNonzeroMask));
+    RtlZeroMemory(Queue->Rkvdec2PrevNonzeroMask,
+                  sizeof(Queue->Rkvdec2PrevNonzeroMask));
 
     /* Auto-reset kick: each Set wakes the poller exactly once. */
     KeInitializeEvent(&Queue->KickEvent, SynchronizationEvent, FALSE);
@@ -443,23 +474,41 @@ have_status:
              * upper bound for any NoC-side buffering not covered by
              * the AXI ordering rule. */
             volatile ULONG drain = READ_REGISTER_ULONG(
-                (volatile ULONG *)((PUCHAR)mmio + ops->SwregBase + 0x004));
+                (volatile ULONG *)((PUCHAR)mmio + ops->RevisionOffset));
             UNREFERENCED_PARAMETER(drain);
             /* AXI write-tail drain via polled idle indicator.  The
              * codec's PERF_WORKING_CNT (offset 0x41c, BSP
              * RKVDEC_PERF_WORKING_CNT) increments every cycle the codec
              * is processing.  Once DEC_RDY is asserted AND the counter
-             * stops changing for a couple consecutive reads, the codec
-             * is fully drained — internal pipeline finished, AXI write
-             * FIFO empty.  Replaces a fixed 1500 µs stall that
-             * over-waited at 720p/1080p and slightly under-waited at
-             * 4K (causing "very slight tearing").
+             * stops changing for several consecutive reads, the codec's
+             * processing engine is idle — but the AXI write channel may
+             * still be retiring buffered pixel writes through the NoC
+             * to DRAM.
              *
-             * Bounds: minimum 200 µs (covers the basic AXI BVALID
-             * round-trip even on the smallest frames), maximum 5000 µs
-             * (worst-case 4K frame with complex post-processing).
-             * Step 100 µs per poll, require 2 consecutive equal reads
-             * to declare done. */
+             * BSP Linux gets away with no explicit drain because the
+             * dma_buf_begin_cpu_access path (cache invalidate + memory
+             * barrier) takes long enough naturally; our Windows IOCTL
+             * → user-mode read path is much tighter and races the
+             * codec's tail-end writes.  Manifests in mft_play (fast
+             * pacing, no inter-kick delay) as non-deterministic
+             * macroblock corruption starting once back-to-back kicks
+             * stack up; mft_decode (slow PNG dump per frame) doesn't
+             * hit it.
+             *
+             * Bounds: minimum 200 µs (covers basic AXI BVALID round-
+             * trip), maximum 10000 µs (4K worst case with chains of
+             * alt-refs).  Step 100 µs per poll.  Require 5 consecutive
+             * equal reads (= 500 µs of unchanged counter) before
+             * declaring the engine idle — earlier `>= 2` saw a 100 µs
+             * gap between NoC bursts as "stable" and exited too soon.
+             *
+             * After PERF_WORKING_CNT settles, an unconditional 1500 µs
+             * settle gives the AXI write channel time to retire the
+             * codec's last pixel writes through the NoC to DRAM.  This
+             * mirrors the original fixed 1500 µs stall (replaced in
+             * 2026-05-04 when the polled drain went in) — restored as
+             * a belt-and-suspenders since PERF_WORKING_CNT alone tracks
+             * codec engine state, not the data fabric. */
             {
                 volatile ULONG *perf_cnt =
                     (volatile ULONG *)((PUCHAR)mmio + ops->PerfWorkingCntOffset);
@@ -467,17 +516,21 @@ have_status:
                 ULONG prev = READ_REGISTER_ULONG(perf_cnt);
                 ULONG stable = 0;
                 ULONG total_us = 200;
-                while (total_us < 5000) {
+                while (total_us < 10000) {
                     KeStallExecutionProcessor(100);
                     total_us += 100;
                     ULONG cur = READ_REGISTER_ULONG(perf_cnt);
                     if (cur == prev) {
-                        if (++stable >= 2) break;
+                        if (++stable >= 5) break;
                     } else {
                         stable = 0;
                         prev = cur;
                     }
                 }
+                /* Unconditional final settle for the AXI/NoC write
+                 * channel.  Cost: 1.5 ms × 30 fps = 45 ms/sec extra
+                 * wait, well within frame budget. */
+                KeStallExecutionProcessor(1500);
             }
         }
 
@@ -554,6 +607,27 @@ have_status:
                                snap.PageFaultAddr, snap.DteAddr,
                                snap.Status1, snap.IntRawStat1, snap.IntStatus1,
                                snap.PageFaultAddr1, snap.DteAddr1);
+                }
+            }
+        }
+
+        /* AV1 error path: dump INT status + IOMMU snapshot when any
+         * error/timeout bit is set.  Mirrors the rkvdec2 stalled-kick
+         * dump above; only fires on real failures, not per-kick. */
+        if (ops == &g_ops_av1d &&
+            (hwStatus & AV1D_INT_ERROR_MASK)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkmpp(av1d): poller INT=0x%08x result=0x%08x\n",
+                       hwStatus, result);
+            PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(q->Device);
+            if (iommu && iommu->Snapshot) {
+                RKIOMMU_FAULT_SNAPSHOT snap = {0};
+                if (NT_SUCCESS(iommu->Snapshot(iommu->Header.Context, &snap))) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "  av1d-iommu STATUS=0x%08x INT_RAWSTAT=0x%08x "
+                               "INT_STATUS=0x%08x FAULT_ADDR=0x%08x PTA=0x%08x\n",
+                               snap.Status, snap.IntRawStat, snap.IntStatus,
+                               snap.PageFaultAddr, snap.DteAddr);
                 }
             }
         }
@@ -700,6 +774,22 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
             ccu->AssertCoreReset(ccu->Header.Context);
             ccu->DeassertCoreReset(ccu->Header.Context);
         }
+        /* Codec regs are now back to power-on zero — drop the prev-mask
+         * so the next kick re-writes every nonzero reg (the skip logic
+         * relies on the mask reflecting what's currently in HW). */
+        RtlZeroMemory(q->Rkvdec2PrevNonzeroMask,
+                      sizeof(q->Rkvdec2PrevNonzeroMask));
+    } else if (ops == &g_ops_av1d && RkMppQueryAndClearNeedsCoreReset(Device)) {
+        /* AV1 has no hardware-reset wiring yet (TODO: AV1 hang recovery).
+         * But after a kick error the codec's reg state is unknown — we
+         * may have observed an IOMMU fault, AXI bus error, or partial
+         * decode that left some regs in an unexpected state.  Drop the
+         * prev-mask so the next kick rewrites every reg from scratch,
+         * eliminating any reliance on stale HW state.  Also covers the
+         * case where an external power-cycle (suspend/resume, RaiseCluster
+         * after PD power-gate) zeroed regs without us knowing. */
+        RtlZeroMemory(q->Av1PrevNonzeroMask,
+                      sizeof(q->Av1PrevNonzeroMask));
     }
 
     /* Clear any stale latched status bits before the kick. */
@@ -754,12 +844,89 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         TRACED_WRITE_ULONG(CACHE_OFF(0x590), 1);
 #undef CACHE_OFF
     }
-    /* AV1 internal CACHE/AFBC config is kernel-driven from task params per
-     * BSP `av1dec_set_l2_cache` / `av1dec_set_afbc`.  Userspace only sees
-     * the VCD class — the kernel writes the CACHE+AFBC windows directly.
-     * For first-decode bring-up we leave them in their reset state and
-     * pull the geometry-derived values in once we have hardware kicks
-     * landing.  TODO: port the BSP set_l2_cache / set_afbc helpers. */
+    /* AV1 L2 cache config (CACHE window @ Mmios[1]).  Port of BSP
+     * av1dec_set_l2_cache from mpp_av1dec.c.  Required for the codec's
+     * PP output path to function — without it, the codec hits AXI bus
+     * errors mid-decode (dec_bus_int with no IOMMU fault).
+     *
+     * For NV12 output (sw_pp_out_tile_size != AV1_PP_TILE_16X16):
+     * configure PP0_Y and PP0_U cache channels with the output buffer
+     * iovas + line geometry, mask cache IRQ, enable shaper, enable
+     * cache.  AFBC config (Mmios[2]) is a no-op for NV12 — the AFBC
+     * sub-block stays in reset state.
+     *
+     * Geometry derived from the regbuilder's output already substituted
+     * into job->Writes (iovas in reg326/328, dims in reg4, pp_in_format
+     * in reg322 bits 27-31).  We need the SUBSTITUTED iovas not the FDs
+     * that the regbuilder originally wrote — hence reading from
+     * job->Writes (post-substitution) rather than recomputing. */
+    if (ops == &g_ops_av1d) {
+        /* Pull post-substitution values for relevant regs from job->Writes. */
+        ULONG reg4 = 0, reg10 = 0, reg321 = 0, reg322 = 0;
+        ULONG reg326 = 0, reg328 = 0;
+        BOOLEAN haveOut = FALSE;
+        for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
+            ULONG idx = Job->Writes[i].Offset / 4;
+            ULONG val = Job->Writes[i].Value;
+            if      (idx == 4)   reg4   = val;
+            else if (idx == 10)  reg10  = val;
+            else if (idx == 321) reg321 = val;
+            else if (idx == 322) reg322 = val;
+            else if (idx == 326) { reg326 = val; haveOut = TRUE; }
+            else if (idx == 328) reg328 = val;
+        }
+
+        ULONG cacheLen = 0;
+        PVOID cacheBase = RkMppGetMmioWindow(Device, 1, &cacheLen);
+        const ULONG AV1_PP_TILE_SIZE   = (3u << 9);  /* GENMASK(10,9) */
+        const ULONG AV1_PP_TILE_16X16  = (1u << 10);
+        BOOLEAN tile16 = ((reg321 & AV1_PP_TILE_SIZE) == AV1_PP_TILE_16X16);
+
+        if (cacheBase && cacheLen >= 0x300 && haveOut && !tile16) {
+            const ULONG width  = (reg4 >> 19) * 8;
+            const ULONG height = ((reg4 >> 6) & 0x1fff) * 8;
+            const ULONG pp_in_format = (reg322 >> 27) & 0x1F;
+            const ULONG pixel_width  = (pp_in_format == 1) ? 8 : 16;
+            const ULONG pre_fetch_height = 136;
+
+            /* MPP_ALIGN(MPP_ALIGN(width * pixel_width, 8) / 8, 16) */
+            ULONG line_size = ((width * pixel_width + 7) & ~7u) / 8;
+            line_size = (line_size + 15) & ~15u;
+            const ULONG line_stride = line_size >> 4;
+
+#define CACHE_W(off, val) \
+    WRITE_REGISTER_ULONG((volatile ULONG*)((PUCHAR)cacheBase + (off)), (val))
+            /* TEST: keep cache disabled for all kicks to confirm whether the
+             * L2 write cache is causing alternating-frame corruption.
+             * PP writes bypass the cache and go directly to DRAM.
+             * If all frames decode correctly without the cache, the root cause
+             * is in the cache enable/disable/flush sequencing.
+             * TODO: re-enable once correct flush sequence is identified. */
+            CACHE_W(0x204, 0x00000000);
+            /* PP0_Y channel */
+            CACHE_W(0x84, reg326 + 1);                                 /* CONFIG0 */
+            CACHE_W(0x8c, line_size | (line_stride << 16));            /* CONFIG2 */
+            CACHE_W(0x90, height    | (pre_fetch_height << 16));       /* CONFIG3 */
+            /* PP0_U channel (chroma half height) */
+            CACHE_W(0x98, reg328 + 1);
+            CACHE_W(0xa0, line_size | (line_stride << 16));
+            CACHE_W(0xa4, (height >> 1) | ((pre_fetch_height >> 1) << 16));
+            /* Mask cache IRQ */
+            CACHE_W(0x30, 0xf);
+            /* Shaper enable */
+            CACHE_W(0x20, 0x1);
+            /* Single-tile: enable cache for all reads (reg10 bit 1 == 0) */
+            if (!(reg10 & (1u << 1))) {
+                CACHE_W(0x208, 0x00000001);
+            }
+            /* DISABLED: do not write 0x81 (reorder_e | cache_e) — L2 cache
+             * disabled for all kicks while diagnosing alternating-frame
+             * corruption.  Without the enable, PP writes go directly to DRAM
+             * bypassing the cache write-combining path entirely. */
+            /* CACHE_W(0x204, 0x00000081); */
+#undef CACHE_W
+        }
+    }
 
     /* Validate every (shifted) offset is in-range BEFORE issuing any MMIO
      * write, so we can reject malformed register lists without leaving
@@ -812,6 +979,7 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         };
         ULONG bank_vals[6][80] = {0};
         BOOLEAN bank_seen[6][80] = {0};
+        ULONG cur_nonzero[16] = {0};   /* bitmap of regs nonzero this kick */
 
         for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
             const RKMPP_REG_WRITE *w = &Job->Writes[i];
@@ -822,20 +990,33 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                     ULONG pos = idx - bank_ranges[b].first;
                     bank_vals[b][pos] = w->Value;
                     bank_seen[b][pos] = TRUE;
+                    if (w->Value != 0)
+                        cur_nonzero[idx >> 5] |= (1u << (idx & 31));
                     break;
                 }
             }
         }
+        /* Skip MMIO writes for regs that were zero last kick AND are
+         * zero this kick — same optimization as the AV1 path.  Cuts
+         * the rkvdec2 bank-walk from ~155 writes down to ~80. */
+        const ULONG *prev = q->Rkvdec2PrevNonzeroMask;
         for (int b = 0; b < 6; b++) {
             ULONG count = bank_ranges[b].last - bank_ranges[b].first + 1;
             for (ULONG p = 0; p < count; p++) {
                 ULONG idx = bank_ranges[b].first + p;
                 if (idx == 10) continue;
+                const ULONG bit = 1u << (idx & 31);
+                const BOOLEAN was_nz = (prev[idx >> 5] & bit) != 0;
+                const BOOLEAN is_nz  = (cur_nonzero[idx >> 5] & bit) != 0;
+                if (!was_nz && !is_nz) continue;
                 TRACED_WRITE_ULONG(
                     ((PUCHAR)mmio + idx * 4 + RKVDEC2_SWREG_BASE),
                     bank_vals[b][p]);
             }
         }
+        /* Snapshot for next kick. */
+        for (int i = 0; i < 16; i++)
+            q->Rkvdec2PrevNonzeroMask[i] = cur_nonzero[i];
         /* Now the kick (idx 10) — written last, separately. */
         for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
             const RKMPP_REG_WRITE *w = &Job->Writes[i];
@@ -852,22 +1033,44 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
          * (per av1_bringup_table memory: reg_start=1, reg_end=319, en at
          * VCD+0x004 which IS idx 1).  Build a flat 320-entry shadow,
          * write in ascending order, skip the kick reg, then write kick
-         * last.  No SWREG prefix — offset = idx*4 directly. */
+         * last.  Now extended through 511 — the PP cfg block lives at
+         * swreg320..511 (byte 0x500..0x7FC) inside the same VCD window
+         * (Mmios[0], length 0x800).  Without these writes the PP module
+         * stays idle: VCD decodes correctly to tile_out_internal, but
+         * the user-visible NV12 output buffer (pool_output) gets nothing
+         * — codec returns hwstatus=success-clean but content is zeros.
+         * No SWREG prefix — offset = idx*4 directly. */
         ULONG av1_vals[512] = {0};
         BOOLEAN av1_seen[512] = {0};
+        ULONG cur_nonzero[16] = {0};   /* bitmap of regs nonzero this kick */
         for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
             const RKMPP_REG_WRITE *w = &Job->Writes[i];
             ULONG idx = w->Offset / 4;
             if (idx >= 512) continue;
             av1_vals[idx] = w->Value;
             av1_seen[idx] = TRUE;
+            if (w->Value != 0)
+                cur_nonzero[idx >> 5] |= (1u << (idx & 31));
         }
         const ULONG kick_idx = ops->KickRegOffset / 4;   /* 1 */
-        for (ULONG idx = 1; idx < 320; idx++) {
+        /* Skip MMIO writes for regs that were zero last kick AND are zero
+         * this kick — hardware retains their (zero) value, so writing zero
+         * again is wasted bus work.  Regs that flipped nonzero→zero must
+         * still be cleared.  Cuts per-kick MMIO from 511 writes down to
+         * roughly the count of active regs (~80 typical) plus a few
+         * "clear" writes for regs going inactive. */
+        const ULONG *prev = q->Av1PrevNonzeroMask;
+        for (ULONG idx = 1; idx < 512; idx++) {
             if (idx == kick_idx) continue;
-            if (!av1_seen[idx]) continue;  /* leave unset slots untouched */
+            const ULONG bit = 1u << (idx & 31);
+            const BOOLEAN was_nz = (prev[idx >> 5] & bit) != 0;
+            const BOOLEAN is_nz  = (cur_nonzero[idx >> 5] & bit) != 0;
+            if (!was_nz && !is_nz) continue;  /* zero→zero: skip */
             TRACED_WRITE_ULONG(((PUCHAR)mmio + idx * 4), av1_vals[idx]);
         }
+        /* Snapshot for next kick. */
+        for (int i = 0; i < 16; i++)
+            q->Av1PrevNonzeroMask[i] = cur_nonzero[i];
         /* Kick last. */
         if (av1_seen[kick_idx]) {
             TRACED_WRITE_ULONG(((PUCHAR)mmio + ops->KickRegOffset),
@@ -942,17 +1145,35 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
         }
     }
 
-    /* Cache invalidate the OUTPUT FRAME only — that's the single buffer
-     * the codec wrote this kick that the CPU will read next.  Refs are
-     * codec-read-only and their cache lines were invalidated back when
-     * they were the output of an earlier kick; redoing them is wasted
-     * work, dominating per-frame cache cost at 1440p+ where it added
-     * ~1-2 ms of kernel time.  `ReadOperation=FALSE` → `dc ivac`. */
+    /* Cache invalidate DMA-output buffers the CPU will read after this kick.
+     * Per MS docs, `ReadOperation=TRUE` means data flow is device→memory,
+     * which on ARM64 emits the invalidate (`dc ivac`) needed to drop stale
+     * CPU cache lines so the next CPU read reloads from DRAM.  An earlier
+     * comment here had the boolean flipped — claiming FALSE invalidates —
+     * which would explain the AV1 mft_play non-determinism: clean (FALSE)
+     * leaves stale prefetched lines resident, and whether they survive to
+     * the next user-mode read depends on cache pressure (mft_decode's PNG
+     * write evicts them; mft_play's tight loop doesn't).
+     *
+     * OutputFrameMdl    — pool_output NV12 (all codecs use MmCached).
+     * InternalOutputMdl — AV1 pool_internal codec-tiled: user-mode dump
+     *                     path (RKMPP_AV1_DUMP_DIR) reads it for diffing
+     *                     against BSP captures.
+     * AuxOutputMdl      — prob_tbl_out: user mode reads for CDF snapshot.
+     *   InternalOutputMdl/AuxOutputMdl written by VCD, fully committed before
+     *   the PERF_WORKING_CNT drain exits. */
     if (job->OutputFrameMdl) {
         KeFlushIoBuffers(job->OutputFrameMdl,
-                         /*ReadOperation*/ FALSE, /*DmaOperation*/ TRUE);
+                         /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
     }
-
+    if (job->InternalOutputMdl) {
+        KeFlushIoBuffers(job->InternalOutputMdl,
+                         /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
+    }
+    if (job->AuxOutputMdl) {
+        KeFlushIoBuffers(job->AuxOutputMdl,
+                         /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
+    }
     /* Move from InFlight to Completed. */
     q->InFlight = NULL;
     InsertTailList(&q->Completed, &job->Link);
@@ -1081,11 +1302,41 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
             mdl == NULL) {
             continue;
         }
-        if (src->Offset == 0x208u) {
+        /* Cache-maintenance MDL classification.  Two camps:
+         *
+         *   Output  — codec writes, CPU reads post-decode.  Need to
+         *             invalidate user-mode-cached lines after kick.
+         *   Input   — CPU writes (memcpy from user / regbuilder),
+         *             codec reads.  Need to clean (push) cached lines
+         *             before kick so codec's DMA sees fresh data.
+         *
+         * rkvdec2 offsets: output reg130 = 0x208; inputs reg128/129/
+         * 161/163/180 = 0x200/0x204/0x284/0x28C/0x2D0.
+         *
+         * AV1 offsets: codec writes user-visible NV12 to PP output regs
+         * 326/328 = 0x518/0x520 (and reg65/99/133 internal scratch);
+         * inputs are reg167 tile_info=0x29C, reg169 bitstream=0x2A4,
+         * reg173 prob_tbl=0x2B4, reg83 global_model=0x14C.
+         *
+         * Without this gating, AV1 user-mode writes sit in CPU cache
+         * (MmCached user mapping) and never reach DRAM before kick;
+         * codec reads zeros for tile_info / OBU / CDFs → timeouts. */
+        if (src->Offset == 0x208u ||      /* rkvdec2 output      */
+            src->Offset == 0x518u ||      /* AV1 PP output luma  */
+            src->Offset == 0x520u) {      /* AV1 PP output chroma */
             if (job->OutputFrameMdl == NULL) job->OutputFrameMdl = mdl;
+        } else if (src->Offset == 0x104u) {  /* AV1 reg65 = pool_internal Y */
+            if (job->InternalOutputMdl == NULL) job->InternalOutputMdl = mdl;
+        } else if (src->Offset == 0x2ACu) {  /* AV1 reg171 = prob_tbl_out */
+            if (job->AuxOutputMdl == NULL) job->AuxOutputMdl = mdl;
         } else if (src->Offset == 0x200u || src->Offset == 0x204u ||
                    src->Offset == 0x284u || src->Offset == 0x28Cu ||
-                   src->Offset == 0x2D0u) {
+                   src->Offset == 0x2D0u ||
+                   /* AV1 CPU-written inputs */
+                   src->Offset == 0x29Cu ||  /* reg167 tile_info */
+                   src->Offset == 0x2A4u ||  /* reg169 bitstream */
+                   src->Offset == 0x2B4u ||  /* reg173 prob_tbl  */
+                   src->Offset == 0x14Cu) {  /* reg83  global_model */
             BOOLEAN already = FALSE;
             for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
                 if (job->CleanMdls[k] == mdl) { already = TRUE; break; }

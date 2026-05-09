@@ -74,6 +74,20 @@ typedef struct H264ParseResult {
     uint8_t has_pred_weights;
     uint8_t has_slice;
 
+    /* VUI bitstream-restriction `max_num_reorder_frames` (spec E.2.1).
+     * The proper display-reorder bound — number of pictures that can
+     * be ordered before a frame that follows them in decode order
+     * appears in display order.  Tighter than `sps.max_num_ref_frames`
+     * (which over-approximates by including all refs, not just refs
+     * that affect display reorder).
+     *
+     * Valid only when `has_sps_vui_reorder` is set.  When unset (no
+     * VUI / no bitstream_restriction in VUI), callers should fall
+     * back to a conservative bound.  See decode_engine.cpp's
+     * resolve_max_reorder() for the H.264 path. */
+    uint8_t  has_sps_vui_reorder;
+    uint8_t  sps_vui_max_num_reorder_frames;
+
     /* Slice data (post emulation-prevention unescape, RBSP form, after
      * the slice header).  Pointer is into a caller-owned scratch buffer
      * supplied via H264ParseAccessUnit; valid until the next parse. */

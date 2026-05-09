@@ -149,6 +149,26 @@ private:
      * actually getting filtered out. */
     uint64_t    frames_skipped_dropmode_ = 0;
 
+    /* Last pts we delivered to the consumer.  Used in ProcessOutput to
+     * detect "rogue" out-of-order samples (pts moves backward without
+     * a FLUSH having reset state) — we drop those rather than emit them
+     * to EVR, which would otherwise present each backward-pts frame for
+     * a single tick (the canonical "previous frame flash" symptom on
+     * MP4 looping / mid-stream seek). INT64_MIN until first emit; reset
+     * on FLUSH so a legitimate seek/loop doesn't get penalised.  This
+     * is the safety-belt; the primary correctness fix is `stream_epoch_`
+     * (below). */
+    int64_t     last_emitted_pts_ = INT64_MIN;
+    /* Stream-epoch counter — incremented on every FLUSH (and any other
+     * timeline reset).  Tagged onto every Submit; the engine forwards
+     * the tag to ReorderEntry → DecodedFrame.  ProcessOutput drops any
+     * frame whose epoch is older than `stream_epoch_`, so decode results
+     * that survived a flush (because they were already in flight when
+     * FLUSH fired) get rejected rather than presented on the new
+     * timeline.  This is what catches the genuine race; the pts-monotonic
+     * guard is a secondary belt-and-suspenders. */
+    uint32_t    stream_epoch_ = 0;
+
     bool        streaming_     = false;
     bool        draining_      = false;
     /* IMFQualityAdvise drop mode — set by EVR's quality manager when we

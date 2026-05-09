@@ -66,6 +66,17 @@ struct BitPacker {
         memset(buf, 0, words * sizeof(uint64_t));
     }
 
+    /* Advance the bit cursor by `nbits` without writing anything.
+     * Caller must guarantee the underlying buffer was zero-initialized
+     * (init() does that), so skipping the writes leaves zeros in place. */
+    void skip(int nbits) {
+        if (nbits == 0) return;
+        size_t total = word_idx * 64 + (size_t)bit_in_word + (size_t)nbits;
+        word_idx    = total / 64;
+        bit_in_word = (int)(total & 63);
+        if (word_idx > cap_u64) word_idx = cap_u64;
+    }
+
     void put(uint64_t value, int nbits) {
         if (nbits == 0) return;
         uint64_t mask = (nbits == 64) ? ~0ULL : ((1ULL << nbits) - 1);
@@ -367,18 +378,22 @@ int H265PackRPS(const H265ParseResult *parsed, uint8_t *out, size_t out_size)
             sps = &parsed->sps[parsed->active_sps_id];
     }
 
-    /* ---- 32 LT entries (BSP loops i=0..31 unconditionally) ----------- */
-    for (int i = 0; i < 32; i++) {
-        uint16_t poc_lsb = 0;
-        uint8_t  used = 0;
-        if (sps && sps->long_term_ref_pics_present_flag &&
-            i < sps->num_long_term_ref_pics_sps) {
-            poc_lsb = sps->lt_ref_pic_poc_lsb_sps[i];
-            used    = sps->used_by_curr_pic_lt_sps_flag[i];
+    /* ---- 32 LT entries (BSP loops i=0..31 unconditionally) -----------
+     * 32 bits per entry; buffer is pre-zeroed.  When LT refs aren't
+     * present at all (the common case) skip the whole 1024-bit block. */
+    if (sps && sps->long_term_ref_pics_present_flag &&
+        sps->num_long_term_ref_pics_sps > 0) {
+        for (int i = 0; i < 32; i++) {
+            if (i < sps->num_long_term_ref_pics_sps) {
+                bp.put(sps->lt_ref_pic_poc_lsb_sps[i],   16);
+                bp.put(sps->used_by_curr_pic_lt_sps_flag[i], 1);
+                bp.skip(15);
+            } else {
+                bp.skip(32);
+            }
         }
-        bp.put(poc_lsb, 16);
-        bp.put(used, 1);
-        bp.put(0, 15);
+    } else {
+        bp.skip(32 * 32);
     }
 
     /* ---- 64 STRPS slots --------------------------------------------- */
@@ -415,16 +430,13 @@ int H265PackRPS(const H265ParseResult *parsed, uint8_t *out, size_t out_size)
                 bp.put(0, 1);
             }
         } else {
-            /* Empty slot: still 4+4 + 15*17 = 263 bits of zero. */
-            bp.put(0, 4);
-            bp.put(0, 4);
-            for (int j = 0; j < 15; j++) {
-                bp.put(0, 16);
-                bp.put(0, 1);
-            }
+            /* Empty slot: 4+4 + 15*17 = 263 bits all zero.  Buffer is
+             * pre-zeroed by init(), so just advance the cursor. */
+            bp.skip(263);
         }
         bp.align(64, /*fill=*/0);
-        bp.put(0, 64);
+        /* 64-bit zero trailer — also a skip since buffer is pre-zeroed. */
+        bp.skip(64);
     }
 
     memcpy(out, buf, RKH265_RPS_SIZE);

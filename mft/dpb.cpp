@@ -301,7 +301,10 @@ static void evict_oldest_short_term(DpbCtx *ctx) {
             oldest_fnw  = fnw;
         }
     }
-    if (oldest >= 0) slot_clear(ctx, oldest);
+    if (oldest >= 0) {
+        ctx->last_bumped_poc = ctx->slots[oldest].top_poc;
+        slot_clear(ctx, oldest);
+    }
 }
 
 } /* anon */
@@ -699,7 +702,9 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
 extern "C"
 void Dpb_OnDecodeComplete(DpbCtx *ctx)
 {
-    if (!ctx || ctx->current_idx < 0) return;
+    if (!ctx) return;
+    ctx->last_bumped_poc = INT32_MIN;
+    if (ctx->current_idx < 0) return;
 
     int cur = ctx->current_idx;
     ctx->current_idx = -1;

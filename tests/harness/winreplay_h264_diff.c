@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <glob.h>
 
 #include "winshim.h"
 #include "mft/parser_glue.h"
@@ -25,7 +26,7 @@
 
 /* ---- Shim-log parser (identical layout to HEVC harness) ---------- */
 #define MAX_SUBMSGS_PER_AU 16
-#define MAX_AUS            64
+#define MAX_AUS            256
 
 typedef struct ShimSubMsg {
     uint32_t cmd, flags, size, offset, words;
@@ -248,14 +249,105 @@ static void splat_bank(const H264RegWriteList *rl,
     }
 }
 
+/* cmd=0x202 sub payload is a list of (reg_index, byte_offset) u32 pairs.
+ * The kernel uses these to substitute IOVAs into the register file: reg
+ * `reg_index` (in u32 indices, e.g. 0xa3 = reg163) gets its base set to
+ * (fd_iova + byte_offset) at decode time.
+ *
+ * For the H.264 fd9 buffer:
+ *   reg 0xa1 (RKVDEC2_REG_PPS_BASE) -> pps_table
+ *   reg 0xa3 (RKVDEC2_REG_RPS_BASE) -> rps_table
+ *
+ * Walk every 0x202 sub's payload pairs and return the byte_offset belonging
+ * to `target_reg_byte` (e.g. RKVDEC2_REG_RPS_BASE).  Sub index goes out via
+ * *out_sub_idx for diagnostics; UINT32_MAX on miss. */
+static uint32_t find_dma_offset_for_reg(const ShimAU *shim_au,
+                                        uint32_t target_reg_byte,
+                                        int *out_sub_idx)
+{
+    uint32_t target_reg_u32 = target_reg_byte / 4;
+    for (int s = 0; s < shim_au->n_subs; s++) {
+        if (shim_au->subs[s].cmd != 0x202) continue;
+        const uint32_t *d = shim_au->subs[s].data;
+        uint32_t w = shim_au->subs[s].words;
+        /* Pairs of (reg_idx, byte_off).  Stop at first odd word. */
+        for (uint32_t i = 0; i + 1 < w; i += 2) {
+            if (d[i] == target_reg_u32) {
+                if (out_sub_idx) *out_sub_idx = s;
+                return d[i + 1];
+            }
+        }
+    }
+    if (out_sub_idx) *out_sub_idx = -1;
+    return UINT32_MAX;
+}
+
+/* Read `size` bytes from offset `byte_off` within the DMA dump file
+ * matching `{dma_dir}/dec{kick:03}_fd{fd_num}_*.bin` (mppshim.v6/v7 format).
+ * Returns 1 on success, 0 on failure (prints warning). */
+static int read_bsp_bytes(const char *dma_dir, int kick, int fd_num,
+                          uint32_t byte_off, uint8_t *out, uint32_t size)
+{
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s/dec%03d_fd%d_*.bin",
+             dma_dir, kick, fd_num);
+
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+    if (glob(pattern, 0, NULL, &g) != 0 || g.gl_pathc == 0) {
+        fprintf(stderr, "  [dma-dir] no file matching %s\n", pattern);
+        globfree(&g);
+        return 0;
+    }
+    FILE *f = fopen(g.gl_pathv[0], "rb");
+    globfree(&g);
+    if (!f) { perror(pattern); return 0; }
+
+    if (fseek(f, (long)byte_off, SEEK_SET) != 0) {
+        fprintf(stderr, "  [dma-dir] fseek to %u failed\n", byte_off);
+        fclose(f); return 0;
+    }
+    size_t got = fread(out, 1, size, f);
+    fclose(f);
+    if (got < size) {
+        fprintf(stderr, "  [dma-dir] short read %zu < %u at offset %u\n",
+                got, size, byte_off);
+        return 0;
+    }
+    return 1;
+}
+
+static int diff_bytes(const char *label,
+                      const uint8_t *bsp, const uint8_t *ours,
+                      uint32_t size)
+{
+    int diffs = 0;
+    for (uint32_t b = 0; b < size; b++) {
+        if (bsp[b] != ours[b]) {
+            if (diffs == 0) printf("  [%s byte diffs]\n", label);
+            printf("    byte %4u: bsp=0x%02x ours=0x%02x XOR=0x%02x\n",
+                   b, bsp[b], ours[b], bsp[b] ^ ours[b]);
+            diffs++;
+        }
+    }
+    if (diffs == 0)
+        printf("  [%s] OK (%u bytes match)\n", label, size);
+    return diffs;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <bitstream.h264> <mpp.shim.h264.log> [--au N]\n", argv[0]);
+        fprintf(stderr, "usage: %s <bitstream.h264> <mpp.shim.h264.log> "
+                        "[--au N] [--dma-dir <path>]\n", argv[0]);
         return 1;
     }
     int target_au = -1;
+    const char *dma_dir = NULL;
     for (int i = 3; i < argc; i++) {
-        if (!strcmp(argv[i], "--au") && i + 1 < argc) target_au = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--au") && i + 1 < argc)
+            target_au = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dma-dir") && i + 1 < argc)
+            dma_dir = argv[++i];
     }
 
     size_t bs_len;
@@ -268,7 +360,7 @@ int main(int argc, char **argv) {
 
     static H264ParseResult parsed;
     memset(&parsed, 0, sizeof(parsed));
-    static uint8_t scratch[2 * 65536];
+    static uint8_t scratch[2u << 20];
 
     static DpbPoolEntry pool[DPB_MAX_SLOTS];
     for (int i = 0; i < DPB_MAX_SLOTS; i++) {
@@ -355,7 +447,65 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Compute our packed RPS table and write it per-AU so a bytewise
+         * diff against the BSP-captured rps bytes is one cmp call.  BSP's
+         * rps lives at offset 0x5000 (or 0xb000 for the alternate slice
+         * context) inside fd9_*.bin from the v6 shim DMA dump.  The sub 7
+         * (cmd=0x202) entries in the shim log give the per-AU offset:
+         *   (reg163 / 0xa3, byte_offset_within_fd9_buffer). */
+        uint8_t rps_bytes[RKH264_RPS_SIZE];
+        uint8_t pps_bytes[RKH264_SPSPPS_UNIT_SIZE];
+        {
+            memset(rps_bytes, 0, sizeof(rps_bytes));
+            H264PackFrameRps(rps_bytes,
+                             parsed.decode.frame_num,
+                             parsed.sps.log2_max_frame_num_minus4,
+                             sel.dpb_entries, sel.ref_lists);
+            char path[64];
+            snprintf(path, sizeof(path), "our_rps_au%03d.bin", au_idx);
+            FILE *rf = fopen(path, "wb");
+            if (rf) {
+                fwrite(rps_bytes, 1, RKH264_RPS_SIZE, rf);
+                fclose(rf);
+            }
+            memset(pps_bytes, 0, sizeof(pps_bytes));
+            H264PackSpsPpsUnit(pps_bytes, &parsed.sps, &parsed.pps,
+                               sel.dpb_entries, /*field_pic=*/0);
+            snprintf(path, sizeof(path), "our_pps_au%03d.bin", au_idx);
+            FILE *pf = fopen(path, "wb");
+            if (pf) {
+                fwrite(pps_bytes, 1, RKH264_SPSPPS_UNIT_SIZE, pf);
+                fclose(pf);
+            }
+        }
+
         Dpb_OnDecodeComplete(&dpb);
+
+        if (target_au == au_idx ||
+            (target_au < 0 && parsed.slice.slice_type == V4L2_H264_SLICE_TYPE_B)) {
+            fprintf(stderr, "AU %d B-frame ref_lists dump (l0_active=%u l1_active=%u rplm_l0=%d rplm_l1=%d):\n",
+                    au_idx,
+                    parsed.slice.num_ref_idx_l0_active_minus1 + 1u,
+                    parsed.slice.num_ref_idx_l1_active_minus1 + 1u,
+                    parsed.ref_pic_list_modification_flag_l0,
+                    parsed.ref_pic_list_modification_flag_l1);
+            for (int L = 0; L < 3; L++) {
+                fprintf(stderr, "  L%d:", L);
+                for (int i = 0; i < 16; i++) {
+                    fprintf(stderr, " %d/f%x", sel.ref_lists[L][i].index,
+                            sel.ref_lists[L][i].fields);
+                }
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "  dpb POC/fn/flags:");
+            for (int i = 0; i < 4; i++) {
+                fprintf(stderr, " [%d]poc=%d/fn=%u/fl=%x", i,
+                        sel.dpb_entries[i].top_field_order_cnt,
+                        sel.dpb_entries[i].frame_num,
+                        sel.dpb_entries[i].flags);
+            }
+            fprintf(stderr, "\n");
+        }
 
         if (target_au >= 0 && au_idx != target_au) {
             au_idx++;
@@ -404,6 +554,46 @@ int main(int argc, char **argv) {
             if (d == 0)
                 printf("  [bank %s base reg%u] OK (%u words match)\n",
                        label, kBanks[b].first_idx, cap);
+        }
+
+        if (dma_dir) {
+            /* Locate rps_table / pps_table byte offsets within fd9 by walking
+             * the cmd=0x202 (reg_idx, byte_offset) substitution pairs. */
+            int rps_sub_idx = -1, pps_sub_idx = -1;
+            uint32_t rps_off = find_dma_offset_for_reg(
+                shim, RKVDEC2_REG_RPS_BASE, &rps_sub_idx);
+            uint32_t pps_off = find_dma_offset_for_reg(
+                shim, RKVDEC2_REG_PPS_BASE, &pps_sub_idx);
+
+            if (rps_off == UINT32_MAX) {
+                printf("  [rps AU%d]: no reg163 substitution found — skipped\n",
+                       au_idx);
+            } else {
+                uint8_t bsp_rps[RKH264_RPS_SIZE];
+                if (read_bsp_bytes(dma_dir, au_idx, 9,
+                                   rps_off, bsp_rps, RKH264_RPS_SIZE)) {
+                    char rps_label[48];
+                    snprintf(rps_label, sizeof(rps_label),
+                             "rps AU%d (fd9+0x%x)", au_idx, rps_off);
+                    total_diffs += diff_bytes(rps_label, bsp_rps, rps_bytes,
+                                             RKH264_RPS_SIZE);
+                }
+            }
+
+            if (pps_off == UINT32_MAX) {
+                printf("  [pps AU%d]: no reg161 substitution found — skipped\n",
+                       au_idx);
+            } else {
+                uint8_t bsp_pps[RKH264_SPSPPS_UNIT_SIZE];
+                if (read_bsp_bytes(dma_dir, au_idx, 9,
+                                   pps_off, bsp_pps, RKH264_SPSPPS_UNIT_SIZE)) {
+                    char pps_label[48];
+                    snprintf(pps_label, sizeof(pps_label),
+                             "pps AU%d (fd9+0x%x)", au_idx, pps_off);
+                    total_diffs += diff_bytes(pps_label, bsp_pps, pps_bytes,
+                                             RKH264_SPSPPS_UNIT_SIZE);
+                }
+            }
         }
 
         au_idx++;

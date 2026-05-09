@@ -174,9 +174,15 @@ static HRESULT MakeSampleFromBytes(const uint8_t *data, size_t n,
 }
 
 /* Pump ProcessOutput until NEED_MORE_INPUT.  Each frame produced gets
- * its NV12 data appended to *out_file. */
-static int DrainOutputs(IMFTransform *mft, FILE *out_file, int *frame_count) {
+ * its NV12 data appended to *out_file.
+ *
+ * Returns 0 on success, 1 on hard failure, 2 when *frame_count has
+ * reached `max_frames` (caller should stop submitting). max_frames=0
+ * means unlimited. */
+static int DrainOutputs(IMFTransform *mft, FILE *out_file,
+                        int *frame_count, int max_frames) {
     for (;;) {
+        if (max_frames > 0 && *frame_count >= max_frames) return 2;
         MFT_OUTPUT_DATA_BUFFER ob{}; DWORD st = 0;
         HRESULT hr = mft->ProcessOutput(0, 1, &ob, &st);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return 0;
@@ -216,12 +222,14 @@ int wmain(int argc, wchar_t **argv) {
     const wchar_t *out_path = nullptr;
     CodecCli codec = CodecCli::H264;
     UINT32 width = 1920, height = 1080;
+    int max_frames = 0;   /* 0 = unlimited */
 
     for (int i = 1; i < argc; i++) {
         if      (!wcscmp(argv[i], L"--in")     && i+1 < argc) in_path  = argv[++i];
         else if (!wcscmp(argv[i], L"--out")    && i+1 < argc) out_path = argv[++i];
         else if (!wcscmp(argv[i], L"--width")  && i+1 < argc) width    = (UINT32)_wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--height") && i+1 < argc) height   = (UINT32)_wtoi(argv[++i]);
+        else if (!wcscmp(argv[i], L"--frames") && i+1 < argc) max_frames = _wtoi(argv[++i]);
         else if (!wcscmp(argv[i], L"--codec")  && i+1 < argc) {
             const wchar_t *c = argv[++i];
             if      (!wcscmp(c, L"h264") || !wcscmp(c, L"H264")) codec = CodecCli::H264;
@@ -234,9 +242,11 @@ int wmain(int argc, wchar_t **argv) {
             }
         } else {
             std::printf("usage: mft_decode --codec h264|h265|av1 --in <file> "
-                        "--out <yuv> [--width W --height H]\n"
+                        "--out <yuv> [--width W --height H] [--frames N]\n"
                         "  h264/h265: input is Annex-B bitstream\n"
-                        "  av1:       input is an IVF file (DKIF header + OBU TUs)\n");
+                        "  av1:       input is an IVF file (DKIF header + OBU TUs)\n"
+                        "  --frames N: stop after N decoded output frames "
+                        "(default: unlimited)\n");
             return 1;
         }
     }
@@ -346,18 +356,19 @@ int wmain(int argc, wchar_t **argv) {
         }
 
         /* If MFT is full, drain output first. */
+        bool reached_limit = false;
         for (int retry = 0; retry < 4; retry++) {
             hr = mft->ProcessInput(0, s, 0);
             if (hr == MF_E_NOTACCEPTING) {
-                if (DrainOutputs(mft, out, &frames_out) != 0) {
-                    s->Release();
-                    return 5;
-                }
+                int dr = DrainOutputs(mft, out, &frames_out, max_frames);
+                if (dr == 1) { s->Release(); return 5; }
+                if (dr == 2) { reached_limit = true; break; }
                 continue;
             }
             break;
         }
         s->Release();
+        if (reached_limit) break;
         if (FAILED(hr)) {
             std::printf("ProcessInput failed at AU %d: 0x%08x\n",
                         au_idx, (unsigned)hr);
@@ -365,13 +376,18 @@ int wmain(int argc, wchar_t **argv) {
         }
 
         /* Drain whatever's ready. */
-        if (DrainOutputs(mft, out, &frames_out) != 0) return 5;
+        int dr = DrainOutputs(mft, out, &frames_out, max_frames);
+        if (dr == 1) return 5;
+        if (dr == 2) break;
         au_idx++;
     }
 
-    /* Final drain. */
-    HR(mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0));
-    if (DrainOutputs(mft, out, &frames_out) != 0) return 5;
+    /* Final drain (skip if --frames cap already hit). */
+    if (max_frames == 0 || frames_out < max_frames) {
+        HR(mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0));
+        int dr = DrainOutputs(mft, out, &frames_out, max_frames);
+        if (dr == 1) return 5;
+    }
 
     HR(mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0));
     mft->Release();

@@ -62,13 +62,14 @@ typedef HRESULT (__stdcall *PFN_DllGetClassObject)(REFCLSID, REFIID, void **);
 
 /* -------- args -------- */
 
-enum class CodecPick { Auto, H264, H265 };
+enum class CodecPick { Auto, H264, H265, AV1 };
 
 struct Args {
-    const wchar_t *in_path   = nullptr;
-    CodecPick      codec     = CodecPick::Auto;
-    bool           no_render = false;
-    bool           use_evr   = false;
+    const wchar_t *in_path     = nullptr;
+    CodecPick      codec       = CodecPick::Auto;
+    bool           no_render   = false;
+    bool           use_evr     = false;
+    int            max_seconds = 0;   /* 0 = play to end */
 };
 
 static bool ParseArgs(int argc, wchar_t **argv, Args *out) {
@@ -79,10 +80,15 @@ static bool ParseArgs(int argc, wchar_t **argv, Args *out) {
             if      (!wcscmp(c, L"auto")) out->codec = CodecPick::Auto;
             else if (!wcscmp(c, L"h264")) out->codec = CodecPick::H264;
             else if (!wcscmp(c, L"h265") || !wcscmp(c, L"hevc")) out->codec = CodecPick::H265;
+            else if (!wcscmp(c, L"av1")  || !wcscmp(c, L"AV1"))  out->codec = CodecPick::AV1;
             else return false;
         }
         else if (!wcscmp(argv[i], L"--no-render")) out->no_render = true;
         else if (!wcscmp(argv[i], L"--use-evr"))   out->use_evr   = true;
+        else if (!wcscmp(argv[i], L"--max-seconds") && i+1 < argc) {
+            out->max_seconds = _wtoi(argv[++i]);
+            if (out->max_seconds < 0) out->max_seconds = 0;
+        }
         /* Anything else (e.g. a file path passed via Explorer
          * drag-and-drop or as a bare positional arg) is treated as the
          * input path.  Last one wins. */
@@ -210,29 +216,38 @@ public:
         sds.MaxLOD   = D3D11_FLOAT32_MAX;
         HRCK(device_->CreateSamplerState(&sds, &samp_));
 
-        /* Pre-allocate the NV12 source texture so we don't recreate
-         * per frame.  USAGE_DEFAULT + UpdateSubresource is the
-         * recommended pattern for streaming uploads. */
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width              = width_;
-        td.Height             = height_;
-        td.MipLevels          = 1;
-        td.ArraySize          = 1;
-        td.Format             = DXGI_FORMAT_NV12;
-        td.SampleDesc.Count   = 1;
-        td.Usage              = D3D11_USAGE_DEFAULT;
-        td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-        HRCK(device_->CreateTexture2D(&td, nullptr, &nv12_tex_));
+        /* Ring of NV12 source textures rotated per frame.  A single
+         * shared DEFAULT texture overwritten every frame via
+         * UpdateSubresource races with the GPU's consumption of the
+         * prior Draw — visible as garbage every other frame at burst
+         * input rates (e.g. AV1 alt-ref + show_existing alternation
+         * where decode budget per TU is wildly uneven).  Three slots
+         * give the GPU one full Present cycle to drain before a slot
+         * is reused. */
+        for (UINT i = 0; i < kRingSize; i++) {
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width              = width_;
+            td.Height             = height_;
+            td.MipLevels          = 1;
+            td.ArraySize          = 1;
+            td.Format             = DXGI_FORMAT_NV12;
+            td.SampleDesc.Count   = 1;
+            td.Usage              = D3D11_USAGE_DEFAULT;
+            td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+            HRCK(device_->CreateTexture2D(&td, nullptr, &ring_tex_[i]));
 
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd_y = {};
-        sd_y.Format        = DXGI_FORMAT_R8_UNORM;
-        sd_y.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd_y.Texture2D.MipLevels = 1;
-        HRCK(device_->CreateShaderResourceView(nv12_tex_, &sd_y, &y_srv_));
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd_y = {};
+            sd_y.Format        = DXGI_FORMAT_R8_UNORM;
+            sd_y.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd_y.Texture2D.MipLevels = 1;
+            HRCK(device_->CreateShaderResourceView(ring_tex_[i], &sd_y,
+                                                    &ring_y_srv_[i]));
 
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd_uv = sd_y;
-        sd_uv.Format = DXGI_FORMAT_R8G8_UNORM;
-        HRCK(device_->CreateShaderResourceView(nv12_tex_, &sd_uv, &uv_srv_));
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd_uv = sd_y;
+            sd_uv.Format = DXGI_FORMAT_R8G8_UNORM;
+            HRCK(device_->CreateShaderResourceView(ring_tex_[i], &sd_uv,
+                                                    &ring_uv_srv_[i]));
+        }
 
         std::fprintf(stderr,
             "D3D11VideoSink: swap chain %ux%u (window) BGRA, NV12 source %ux%u, "
@@ -242,9 +257,11 @@ public:
     }
 
     void Cleanup() {
-        if (uv_srv_)     { uv_srv_->Release();     uv_srv_     = nullptr; }
-        if (y_srv_)      { y_srv_->Release();      y_srv_      = nullptr; }
-        if (nv12_tex_)   { nv12_tex_->Release();   nv12_tex_   = nullptr; }
+        for (UINT i = 0; i < kRingSize; i++) {
+            if (ring_uv_srv_[i]) { ring_uv_srv_[i]->Release(); ring_uv_srv_[i] = nullptr; }
+            if (ring_y_srv_[i])  { ring_y_srv_[i]->Release();  ring_y_srv_[i]  = nullptr; }
+            if (ring_tex_[i])    { ring_tex_[i]->Release();    ring_tex_[i]    = nullptr; }
+        }
         if (samp_)       { samp_->Release();       samp_       = nullptr; }
         if (ps_)         { ps_->Release();         ps_         = nullptr; }
         if (vs_)         { vs_->Release();         vs_         = nullptr; }
@@ -257,12 +274,18 @@ public:
         const UINT y_size = width_ * height_;
         if (len < y_size + (y_size / 2)) return E_INVALIDARG;
 
-        /* Upload NV12 bytes to the source texture (Y subresource 0,
-         * UV subresource 1).  Both at row pitch == width. */
+        /* Pick the next slot in the texture ring; advance ring_idx_
+         * AFTER reading so this frame's Present is queued before the
+         * GPU touches the next slot's texture again. */
+        const UINT slot = ring_idx_;
+        ring_idx_ = (ring_idx_ + 1u) % kRingSize;
+
+        /* Upload NV12 bytes to this frame's ring texture (Y subresource
+         * 0, UV subresource 1).  Both at row pitch == width. */
         const UINT row_pitch = width_;
-        context_->UpdateSubresource(nv12_tex_, 0, nullptr,
+        context_->UpdateSubresource(ring_tex_[slot], 0, nullptr,
                                     nv12, row_pitch, row_pitch * height_);
-        context_->UpdateSubresource(nv12_tex_, 1, nullptr,
+        context_->UpdateSubresource(ring_tex_[slot], 1, nullptr,
                                     nv12 + y_size, row_pitch,
                                     row_pitch * (height_ / 2));
 
@@ -283,7 +306,7 @@ public:
         vp.Height = (FLOAT)cur_desc.Height;
         vp.MaxDepth = 1.0f;
 
-        ID3D11ShaderResourceView *srvs[2] = { y_srv_, uv_srv_ };
+        ID3D11ShaderResourceView *srvs[2] = { ring_y_srv_[slot], ring_uv_srv_[slot] };
         context_->OMSetRenderTargets(1, &rtv, nullptr);
         context_->RSSetViewports(1, &vp);
         context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -333,26 +356,48 @@ public:
     /* IMFSampleGrabberSinkCallback */
     STDMETHODIMP OnSetPresentationClock(IMFPresentationClock*) override { return S_OK; }
     STDMETHODIMP OnProcessSample(REFGUID /*major_type*/, DWORD /*flags*/,
-                                  LONGLONG /*sample_time*/, LONGLONG /*duration*/,
+                                  LONGLONG sample_time, LONGLONG /*duration*/,
                                   const BYTE *buffer, DWORD len) override {
+        /* Sink-side fingerprint of received bytes — fold every byte into
+         * an FNV-1a hash so we can diff against the MFT's po# fnv to
+         * verify the IMFSample → sample-grabber handoff doesn't mangle
+         * content. */
+        static int dump_n = 0;
+        char trace_env[2];
+        if (dump_n < 60 &&
+            GetEnvironmentVariableA("RKMPP_AV1_TRACE", trace_env, 2) > 0) {
+            uint32_t h = 2166136261u;
+            for (DWORD i = 0; i < len; i++) { h ^= buffer[i]; h *= 16777619u; }
+            std::fprintf(stderr,
+                "AV1_TRACE sink_recv idx=%d pts=%lld len=%u y0=%02x ymid=%02x ylast=%02x fnv=%08x\n",
+                dump_n, (long long)sample_time, (unsigned)len,
+                len ? buffer[0] : 0u,
+                len ? buffer[len/2] : 0u,
+                len ? buffer[len-1] : 0u,
+                h);
+            std::fflush(stderr);
+            dump_n++;
+        }
         return RenderNV12(buffer, len);
     }
     STDMETHODIMP OnShutdown() override { return S_OK; }
 
 private:
+    static constexpr UINT      kRingSize   = 3;
     long                       refs_;
     HWND                       hwnd_       = nullptr;
     UINT                       width_      = 0;
     UINT                       height_     = 0;
+    UINT                       ring_idx_   = 0;
     ID3D11Device              *device_     = nullptr;
     ID3D11DeviceContext       *context_    = nullptr;
     IDXGISwapChain1           *swap_chain_ = nullptr;
     ID3D11VertexShader        *vs_         = nullptr;
     ID3D11PixelShader         *ps_         = nullptr;
     ID3D11SamplerState        *samp_       = nullptr;
-    ID3D11Texture2D           *nv12_tex_   = nullptr;
-    ID3D11ShaderResourceView  *y_srv_      = nullptr;
-    ID3D11ShaderResourceView  *uv_srv_     = nullptr;
+    ID3D11Texture2D           *ring_tex_[kRingSize]    = {};
+    ID3D11ShaderResourceView  *ring_y_srv_[kRingSize]  = {};
+    ID3D11ShaderResourceView  *ring_uv_srv_[kRingSize] = {};
 };
 
 /* No-op IMFSampleGrabberSinkCallback — used when --no-render is set.
@@ -469,8 +514,23 @@ static HRESULT PickVideoStream(IMFPresentationDescriptor *pd,
 
 static HRESULT PickAudioStream(IMFPresentationDescriptor *pd,
                                IMFStreamDescriptor **out_sd,
-                               DWORD *out_index) {
-    return PickStreamByMajor(pd, MFMediaType_Audio, out_sd, out_index, nullptr);
+                               DWORD *out_index,
+                               GUID  *out_subtype = nullptr) {
+    return PickStreamByMajor(pd, MFMediaType_Audio, out_sd, out_index, out_subtype);
+}
+
+/* Returns true for audio subtypes that Windows MF can decode natively.
+ * Opus (0x4F505553) and Vorbis (0x566F7262) ship in AV1/VP9 web content
+ * but have no built-in Windows decoder; the topology resolver will fail
+ * MESessionTopologySet with MF_E_TOPO_CODEC_NOT_FOUND if they are included. */
+static bool IsAudioSubtypeNativelySupported(const GUID &sub) {
+    return sub == MFAudioFormat_AAC
+        || sub == MFAudioFormat_MP3
+        || sub == MFAudioFormat_PCM
+        || sub == MFAudioFormat_Float
+        || sub == MFAudioFormat_WMAudioV8
+        || sub == MFAudioFormat_WMAudioV9
+        || sub == MFAudioFormat_FLAC;
 }
 
 /* -------- topology builders -------- */
@@ -680,7 +740,7 @@ static HRESULT AddAudioOutputNode(IMFTopology *topo, IMFTopologyNode **out) {
 
 /* -------- session event pump -------- */
 
-static int RunSession(IMFMediaSession *sess, HWND hwnd) {
+static int RunSession(IMFMediaSession *sess, HWND hwnd, int max_seconds) {
     PROPVARIANT start;  PropVariantInit(&start);
     HRESULT hr = sess->Start(&GUID_NULL, &start);
     PropVariantClear(&start);
@@ -688,6 +748,12 @@ static int RunSession(IMFMediaSession *sess, HWND hwnd) {
         std::fprintf(stderr, "Start failed 0x%08x\n", (unsigned)hr);
         return 1;
     }
+
+    const ULONGLONG t_start_ms  = GetTickCount64();
+    const ULONGLONG t_deadline  = max_seconds > 0
+                                ? t_start_ms + (ULONGLONG)max_seconds * 1000ULL
+                                : 0;
+    bool stop_requested = false;
 
     bool ended = false;
     while (!ended) {
@@ -697,6 +763,17 @@ static int RunSession(IMFMediaSession *sess, HWND hwnd) {
             if (msg.message == WM_QUIT) ended = true;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        /* Honour --max-seconds: ask the session to stop once wall-clock
+         * elapsed exceeds the cap.  Sending Stop() once is enough — the
+         * session emits MESessionStopped → MESessionClosed which run the
+         * tear-down branches below. */
+        if (t_deadline && !stop_requested && GetTickCount64() >= t_deadline) {
+            std::printf("--max-seconds %d reached, stopping session\n",
+                        max_seconds);
+            sess->Stop();
+            stop_requested = true;
         }
 
         IMFMediaEvent *ev = nullptr;
@@ -778,7 +855,8 @@ int wmain(int argc, wchar_t **argv) {
     Args args;
     if (!ParseArgs(argc, argv, &args)) {
         std::fwprintf(stderr,
-            L"usage: mft_play --in <url-or-path> [--codec auto|h264|h265]\n");
+            L"usage: mft_play --in <url-or-path> [--codec auto|h264|h265|av1]\n"
+            L"               [--no-render] [--use-evr] [--max-seconds N]\n");
         return 1;
     }
 
@@ -825,19 +903,50 @@ int wmain(int argc, wchar_t **argv) {
      * and SAR's playback position will manifest as A/V desync. */
     IMFStreamDescriptor *audio_sd  = nullptr;
     DWORD                audio_idx = 0;
-    HRESULT              audio_hr  = PickAudioStream(pd, &audio_sd, &audio_idx);
-    const bool           has_audio = SUCCEEDED(audio_hr);
-    std::printf("audio stream: %s\n", has_audio ? "present" : "none");
+    GUID                 audio_sub = {};
+    HRESULT              audio_hr  = PickAudioStream(pd, &audio_sd, &audio_idx, &audio_sub);
+    bool                 has_audio = false;
+    if (SUCCEEDED(audio_hr)) {
+        if (IsAudioSubtypeNativelySupported(audio_sub)) {
+            has_audio = true;
+            std::printf("audio stream: present {%08X-...}\n", audio_sub.Data1);
+        } else {
+            std::printf("audio stream: present {%08X-...} — not natively supported by Windows MF (e.g. Opus/Vorbis), skipping to avoid MF_E_TOPO_CODEC_NOT_FOUND\n",
+                        audio_sub.Data1);
+            pd->DeselectStream(audio_idx);
+            audio_sd->Release();
+            audio_sd = nullptr;
+        }
+    } else {
+        std::printf("audio stream: none\n");
+    }
+    std::fflush(stdout);
 
-    REFCLSID clsid = (args.codec == CodecPick::H265
-                      || (args.codec == CodecPick::Auto && video_sub == MFVideoFormat_HEVC))
-                     ? CLSID_RkmppHevcDecoder
-                     : CLSID_RkmppH264Decoder;
+    std::printf("video subtype: {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}\n",
+                video_sub.Data1, video_sub.Data2, video_sub.Data3,
+                video_sub.Data4[0], video_sub.Data4[1],
+                video_sub.Data4[2], video_sub.Data4[3],
+                video_sub.Data4[4], video_sub.Data4[5],
+                video_sub.Data4[6], video_sub.Data4[7]);
+    std::printf("  MFVideoFormat_H264: {%08X-...}\n", MFVideoFormat_H264.Data1);
+    std::printf("  MFVideoFormat_HEVC: {%08X-...}\n", MFVideoFormat_HEVC.Data1);
+    std::printf("  MFVideoFormat_AV1:  {%08X-...}\n", MFVideoFormat_AV1.Data1);
+    std::fflush(stdout);
+
+    REFCLSID clsid =
+        (args.codec == CodecPick::AV1
+         || (args.codec == CodecPick::Auto && video_sub == MFVideoFormat_AV1))
+        ? CLSID_RkmppAv1Decoder
+        : (args.codec == CodecPick::H265
+           || (args.codec == CodecPick::Auto && video_sub == MFVideoFormat_HEVC))
+          ? CLSID_RkmppHevcDecoder
+          : CLSID_RkmppH264Decoder;
 
     /* --- MFT --- */
     IMFTransform *mft = nullptr;
     HRCK(CreateRkmppMft(clsid, &mft));
     std::printf("rkmpp MFT instantiated for %s\n",
+                clsid == CLSID_RkmppAv1Decoder  ? "AV1"  :
                 clsid == CLSID_RkmppHevcDecoder ? "HEVC" : "H.264");
 
     /* --- D3D11 device manager (best-effort) --- */
@@ -912,7 +1021,7 @@ int wmain(int argc, wchar_t **argv) {
     HRCK(MFCreateMediaSession(nullptr, &sess));
     HRCK(sess->SetTopology(0, topo));
 
-    int rc = RunSession(sess, hwnd);
+    int rc = RunSession(sess, hwnd, args.max_seconds);
 
     sess->Release();
     topo->Release();

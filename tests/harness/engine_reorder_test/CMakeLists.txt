@@ -1,0 +1,3 @@
+add_executable(engine_reorder_test engine_reorder_test.cpp)
+target_link_libraries(engine_reorder_test PRIVATE rkmpp_decode_engine)
+add_test(NAME engine_reorder_test COMMAND engine_reorder_test)

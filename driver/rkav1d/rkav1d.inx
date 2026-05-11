@@ -1,0 +1,50 @@
+;
+; rkav1d.inx — Rockchip RK3588 AV1 video decoder driver.
+; Matches RKCP3560 (RKVDEC AV1) only.
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Media
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; will be stamped by stampinf
+CatalogFile = rkav1d.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rkav1d.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%rkav1d.DeviceDesc% = rkav1d_Inst, ACPI\RKCP3560
+
+[rkav1d_Inst.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rkav1d.sys
+
+[rkav1d_Inst.NT.Services]
+AddService = rkav1d, %SPSVCINST_ASSOCSERVICE%, rkav1d_Service_Inst
+
+[rkav1d_Service_Inst]
+DisplayName    = %rkav1d.SVCDESC%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\rkav1d.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "Rockchip Windows Drivers Project"
+DiskName               = "rkav1d Installation Disk"
+rkav1d.DeviceDesc      = "Rockchip RK3588 AV1 video decoder"
+rkav1d.SVCDESC         = "rkav1d Service"

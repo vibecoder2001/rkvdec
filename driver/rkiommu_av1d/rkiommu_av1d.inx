@@ -1,0 +1,50 @@
+;
+; rkiommu_av1d.inx — Rockchip RK3588 AV1 decoder IOMMU driver.
+; Matches RKCP3571 (rockchip,iommu-av1d) — AHB_CONTROL flat enable model.
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; will be stamped by stampinf
+CatalogFile = rkiommu_av1d.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rkiommu_av1d.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%rkiommu_av1d.DeviceDesc% = rkiommu_av1d_Inst, ACPI\RKCP3571
+
+[rkiommu_av1d_Inst.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rkiommu_av1d.sys
+
+[rkiommu_av1d_Inst.NT.Services]
+AddService = rkiommu_av1d, %SPSVCINST_ASSOCSERVICE%, rkiommu_av1d_Service_Inst
+
+[rkiommu_av1d_Service_Inst]
+DisplayName    = %rkiommu_av1d.SVCDESC%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\rkiommu_av1d.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE  = 0x00000002
+ManufacturerName        = "Rockchip Windows Drivers Project"
+DiskName                = "rkiommu_av1d Installation Disk"
+rkiommu_av1d.DeviceDesc = "Rockchip RK3588 AV1 decoder IOMMU"
+rkiommu_av1d.SVCDESC    = "rkiommu_av1d Service"

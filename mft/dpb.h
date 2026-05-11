@@ -62,11 +62,26 @@ typedef struct DpbSelection {
     struct v4l2_h264_reference     ref_lists[3][32];
 } DpbSelection;
 
+/* Hold reason for the per-slot lifecycle flags.  Replaces the older
+ * single `external_hold` refcount with named buckets so logs/asserts can
+ * tell apart "still in reorder_q", "queued for output", and "consumer
+ * is reading the frame".  See dpb.h slot bitfields below. */
+typedef enum {
+    DPB_HOLD_REORDER  = 0,    /* slot pinned by an entry in reorder_q */
+    DPB_HOLD_READY    = 1,    /* slot pinned by an entry in ready_q   */
+    DPB_HOLD_CONSUMER = 2,    /* slot pinned by a live DecodedFrame    */
+} DpbHoldReason;
+
 /* Opaque DPB context — caller declares in its struct. */
 typedef struct DpbCtx {
     DpbPoolEntry pool[DPB_MAX_SLOTS];
     uint32_t     pool_size;
     int32_t      current_idx;   /* -1 when nothing is in flight */
+    /* Stream epoch — bumped by Dpb_Flush.  Stamped onto a slot at Select
+     * time; assertions in Add/Transfer/ReleaseHold compare the entry's
+     * caller-supplied epoch against the slot's epoch to catch stale
+     * cross-flush leaks. */
+    uint32_t     current_epoch;
     /* Sliding-window bound captured at Select time so OnDecodeComplete
      * can apply H.264 8.2.5.3 eviction without re-parsing the SPS. */
     uint32_t     max_num_ref_frames;
@@ -100,18 +115,30 @@ typedef struct DpbCtx {
         uint8_t  in_use   : 1;
         uint8_t  is_ref   : 1;
         uint8_t  long_term: 1;
-        /* External hold count — incremented by `Dpb_AddExternalHold`
-         * when a downstream consumer (MFT reorder_q / ready_q entry)
-         * pins the slot's contents.  Slot pickers treat external_hold>0
-         * the same as in_use, so the codec won't write a new picture
-         * over data the consumer is still reading.  Decremented via
-         * `Dpb_ReleaseExternalHold` when the consumer is done. */
-        uint8_t  external_hold : 4;
+        /* Lifecycle flags — replace the old external_hold refcount with
+         * named buckets so an assertion firing or a log line can tell
+         * apart the four ways a slot can be busy.  Slot pickers treat
+         * any of these as "still in use" and will not pick the slot.
+         *
+         *   pending_reorder  : entry sits in DecodeEngine.reorder_q
+         *   pending_ready    : entry sits in DecodeEngine.ready_q
+         *   held_by_consumer : a live DecodedFrame references the slot
+         *
+         * Each is set by Dpb_AddHold / Dpb_TransferHold and cleared by
+         * Dpb_ReleaseHold / Dpb_TransferHold.  Asserts enforce single-
+         * set / single-clear semantics. */
+        uint8_t  pending_reorder  : 1;
+        uint8_t  pending_ready    : 1;
+        uint8_t  held_by_consumer : 1;
         uint8_t  fields;        /* V4L2_H264_*_REF */
         uint16_t frame_num;
         int32_t  top_poc;
         int32_t  bottom_poc;
         uint16_t long_term_frame_idx;
+        /* Epoch the slot was Select'd at.  Set in Dpb_Select to
+         * ctx->current_epoch.  Compared against the entry's caller-
+         * supplied epoch in Dpb_AddHold to catch cross-flush leaks. */
+        uint32_t epoch;
     } slots[DPB_MAX_SLOTS];
 } DpbCtx;
 
@@ -131,13 +158,32 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
  * ref is evicted (sliding window, H.264 8.2.5.3). */
 void Dpb_OnDecodeComplete(DpbCtx *ctx);
 
-/* External-hold ref counting.  Lets a downstream consumer (the MFT
- * reorder/ready queue) pin a pool slot's contents while the codec
- * picks new slots for subsequent decodes.  Used to make a future
- * zero-copy readout path safe — without this, a slot can be reassigned
- * to a new decode while a queued frame still references its data. */
-void Dpb_AddExternalHold     (DpbCtx *ctx, uint32_t slot_idx);
-void Dpb_ReleaseExternalHold (DpbCtx *ctx, uint32_t slot_idx);
+/* Slot-lifecycle hold API.  Lets a downstream consumer (MFT reorder_q /
+ * ready_q entry, or live DecodedFrame) pin a pool slot's contents while
+ * the codec picks new slots for subsequent decodes.
+ *
+ * Add/Release are single-set / single-clear: setting a flag that's
+ * already set, or clearing a flag that's already clear, fires an
+ * assertion.  Transfer atomically clears `from` and sets `to` (used
+ * when an entry moves reorder_q→ready_q→consumer).
+ *
+ * `entry_epoch` is the caller's stream epoch (DecodeEngine.ReorderEntry.
+ * epoch); it's compared against the slot's epoch (set by Dpb_Select) to
+ * catch stale cross-flush references in DBG builds. */
+void Dpb_AddHold      (DpbCtx *ctx, uint32_t slot_idx,
+                       DpbHoldReason reason, uint32_t entry_epoch);
+void Dpb_ReleaseHold  (DpbCtx *ctx, uint32_t slot_idx,
+                       DpbHoldReason reason);
+void Dpb_TransferHold (DpbCtx *ctx, uint32_t slot_idx,
+                       DpbHoldReason from, DpbHoldReason to,
+                       uint32_t entry_epoch);
+
+/* Drop all reference state on slots NOT held by a consumer, bump the
+ * stream epoch, and reset current_idx.  Slots still held by a live
+ * DecodedFrame are preserved (their epoch is the pre-flush value, so
+ * the consumer's eventual ReleaseHold still asserts cleanly).  Pool
+ * buffers and pool_size are untouched. */
+void Dpb_Flush        (DpbCtx *ctx);
 
 /* =====================================================================
  * H.265 (HEVC) DPB — RPS-driven reference marking.
@@ -197,15 +243,17 @@ typedef struct H265DpbCtx {
     DpbPoolEntry pool[DPB_MAX_SLOTS];
     uint32_t     pool_size;
     int32_t      current_idx;   /* -1 when nothing is in flight */
+    uint32_t     current_epoch; /* see DpbCtx::current_epoch */
 
     struct {
         uint8_t  in_use : 1;
         uint8_t  is_ref : 1;     /* "used for reference" — RPS-driven */
-        /* See DpbCtx::slots::external_hold — same purpose: protects this
-         * slot from re-use while a downstream consumer still references
-         * its decoded contents. */
-        uint8_t  external_hold : 4;
+        /* Named lifecycle flags — see DpbCtx::slots for semantics. */
+        uint8_t  pending_reorder  : 1;
+        uint8_t  pending_ready    : 1;
+        uint8_t  held_by_consumer : 1;
         int32_t  poc;            /* signed: HEVC POC may be negative */
+        uint32_t epoch;
     } slots[DPB_MAX_SLOTS];
 } H265DpbCtx;
 
@@ -224,9 +272,15 @@ DpbStatus H265Dpb_Init(H265DpbCtx *ctx, const DpbPoolEntry *pool,
 DpbStatus H265Dpb_Select(H265DpbCtx *ctx, const H265ParseResult *parsed,
                          H265DpbSelection *out);
 
-/* External hold ref-counting — see Dpb_AddExternalHold for rationale. */
-void H265Dpb_AddExternalHold     (H265DpbCtx *ctx, uint32_t slot_idx);
-void H265Dpb_ReleaseExternalHold (H265DpbCtx *ctx, uint32_t slot_idx);
+/* Slot-lifecycle hold API — see Dpb_AddHold for rationale. */
+void H265Dpb_AddHold      (H265DpbCtx *ctx, uint32_t slot_idx,
+                           DpbHoldReason reason, uint32_t entry_epoch);
+void H265Dpb_ReleaseHold  (H265DpbCtx *ctx, uint32_t slot_idx,
+                           DpbHoldReason reason);
+void H265Dpb_TransferHold (H265DpbCtx *ctx, uint32_t slot_idx,
+                           DpbHoldReason from, DpbHoldReason to,
+                           uint32_t entry_epoch);
+void H265Dpb_Flush        (H265DpbCtx *ctx);
 
 /* Finalise current pic.  For HEVC the RPS marking already evicted stale
  * slots; this just clears current_idx (and releases the slot if the

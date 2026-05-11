@@ -168,8 +168,13 @@ typedef struct _RKIOMMU_DOMAIN {
 /* ---------------------------------------------------------------------------
  * Public API (implemented in pgtable.c)
  * --------------------------------------------------------------------------- */
-_IRQL_requires_max_(DISPATCH_LEVEL)
-NTSTATUS RkIommuDomainCreate(_Out_ PRKIOMMU_DOMAIN *Domain, _In_ BOOLEAN IsAv1d);
+/* RkIommuDomainCreateVdec — allocates a v2 IOMMU domain (RKCP3570).
+ * Sets Domain->IsAv1d = FALSE; no PTA allocation. */
+NTSTATUS RkIommuDomainCreateVdec(_Out_ PRKIOMMU_DOMAIN *Domain);
+
+/* RkIommuDomainCreateAv1d — allocates an AV1D IOMMU domain (RKCP3571).
+ * Sets Domain->IsAv1d = TRUE; allocates PTA level above the DT. */
+NTSTATUS RkIommuDomainCreateAv1d(_Out_ PRKIOMMU_DOMAIN *Domain);
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID RkIommuDomainDestroy(_In_ PRKIOMMU_DOMAIN Domain);

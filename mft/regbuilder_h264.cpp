@@ -125,10 +125,10 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
 
     EMIT_P(RKVDEC2_REG_FBC_PARAMS,  0);                     /* no FBC for raster output */
     EMIT_P(RKVDEC2_REG_STREAM_MODE, 0);                     /* rlc_mode = 0, full bitstream */
-    /* reg16 str_len — BSP H.264 HAL writes p_hal->strm_len directly
-     * (hal_h264d_vdpu34x.c:321) without rounding.  Match: caller's
-     * raw slice byte count. */
-    EMIT_P(RKVDEC2_REG_STR_LEN, bufs->bitstream_size);
+    /* reg16 str_len — BSP consistently rounds up to 16-byte boundary:
+     * confirmed by comparing kernel debug output (BSP: 8928 vs raw: 8920,
+     * 3712 vs 3700, 4048 vs 4044).  Without alignment the hardware stalls. */
+    EMIT_P(RKVDEC2_REG_STR_LEN, (bufs->bitstream_size + 15u) & ~15u);
     EMIT_P(RKVDEC2_REG_SLICE_NUM,   0x3FFF);
     EMIT_P(RKVDEC2_REG_Y_HOR_VIRSTRIDE,  luma_stride / 16);
     EMIT_P(RKVDEC2_REG_UV_HOR_VIRSTRIDE, chroma_stride / 16);
@@ -166,13 +166,10 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
         if (!clear_intra) reg21 |= RKVDEC2_ERROR_INTRA_MODE;
         EMIT_P(RKVDEC2_REG_ERROR_CTRL, reg21);
     }
-    /* CABAC error-tolerance range for the bitstream-conformance check.
-     * Captured from a live BSP `mpi_dec_test` IOCTL trace on the same
-     * RK3588 board running mainline rockchip-linux/mpp:
-     *   reg024 = 0xFFFFFFFF, reg025 = 0x3FF3FFFF
-     * Setting these to zero means every CABAC value is "out of range",
-     * the codec triggers error abort partway through the frame, the
-     * AXI bus goes idle, and the watchdog catches it as a timeout. */
+    /* CABAC error detection mask.  BSP source (init_common_regs) sets these
+     * to 0 for RK3588 and 0xffffffff/0x3ff3ffff for older SoCs; however the
+     * BSP shim capture on this board shows 0xffffffff/0x3ff3ffff — the source
+     * does not match the firmware running here.  Match the captured values. */
     EMIT_P(RKVDEC2_REG_CABAC_ERR_LOW,  0xFFFFFFFFu);
     EMIT_P(RKVDEC2_REG_CABAC_ERR_HIGH, 0x3FF3FFFFu);
     EMIT_P(RKVDEC2_REG_BLOCK_GATING,
@@ -213,11 +210,10 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
     EMIT_P(RKVDEC2_REG_WR_WAIT_CYCLE_QOS, 0u);
 
     /* ---- H.264 codec params bank ------------------------------- */
-    /* idx 64 (H264_FLAGS): BSP kernel-side log shows 0 (matches the raw
-     * cmd=0x200 byte).  Our previous "0 causes dec_error" empirical
-     * result was with the bug-stack of pre-kick reset every kick +
-     * scanlist=valid_iova + poc_hi=0.  Re-test 0 with all fixes. */
-    EMIT_P(RKVDEC2_REG_H264_FLAGS, 0u);
+    /* idx 64 (H264_FLAGS): BSP writes 0x00000000 for all frames including IDR.
+     * Empirically confirmed: BSP decode succeeds with this register zero.
+     * Our earlier STREAM_LASTPACKET+FIRSTSLICE_FLAG bits caused TIMEOUT_STA. */
+    EMIT_P(RKVDEC2_REG_H264_FLAGS, 0);
     EMIT_P(RKVDEC2_REG_CUR_TOP_POC,   (uint32_t)dec.top_field_order_cnt);
     EMIT_P(RKVDEC2_REG_CUR_BOT_POC,   (uint32_t)dec.bottom_field_order_cnt);
 
@@ -292,11 +288,13 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
         EMIT_I(RKVDEC2_REG_PPS_BASE,    bufs->pps_table, 0);
     if (bufs->rps_table)
         EMIT_I(RKVDEC2_REG_RPS_BASE,    bufs->rps_table, 0);
-    /* scanlist_addr: BSP emits 0 explicitly.  We previously thought 0
-     * caused an iova-0xae0 fault, but that was actually a different
-     * bug (write-order/explicit-zeros in the driver's bank-write loop,
-     * since fixed).  Match BSP — verified bit-exact in winreplay. */
-    EMIT_P(RKVDEC2_REG_SCANLIST_ADDR, 0u);
+    /* SW180 is in trans_tbl_h264d — on Linux mpp_service IOVA 0 is unmapped
+     * so we must point to a real buffer (zeroed = flat scaling list).
+     * On Windows the driver maps a guard page at IOVA 0 so 0 worked there. */
+    if (bufs->scaling_list)
+        EMIT_I(RKVDEC2_REG_SCANLIST_ADDR, bufs->scaling_list, 0);
+    else if (bufs->output_frame)
+        EMIT_I(RKVDEC2_REG_SCANLIST_ADDR, bufs->output_frame, 0);
     if (bufs->cabac_init_table)
         EMIT_I(RKVDEC2_REG_CABACTBL_BASE, bufs->cabac_init_table, 0);
 

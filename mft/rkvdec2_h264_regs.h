@@ -36,8 +36,8 @@
 #define RKVDEC2_REG_UV_HOR_VIRSTRIDE  (19  * 4)   /* chroma_stride / 16 */
 #define RKVDEC2_REG_Y_VIRSTRIDE       (20  * 4)   /* y_size_bytes / 16 */
 #define RKVDEC2_REG_ERROR_CTRL        (21  * 4)
-#define RKVDEC2_REG_CABAC_ERR_LOW     (24  * 4)   /* RK3588: 0 */
-#define RKVDEC2_REG_CABAC_ERR_HIGH    (25  * 4)   /* RK3588: 0 */
+#define RKVDEC2_REG_CABAC_ERR_LOW     (24  * 4)   /* CABAC error detect mask; RK3588 BSP = 0 */
+#define RKVDEC2_REG_CABAC_ERR_HIGH    (25  * 4)   /* CABAC error detect mask; RK3588 BSP = 0 */
 #define RKVDEC2_REG_BLOCK_GATING      (26  * 4)   /* RK3588: 0xFFFEF | (1<<31) */
 #define RKVDEC2_REG_FILM_IDX          (28  * 4)   /* sw_film_idx[19:10] + flags */
 #define RKVDEC2_REG_TIMEOUT_THRESH    (32  * 4)   /* 0x3FFFF */

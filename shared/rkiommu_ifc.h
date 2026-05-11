@@ -43,9 +43,31 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKIOMMU,
  * RK_MMU_CMD_FORCE_RESET → poll DTE_ADDR == 0 → UN-STALL.  Resets the
  * MMU's internal state machine (walk caches, prefetcher, fault state)
  * without touching the codec/AXI/AHB/NIU CRU bits the wide
- * `Ccu.FullCoreReset` toggles.  Caller MUST follow with `Reattach` to
+ * `Ccu.FullCoreReset0/1`/`FullAv1Reset` toggles.  Caller MUST follow with `Reattach` to
  * reprogram DTE_ADDR (FORCE_RESET zeroes it). */
-#define RKIOMMU_IFC_VERSION 5u
+/* v6: add Enable/Disable/MaskIrq/UnmaskIrq so the codec driver (rkav1d)
+ * can orchestrate the whole cluster's D0Entry/D0Exit sequence on a
+ * single thread.  Design rationale: WDF does NOT synchronize D-state
+ * transitions between sibling devices under the same parent — if both
+ * rkav1d and rkiommu_av1d registered their own EvtDeviceD0Entry/Exit,
+ * the framework would dispatch the two callbacks concurrently and
+ * neither side could guarantee the IOMMU MMIO writes happen on the
+ * correct side of the CCU clock-gate toggle.  Instead, rkav1d owns the
+ * full sequence and drives the IOMMU's hardware state remotely through
+ * these ifc calls.  Ordering rkav1d will use:
+ *   D0Exit  : poller-quiesce → MaskIrq → Disable → Ccu.GateAv1LeafClocks
+ *   D0Entry : Ccu.UngateAv1LeafClocks → Enable → UnmaskIrq
+ * Enable/Disable wrap the existing internal helpers (idempotent on
+ * re-enable, AHB_CONTROL=0 on disable).  Mask/UnmaskIrq use
+ * WdfInterruptDisable/Enable — these only disconnect the ISR from
+ * kernel dispatch (no MMIO), so they are safe to call when the
+ * underlying clocks are gated.  All four methods require PASSIVE_LEVEL
+ * (WdfInterruptDisable/Enable constraint).  The pre-existing
+ * `Reattach` method (Disable-then-Enable atomically) is kept for
+ * cross-session walk-cache flush; it intentionally does NOT expose the
+ * intermediate state needed to interleave clock-gate writes, so
+ * D0Entry/D0Exit need the new split methods. */
+#define RKIOMMU_IFC_VERSION 6u
 
 typedef NTSTATUS (*RKIOMMU_QUERY_VERSION)(_Out_ PUINT32);
 
@@ -108,6 +130,17 @@ typedef NTSTATUS (*RKIOMMU_REATTACH)(_In_ PVOID ProviderContext);
  * STATUS_TIMEOUT if any MMU instance fails to ack within 100 ms. */
 typedef NTSTATUS (*RKIOMMU_FORCE_RESET)(_In_ PVOID ProviderContext);
 
+/* v6 D-state orchestration (PASSIVE_LEVEL only).  Enable programs
+ * DTE_ADDR and asserts AHB paging; Disable writes AHB_CONTROL=0 and
+ * clears the PagingEnabled flag.  MaskIrq/UnmaskIrq call
+ * WdfInterruptDisable/Enable to detach/reattach the ISR from the
+ * kernel dispatcher without touching MMIO — safe to invoke when
+ * clocks are gated.  See RKIOMMU_IFC_VERSION header for sequencing. */
+typedef NTSTATUS (*RKIOMMU_ENABLE)(_In_ PVOID ProviderContext);
+typedef NTSTATUS (*RKIOMMU_DISABLE)(_In_ PVOID ProviderContext);
+typedef NTSTATUS (*RKIOMMU_MASK_IRQ)(_In_ PVOID ProviderContext);
+typedef NTSTATUS (*RKIOMMU_UNMASK_IRQ)(_In_ PVOID ProviderContext);
+
 typedef struct _RKIOMMU_INTERFACE {
     INTERFACE                Header;
     UINT32                   Hid;     /* e.g. 0x3570 / 0x3571 */
@@ -120,4 +153,8 @@ typedef struct _RKIOMMU_INTERFACE {
     RKIOMMU_FLUSH_TLB        FlushTlb;
     RKIOMMU_REATTACH         Reattach;
     RKIOMMU_FORCE_RESET      ForceReset;
+    RKIOMMU_ENABLE           Enable;
+    RKIOMMU_DISABLE          Disable;
+    RKIOMMU_MASK_IRQ         MaskIrq;
+    RKIOMMU_UNMASK_IRQ       UnmaskIrq;
 } RKIOMMU_INTERFACE, *PRKIOMMU_INTERFACE;

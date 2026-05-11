@@ -2,7 +2,7 @@
 #pragma once
 #include <ntddk.h>
 #include <wdf.h>
-#include "../../shared/rkiommu_ifc.h"
+#include "../../../shared/rkiommu_ifc.h"
 
 /* Fault context saved by the ISR and consumed by the DPC. */
 typedef struct _RKIOMMU_FAULT_CTX {

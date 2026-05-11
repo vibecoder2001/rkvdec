@@ -60,95 +60,81 @@ static VOID FreePageBelow4G(_In_ volatile ULONG *Va)
 }
 
 /* ---------------------------------------------------------------------------
- * RkIommuDomainCreate
+ * RkIommuDomainCreateVdec — v2 IOMMU domain (RKCP3570, no PTA).
  * --------------------------------------------------------------------------- */
 _Use_decl_annotations_
-NTSTATUS RkIommuDomainCreate(PRKIOMMU_DOMAIN *Domain, BOOLEAN IsAv1d)
+NTSTATUS RkIommuDomainCreateVdec(PRKIOMMU_DOMAIN *Domain)
 {
     PRKIOMMU_DOMAIN d = (PRKIOMMU_DOMAIN)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(*d), 'mDkR');
     if (!d) return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(d, sizeof(*d));
     KeInitializeSpinLock(&d->Lock);
-    d->IsAv1d = IsAv1d;
+    d->IsAv1d = FALSE;
 
-    /* Allocate the page directory (DT for AV1D, PD for v2 — same layout
-     * for our purposes; AV1D's DTE format differs but the table itself
-     * is still 1024 × 4-byte entries). */
     d->Pd = AllocPageBelow4G(&d->PdPhys);
-    if (!d->Pd) {
-        ExFreePoolWithTag(d, 'mDkR');
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    if (!d->Pd) { ExFreePoolWithTag(d, 'mDkR'); return STATUS_INSUFFICIENT_RESOURCES; }
 
-    /* AV1D adds an extra Page-Table-Array level above the DT.  PTA is
-     * 1024 × 8-byte entries; we only use PTA[0] (single-domain), pointed
-     * at our DT in 4K mode.  IOMMU MMIO is programmed with PtaPhys
-     * instead of PdPhys at enable time. */
-    if (IsAv1d) {
-        ULONG ptaPhys = 0;
-        d->Pta = (volatile ULONGLONG *)AllocPageBelow4G(&ptaPhys);
-        if (!d->Pta) {
-            FreePageBelow4G(d->Pd);
-            ExFreePoolWithTag(d, 'mDkR');
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        d->PtaPhys = ptaPhys;
-        /* PTA[0] = DT phys (1KB-aligned bits) | mode 0 (4K). */
-        d->Pta[0] = ((ULONGLONG)d->PdPhys & AV1_PTA_DT_ADDR_MASK) |
-                    AV1_PTA_MODE_4K;
-    }
-
-    /* Allocate the IOVA bitmap (128 KiB) from non-paged pool */
-    SIZE_T bitmapBytes = RK_IOMMU_IOVA_PAGES / 8;  /* 128 KiB */
-    d->IovaBitmap = (ULONG_PTR *)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, bitmapBytes, 'bIkR');
+    SIZE_T bitmapBytes = RK_IOMMU_IOVA_PAGES / 8;
+    d->IovaBitmap = (ULONG_PTR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, bitmapBytes, 'bIkR');
     if (!d->IovaBitmap) {
         FreePageBelow4G(d->Pd);
         ExFreePoolWithTag(d, 'mDkR');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(d->IovaBitmap, bitmapBytes);
+    d->IovaBitmap[0] |= (ULONG_PTR)1;  /* reserve iova page 0 */
 
-    /* Reserve IOVA page 0 (NULL guard) — restored after system-abrupt-
-     * shutdown.  Letting the bitstream buffer land at iova 0 caused the
-     * codec to AXI-write/read at iova 0..0xFFF in ways that triggered a
-     * critical SError or thermal/power shutdown.  Safer to fault the
-     * IOMMU and let the driver report the bad iova. */
-    d->IovaBitmap[0] |= (ULONG_PTR)1;
-
-    /* Don't map iova page 0 — empirically, mapping iova 0 (zero-filled
-     * OR CABAC-loaded) makes the codec abort via INT bit 4 immediately
-     * with dec_e=1 stuck.  Without it the codec progresses ~3-11 MB
-     * rows before IOMMU-faulting at iova 0xae0..0xe00.  Neither is a
-     * win, but the latter is more debuggable. */
-
-    /* Reserve the BSP-prescribed RCB-SRAM IOVA range:
-     *   rk3588s.dtsi rkvdec0 node has
-     *     rockchip,rcb-iova = <0xFFF00000 0x100000>;
-     * BSP also iommu_maps that range to on-chip SRAM for the codec's
-     * internal RCB scratch.  The codec hardware seems to use this iova
-     * internally regardless of what we write to reg133..142.  When our
-     * top-down allocator placed another buffer (e.g. the bitstream) at
-     * 0xFFF00000, the codec stomped it and eventually faulted.  Reserve
-     * the range to keep other allocations away from it.  TODO: also map
-     * 1 MiB of contiguous DRAM to this iova range so codec writes there
-     * succeed silently instead of faulting. */
+    /* Reserve BSP-prescribed RCB-SRAM IOVA range 0xFFF00000..0xFFFFFFFF. */
     {
         const ULONG kRcbPage  = 0xFFF00000u / RK_IOMMU_PAGE_SIZE;
         const ULONG kRcbCount = 0x00100000u / RK_IOMMU_PAGE_SIZE;
         const ULONG kBpw      = (ULONG)(sizeof(ULONG_PTR) * 8);
         for (ULONG p = kRcbPage; p < kRcbPage + kRcbCount &&
-                                 p < RK_IOMMU_IOVA_PAGES; p++) {
+                                 p < RK_IOMMU_IOVA_PAGES; p++)
             d->IovaBitmap[p / kBpw] |= (ULONG_PTR)1 << (p % kBpw);
-        }
     }
 
-    /* Don't map iova page 0 — both zero-fill and CABAC content cause
-     * the codec to abort with INT=0x10 dec_error_sta.  Codec is reading
-     * SPECIFIC data from low iova; we don't know what.  Falling back
-     * to leaving page 0 unmapped (codec faults via IOMMU) and routing
-     * the codec away from low-iova reads via register fixes. */
+    *Domain = d;
+    return STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
+ * RkIommuDomainCreateAv1d — AV1D IOMMU domain (RKCP3571, allocates PTA).
+ * --------------------------------------------------------------------------- */
+_Use_decl_annotations_
+NTSTATUS RkIommuDomainCreateAv1d(PRKIOMMU_DOMAIN *Domain)
+{
+    PRKIOMMU_DOMAIN d = (PRKIOMMU_DOMAIN)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(*d), 'mDkR');
+    if (!d) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(d, sizeof(*d));
+    KeInitializeSpinLock(&d->Lock);
+    d->IsAv1d = TRUE;
+
+    d->Pd = AllocPageBelow4G(&d->PdPhys);
+    if (!d->Pd) { ExFreePoolWithTag(d, 'mDkR'); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    ULONG ptaPhys = 0;
+    d->Pta = (volatile ULONGLONG *)AllocPageBelow4G(&ptaPhys);
+    if (!d->Pta) {
+        FreePageBelow4G(d->Pd);
+        ExFreePoolWithTag(d, 'mDkR');
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    d->PtaPhys = ptaPhys;
+    d->Pta[0] = ((ULONGLONG)d->PdPhys & AV1_PTA_DT_ADDR_MASK) | AV1_PTA_MODE_4K;
+
+    SIZE_T bitmapBytes = RK_IOMMU_IOVA_PAGES / 8;
+    d->IovaBitmap = (ULONG_PTR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, bitmapBytes, 'bIkR');
+    if (!d->IovaBitmap) {
+        FreePageBelow4G((volatile ULONG *)d->Pta);
+        FreePageBelow4G(d->Pd);
+        ExFreePoolWithTag(d, 'mDkR');
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(d->IovaBitmap, bitmapBytes);
+    d->IovaBitmap[0] |= (ULONG_PTR)1;
 
     *Domain = d;
     return STATUS_SUCCESS;

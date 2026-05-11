@@ -180,6 +180,10 @@ int wmain(int argc, wchar_t **argv) {
                 std::fwrite(f.yuv.data(), 1, f.yuv.size(), o);
             }
             emitted++;
+            /* Release the DPB CONSUMER hold the engine took for this frame.
+             * Without this, the pool fills up after kPoolSize frames and
+             * Dpb_Select returns DPB_FULL.  See dpb.h Dpb_AddHold rationale. */
+            DecodeEngine_ReleaseFrame(&eng, &f);
         }
     };
     while (true) {

@@ -1,7 +1,8 @@
 /* driver/rkmpp_ccu/driver.c — KMDF driver for rkmpp_ccu.sys.
  *
  * Phase 2: maps the CRU MMIO for RKCP3503 (rkv-decoder-v2 CCU / RDCC) and
- * exposes RaiseCluster / DropCluster / AssertCoreReset / DeassertCoreReset
+ * exposes RaiseCluster / DropCluster / AssertRvdec{0,1}CoreReset /
+ * DeassertRvdec{0,1}CoreReset / GateRvdec{0,1}LeafClocks / etc.
  * via the RKMPP_CCU_INTERFACE query-interface mechanism.
  *
  * RKCP3501 / RKCP3502 are still matched (for ACPI) but the MMIO pointer is
@@ -48,6 +49,7 @@ EVT_WDF_DEVICE_PREPARE_HARDWARE  RkMppCcuEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE  RkMppCcuEvtReleaseHardware;
 
 NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device);  /* in ifc.c */
+extern VOID RkMppCcuInitMutex(VOID);                   /* in ccu.c */
 
 /* ---------------------------------------------------------------------------
  * ACPI HID parse — reused from rkmpp/device.c pattern.
@@ -214,6 +216,7 @@ RkMppCcuEvtReleaseHardware(_In_ WDFDEVICE Device,
 NTSTATUS
 DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
+    RkMppCcuInitMutex();
     WDF_DRIVER_CONFIG cfg;
     WDF_DRIVER_CONFIG_INIT(&cfg, RkMppCcuEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES,

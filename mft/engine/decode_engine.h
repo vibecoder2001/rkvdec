@@ -72,7 +72,7 @@ struct DecodeEngine {
      * per-frame kernel→vector memcpy.  Consumers must read directly
      * from pool_output[slot_idx].user_va via DecodedFrame.slot_idx and
      * call DecodeEngine_ReleaseFrame when done.  Safety guaranteed by
-     * the DPB's external-hold counter (see dpb.h Dpb_AddExternalHold).
+     * the DPB's lifecycle-hold flags (see dpb.h Dpb_AddHold).
      * At 4K NV12 this avoids ~12 ms / frame of uncached read work. */
     bool populate_yuv = true;
 
@@ -143,7 +143,7 @@ struct DecodeEngine {
         int64_t                dur_hns;
         std::vector<uint8_t>   yuv;
         /* Slot the codec wrote this picture into — held via the DPB's
-         * external_hold counter for the lifetime of this entry, so the
+         * lifecycle-hold flags (REORDER → READY → CONSUMER) for the lifetime of this entry, so the
          * codec can't reuse the slot while it sits in reorder_q/ready_q.
          * -1 if no hold is taken. */
         int                    slot_idx = -1;

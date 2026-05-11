@@ -1,7 +1,8 @@
 /* driver/rkmpp_ccu/ifc.c — in-kernel query-interface registration.
  *
- * Phase 2: wires all five RKMPP_CCU_INTERFACE function pointers.
- * Implementation lives in ccu.c; forward declarations are here.
+ * Wires every RKMPP_CCU_INTERFACE function pointer.  Implementation
+ * lives in ccu.c; forward declarations are here.  As of v7 the
+ * leaf-clock + core-reset methods are per-instance (Rvdec0 / Rvdec1).
  */
 #include <initguid.h>  /* must precede ntddk.h to force GUID instantiation */
 #include <ntddk.h>
@@ -10,16 +11,24 @@
 #include "../../shared/rkmpp_ccu_ifc.h"
 
 /* Implemented in ccu.c */
-NTSTATUS RkMppCcuQueryVersion        (_Out_ PUINT32 Version);
-NTSTATUS RkMppCcuRaiseCluster        (_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuDropCluster         (_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuAssertCoreReset     (_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuDeassertCoreReset   (_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuFullCoreReset       (_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuGateCoreLeafClocks  (_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuUngateCoreLeafClocks(_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuRaiseAv1Cluster     (_In_  PVOID   Ctx);
-NTSTATUS RkMppCcuDropAv1Cluster      (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuQueryVersion           (_Out_ PUINT32 Version);
+NTSTATUS RkMppCcuRaiseCluster           (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuDropCluster            (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuAssertRvdec0CoreReset  (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuDeassertRvdec0CoreReset(_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuGateRvdec0LeafClocks   (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuUngateRvdec0LeafClocks (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuAssertRvdec1CoreReset  (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuDeassertRvdec1CoreReset(_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuGateRvdec1LeafClocks   (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuUngateRvdec1LeafClocks (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuFullCoreReset0         (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuFullCoreReset1         (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuFullAv1Reset           (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuRaiseAv1Cluster        (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuDropAv1Cluster         (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuGateAv1LeafClocks      (_In_  PVOID   Ctx);
+NTSTATUS RkMppCcuUngateAv1LeafClocks    (_In_  PVOID   Ctx);
 
 NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device)
 {
@@ -41,13 +50,21 @@ NTSTATUS RkMppCcuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.QueryVersion             = RkMppCcuQueryVersion;
     ifc.RaiseCluster             = RkMppCcuRaiseCluster;
     ifc.DropCluster              = RkMppCcuDropCluster;
-    ifc.AssertCoreReset          = RkMppCcuAssertCoreReset;
-    ifc.DeassertCoreReset        = RkMppCcuDeassertCoreReset;
-    ifc.FullCoreReset            = RkMppCcuFullCoreReset;
-    ifc.GateCoreLeafClocks       = RkMppCcuGateCoreLeafClocks;
-    ifc.UngateCoreLeafClocks     = RkMppCcuUngateCoreLeafClocks;
+    ifc.AssertRvdec0CoreReset    = RkMppCcuAssertRvdec0CoreReset;
+    ifc.DeassertRvdec0CoreReset  = RkMppCcuDeassertRvdec0CoreReset;
+    ifc.GateRvdec0LeafClocks     = RkMppCcuGateRvdec0LeafClocks;
+    ifc.UngateRvdec0LeafClocks   = RkMppCcuUngateRvdec0LeafClocks;
+    ifc.AssertRvdec1CoreReset    = RkMppCcuAssertRvdec1CoreReset;
+    ifc.DeassertRvdec1CoreReset  = RkMppCcuDeassertRvdec1CoreReset;
+    ifc.GateRvdec1LeafClocks     = RkMppCcuGateRvdec1LeafClocks;
+    ifc.UngateRvdec1LeafClocks   = RkMppCcuUngateRvdec1LeafClocks;
+    ifc.FullCoreReset0           = RkMppCcuFullCoreReset0;
+    ifc.FullCoreReset1           = RkMppCcuFullCoreReset1;
     ifc.RaiseAv1Cluster          = RkMppCcuRaiseAv1Cluster;
     ifc.DropAv1Cluster           = RkMppCcuDropAv1Cluster;
+    ifc.GateAv1LeafClocks        = RkMppCcuGateAv1LeafClocks;
+    ifc.UngateAv1LeafClocks      = RkMppCcuUngateAv1LeafClocks;
+    ifc.FullAv1Reset             = RkMppCcuFullAv1Reset;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

@@ -1,7 +1,6 @@
 ;
 ; rkmpp_ccu.inx — Rockchip RK3588 MPP cluster control unit driver
-; Matches RKCP3501 (vpu-jpege CCU), RKCP3502 (rkv-encoder-v2 CCU),
-;     and RKCP3503 (rkv-decoder-v2 CCU). Phase 1 only meaningfully
+; Matches RKCP3503 (rkv-decoder-v2 CCU). Phase 1 only meaningfully
 ;     attaches; cluster raise/drop lands in Phase 2.
 ;
 [Version]
@@ -26,8 +25,6 @@ rkmpp_ccu.sys = 1,,
 %ManufacturerName% = Standard,NTARM64.10.0...16299
 
 [Standard.NTARM64.10.0...16299]
-%rkmpp_ccu.DeviceDesc% = rkmpp_ccu_Inst, ACPI\RKCP3501
-%rkmpp_ccu.DeviceDesc% = rkmpp_ccu_Inst, ACPI\RKCP3502
 %rkmpp_ccu.DeviceDesc% = rkmpp_ccu_Inst, ACPI\RKCP3503
 
 [rkmpp_ccu_Inst.NT]

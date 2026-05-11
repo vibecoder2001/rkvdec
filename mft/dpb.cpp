@@ -1,14 +1,28 @@
 /* mft/dpb.cpp — Phase 3b minimal H.264 DPB. */
 #include "dpb.h"
 #include <string.h>
+#include <cassert>
 
 namespace {
 
+/* True iff any lifecycle flag is set — slot is still "in use" for the
+ * picker.  Mirrors the role the old `external_hold` refcount played. */
+static inline bool slot_held(const DpbCtx *ctx, int i) {
+    return ctx->slots[i].pending_reorder
+        || ctx->slots[i].pending_ready
+        || ctx->slots[i].held_by_consumer;
+}
+static inline bool h265_slot_held(const H265DpbCtx *ctx, int i) {
+    return ctx->slots[i].pending_reorder
+        || ctx->slots[i].pending_ready
+        || ctx->slots[i].held_by_consumer;
+}
+
 /* Helpers for the per-slot bitfield struct (the C ABI uses :1 fields,
  * so we go through tiny accessors to keep the implementation tidy).
- * Note: external_hold is intentionally preserved here — it's a refcount
- * owned by a downstream consumer, and the DPB clearing this slot doesn't
- * release the consumer's reference to its data. */
+ * Note: lifecycle flags + epoch are intentionally preserved here — they
+ * track downstream consumers, and the DPB clearing reference state for
+ * a slot doesn't release the consumer's claim on its data. */
 static inline void slot_clear(DpbCtx *ctx, int i) {
     ctx->slots[i].in_use    = 0;
     ctx->slots[i].is_ref    = 0;
@@ -255,23 +269,103 @@ static void apply_mmco_ops(DpbCtx *ctx, int cur) {
 
 static int find_free(const DpbCtx *ctx) {
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
-        if (ctx->slots[i].in_use)         continue;
-        if (ctx->slots[i].external_hold)  continue;
+        if (ctx->slots[i].in_use)  continue;
+        if (slot_held(ctx, (int)i)) continue;
         return (int)i;
     }
     return -1;
 }
 
-extern "C" void Dpb_AddExternalHold(DpbCtx *ctx, uint32_t slot_idx) {
-    if (!ctx || slot_idx >= ctx->pool_size) return;
-    if (ctx->slots[slot_idx].external_hold < 0xF)
-        ctx->slots[slot_idx].external_hold++;
+/* ----- H.264 hold API.  Refcount semantics replaced by named-flag
+ *       single-set/single-clear with assertions on every transition. */
+
+static inline uint8_t h264_flag_get(const DpbCtx *ctx, uint32_t slot_idx,
+                                    DpbHoldReason r)
+{
+    const auto &s = ctx->slots[slot_idx];
+    switch (r) {
+    case DPB_HOLD_REORDER:  return s.pending_reorder;
+    case DPB_HOLD_READY:    return s.pending_ready;
+    case DPB_HOLD_CONSUMER: return s.held_by_consumer;
+    }
+    return 0;
+}
+static inline void h264_flag_set(DpbCtx *ctx, uint32_t slot_idx,
+                                 DpbHoldReason r, uint8_t v)
+{
+    auto &s = ctx->slots[slot_idx];
+    switch (r) {
+    case DPB_HOLD_REORDER:  s.pending_reorder  = v; return;
+    case DPB_HOLD_READY:    s.pending_ready    = v; return;
+    case DPB_HOLD_CONSUMER: s.held_by_consumer = v; return;
+    }
 }
 
-extern "C" void Dpb_ReleaseExternalHold(DpbCtx *ctx, uint32_t slot_idx) {
+extern "C" void Dpb_AddHold(DpbCtx *ctx, uint32_t slot_idx,
+                            DpbHoldReason reason, uint32_t entry_epoch)
+{
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    if (ctx->slots[slot_idx].external_hold > 0)
-        ctx->slots[slot_idx].external_hold--;
+    /* Single-set: the reason flag must currently be clear.  Repeated Adds
+     * for the same reason indicate a queue-tracking bug (e.g. a slot
+     * inserted into reorder_q twice). */
+    assert(h264_flag_get(ctx, slot_idx, reason) == 0);
+    /* Epoch must match.  A mismatch means the entry survived a flush
+     * (current_epoch was bumped) but is still trying to grab a slot
+     * whose epoch is from before the flush — or vice versa. */
+    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    (void)entry_epoch;  /* silence Release-build unused-param warning */
+    h264_flag_set(ctx, slot_idx, reason, 1);
+}
+
+extern "C" void Dpb_ReleaseHold(DpbCtx *ctx, uint32_t slot_idx,
+                                DpbHoldReason reason)
+{
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    /* Single-clear: a release of a reason that wasn't held is a
+     * decrement-from-zero bug.  Catches double-release and stray
+     * cleanup paths. */
+    assert(h264_flag_get(ctx, slot_idx, reason) == 1);
+    h264_flag_set(ctx, slot_idx, reason, 0);
+}
+
+extern "C" void Dpb_TransferHold(DpbCtx *ctx, uint32_t slot_idx,
+                                 DpbHoldReason from, DpbHoldReason to,
+                                 uint32_t entry_epoch)
+{
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    assert(from != to);
+    assert(h264_flag_get(ctx, slot_idx, from) == 1);
+    assert(h264_flag_get(ctx, slot_idx, to)   == 0);
+    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    (void)entry_epoch;
+    h264_flag_set(ctx, slot_idx, from, 0);
+    h264_flag_set(ctx, slot_idx, to,   1);
+}
+
+extern "C" void Dpb_Flush(DpbCtx *ctx)
+{
+    if (!ctx) return;
+    for (uint32_t i = 0; i < ctx->pool_size; i++) {
+        /* Caller is responsible for releasing reorder/ready holds before
+         * calling Flush — those are tied to engine queue entries the
+         * caller knows about.  Consumer holds may legitimately survive a
+         * flush and must keep their pre-flush epoch so a later
+         * ReleaseHold(CONSUMER) still asserts cleanly. */
+        assert(ctx->slots[i].pending_reorder == 0);
+        assert(ctx->slots[i].pending_ready   == 0);
+        if (!ctx->slots[i].held_by_consumer) {
+            slot_clear(ctx, (int)i);
+        } else {
+            /* Drop reference state but keep the slot reserved for the
+             * consumer.  The consumer's eventual ReleaseHold will
+             * compare against the pre-flush epoch on this slot. */
+            ctx->slots[i].in_use    = 0;
+            ctx->slots[i].is_ref    = 0;
+            ctx->slots[i].long_term = 0;
+        }
+    }
+    ctx->current_idx = -1;
+    ctx->current_epoch++;
 }
 
 /* Sliding-window eviction: drop the short-term reference with the
@@ -361,6 +455,14 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
         if (slot < 0) return DPB_FULL;
     }
 
+    /* Slot-state invariant: find_free guarantees in_use=0 and no hold,
+     * but make it explicit at the picker boundary.  An assert here
+     * means find_free or Flush left a slot in an unexpected state. */
+    assert(!ctx->slots[slot].in_use);
+    assert(!slot_held(ctx, slot));
+    assert(!ctx->slots[slot].is_ref);
+    assert(ctx->current_idx != slot);
+
     /* Populate the chosen slot for the picture currently being decoded. */
     ctx->slots[slot].in_use     = 1;
     ctx->slots[slot].is_ref     = (parsed->decode.nal_ref_idc != 0);
@@ -370,6 +472,7 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
     ctx->slots[slot].top_poc    = parsed->decode.top_field_order_cnt;
     ctx->slots[slot].bottom_poc = parsed->decode.bottom_field_order_cnt;
     ctx->slots[slot].long_term_frame_idx = 0;   /* IDR LT idx is 0 by spec */
+    ctx->slots[slot].epoch      = ctx->current_epoch;
     ctx->current_idx            = slot;
 
     /* Capture the dec_ref_pic_marking surface for OnDecodeComplete to
@@ -751,7 +854,7 @@ void Dpb_OnDecodeComplete(DpbCtx *ctx)
 namespace {
 
 static inline void h265_slot_clear(H265DpbCtx *ctx, int i) {
-    /* external_hold deliberately not touched — see DpbCtx::slot_clear. */
+    /* Lifecycle flags + epoch deliberately not touched — see slot_clear. */
     ctx->slots[i].in_use = 0;
     ctx->slots[i].is_ref = 0;
     ctx->slots[i].poc    = 0;
@@ -762,26 +865,82 @@ static int h265_find_free(const H265DpbCtx *ctx) {
      * cleared its is_ref bit) AND isn't held by a downstream consumer.
      * Then try truly-empty slots that also aren't held. */
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
-        if (ctx->slots[i].external_hold)              continue;
+        if (h265_slot_held(ctx, (int)i))               continue;
         if (ctx->slots[i].in_use && !ctx->slots[i].is_ref) return (int)i;
     }
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
-        if (ctx->slots[i].external_hold) continue;
+        if (h265_slot_held(ctx, (int)i)) continue;
         if (!ctx->slots[i].in_use)       return (int)i;
     }
     return -1;
 }
 
-extern "C" void H265Dpb_AddExternalHold(H265DpbCtx *ctx, uint32_t slot_idx) {
-    if (!ctx || slot_idx >= ctx->pool_size) return;
-    if (ctx->slots[slot_idx].external_hold < 0xF)
-        ctx->slots[slot_idx].external_hold++;
+static inline uint8_t h265_flag_get(const H265DpbCtx *ctx, uint32_t slot_idx,
+                                    DpbHoldReason r)
+{
+    const auto &s = ctx->slots[slot_idx];
+    switch (r) {
+    case DPB_HOLD_REORDER:  return s.pending_reorder;
+    case DPB_HOLD_READY:    return s.pending_ready;
+    case DPB_HOLD_CONSUMER: return s.held_by_consumer;
+    }
+    return 0;
+}
+static inline void h265_flag_set(H265DpbCtx *ctx, uint32_t slot_idx,
+                                 DpbHoldReason r, uint8_t v)
+{
+    auto &s = ctx->slots[slot_idx];
+    switch (r) {
+    case DPB_HOLD_REORDER:  s.pending_reorder  = v; return;
+    case DPB_HOLD_READY:    s.pending_ready    = v; return;
+    case DPB_HOLD_CONSUMER: s.held_by_consumer = v; return;
+    }
 }
 
-extern "C" void H265Dpb_ReleaseExternalHold(H265DpbCtx *ctx, uint32_t slot_idx) {
+extern "C" void H265Dpb_AddHold(H265DpbCtx *ctx, uint32_t slot_idx,
+                                DpbHoldReason reason, uint32_t entry_epoch)
+{
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    if (ctx->slots[slot_idx].external_hold > 0)
-        ctx->slots[slot_idx].external_hold--;
+    assert(h265_flag_get(ctx, slot_idx, reason) == 0);
+    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    (void)entry_epoch;
+    h265_flag_set(ctx, slot_idx, reason, 1);
+}
+extern "C" void H265Dpb_ReleaseHold(H265DpbCtx *ctx, uint32_t slot_idx,
+                                    DpbHoldReason reason)
+{
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    assert(h265_flag_get(ctx, slot_idx, reason) == 1);
+    h265_flag_set(ctx, slot_idx, reason, 0);
+}
+extern "C" void H265Dpb_TransferHold(H265DpbCtx *ctx, uint32_t slot_idx,
+                                     DpbHoldReason from, DpbHoldReason to,
+                                     uint32_t entry_epoch)
+{
+    if (!ctx || slot_idx >= ctx->pool_size) return;
+    assert(from != to);
+    assert(h265_flag_get(ctx, slot_idx, from) == 1);
+    assert(h265_flag_get(ctx, slot_idx, to)   == 0);
+    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    (void)entry_epoch;
+    h265_flag_set(ctx, slot_idx, from, 0);
+    h265_flag_set(ctx, slot_idx, to,   1);
+}
+extern "C" void H265Dpb_Flush(H265DpbCtx *ctx)
+{
+    if (!ctx) return;
+    for (uint32_t i = 0; i < ctx->pool_size; i++) {
+        assert(ctx->slots[i].pending_reorder == 0);
+        assert(ctx->slots[i].pending_ready   == 0);
+        if (!ctx->slots[i].held_by_consumer) {
+            h265_slot_clear(ctx, (int)i);
+        } else {
+            ctx->slots[i].in_use = 0;
+            ctx->slots[i].is_ref = 0;
+        }
+    }
+    ctx->current_idx = -1;
+    ctx->current_epoch++;
 }
 
 /* Resolve the active short-term RPS for the current slice (HEVC 7.4.7.1):

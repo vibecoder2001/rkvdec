@@ -13,6 +13,38 @@ static int Fail(const char *m, DWORD ec = 0) {
     return 1;
 }
 
+/* Diagnostic: pre-fill the output frame buffer with a marker byte before
+ * each H.264 kick, gated on RKMPP_OUTPUT_FILL=<byte>.  Targets the open
+ * hypothesis from h264_cavlc_idr_divergence.md that BSP allocates fd 11
+ * with a 0xD6 fill pattern (probably mpp's debug-fill init) while our
+ * `RkMppBufAlloc` zero-fills, and the codec leaves *some* MB region
+ * untouched during I-slice decode → the init pattern leaks into output.
+ *
+ * Set RKMPP_OUTPUT_FILL=0xD6 to mimic BSP, RKMPP_OUTPUT_FILL=0xAA / 0x55
+ * for distinct sentinels, unset to keep zero-fill (default).  Compares
+ * against the BSP YUV with `fc /b ours.yuv bsp.yuv` to determine whether
+ * the divergence comes from leak-through.  Returns -1 when unset. */
+static int OutputFillByte() {
+    static int cached = -2;
+    if (cached == -2) {
+        char buf[16] = {};
+        DWORD n = GetEnvironmentVariableA("RKMPP_OUTPUT_FILL", buf, sizeof(buf));
+        if (n == 0) {
+            cached = -1;
+            std::fprintf(stderr,
+                "RKMPP_OUTPUT_FILL: unset (output buffer left as kernel-zeroed)\n");
+            return -1;
+        }
+        unsigned long v = strtoul(buf, nullptr,
+                                  (buf[0]=='0' && (buf[1]=='x' || buf[1]=='X')) ? 16 : 10);
+        cached = (int)(v & 0xff);
+        std::fprintf(stderr,
+            "RKMPP_OUTPUT_FILL=%s -> pre-filling each H.264 output buffer with 0x%02x\n",
+            buf, cached);
+    }
+    return cached;
+}
+
 /* Per-frame debug spam (DMA buffer dumps to win_*.bin, register-list
  * dumps, slice-offset prints) was useful during bring-up but each frame
  * triggers ~5 fopen/fwrite/fclose cycles + 100+ printf lines.  On a
@@ -524,6 +556,18 @@ static int DecodeOne_H264(DecodeEngine *e,
     if (e->pool_colmv[sel.current_slot].user_va) {
         std::memset(e->pool_colmv[sel.current_slot].user_va, 0,
                     e->pool_colmv[sel.current_slot].size);
+    }
+
+    /* Output pre-fill experiment — see OutputFillByte() docstring.  Only
+     * fires when RKMPP_OUTPUT_FILL is set; default path leaves the
+     * kernel-zeroed buffer alone so this is opt-in for diagnostics. */
+    {
+        int fill = OutputFillByte();
+        if (fill >= 0 && e->pool_output[sel.current_slot].user_va) {
+            std::memset(e->pool_output[sel.current_slot].user_va,
+                        fill,
+                        e->pool_output[sel.current_slot].size);
+        }
     }
 
     if (TimingEnabled()) { int64_t t = QpcNow(); timing.pack_us = QpcUs(t0, t); t0 = t; }
@@ -1145,6 +1189,21 @@ static void bump_lowest(DecodeEngine *e) {
     for (size_t i = 1; i < e->reorder_q.size(); i++) {
         if (e->reorder_q[i].poc < e->reorder_q[best].poc) best = i;
     }
+    auto &entry = e->reorder_q[best];
+    /* Move the slot's hold from REORDER → READY so the diagnostic state
+     * matches which queue the entry is in.  Skipped when slot_idx<0
+     * (engine_reorder_test bypasses the hold path). */
+    if (entry.slot_idx >= 0 && entry.slot_idx < DecodeEngine::kPoolSize) {
+        if (e->codec == Codec::H265) {
+            H265Dpb_TransferHold(&e->dpb_h265, (uint32_t)entry.slot_idx,
+                                 DPB_HOLD_REORDER, DPB_HOLD_READY,
+                                 entry.epoch);
+        } else {
+            Dpb_TransferHold(&e->dpb_h264, (uint32_t)entry.slot_idx,
+                             DPB_HOLD_REORDER, DPB_HOLD_READY,
+                             entry.epoch);
+        }
+    }
     e->ready_q.push_back(std::move(e->reorder_q[best]));
     e->reorder_q.erase(e->reorder_q.begin() + best);
 }
@@ -1198,10 +1257,12 @@ int DecodeEngine_Submit(DecodeEngine *e,
         e->last_decoded_slot < DecodeEngine::kPoolSize) {
         entry.slot_idx = e->last_decoded_slot;
         if (e->codec == Codec::H265) {
-            H265Dpb_AddExternalHold(&e->dpb_h265, (uint32_t)entry.slot_idx);
+            H265Dpb_AddHold(&e->dpb_h265, (uint32_t)entry.slot_idx,
+                            DPB_HOLD_REORDER, entry.epoch);
             entry.is_ref = e->dpb_h265.slots[entry.slot_idx].is_ref ? true : false;
         } else {
-            Dpb_AddExternalHold(&e->dpb_h264, (uint32_t)entry.slot_idx);
+            Dpb_AddHold(&e->dpb_h264, (uint32_t)entry.slot_idx,
+                        DPB_HOLD_REORDER, entry.epoch);
             entry.is_ref = e->dpb_h264.slots[entry.slot_idx].is_ref ? true : false;
         }
     }
@@ -1256,11 +1317,22 @@ int DecodeEngine_PollFrame(DecodeEngine *e, DecodedFrame *out)
     out->dur_hns  = entry.dur_hns;
     out->yuv      = std::move(entry.yuv);
     out->epoch    = entry.epoch;
-    /* Transfer the external hold from the queue entry to the
-     * DecodedFrame.  Consumer must call DecodeEngine_ReleaseFrame to
-     * decrement; failing to do so would leak holds and eventually
-     * exhaust the slot pool. */
+    /* Move the slot's hold from READY → CONSUMER as the entry leaves
+     * ready_q for a live DecodedFrame.  Consumer must call
+     * DecodeEngine_ReleaseFrame to clear the CONSUMER hold; failing to
+     * do so would leak holds and eventually exhaust the slot pool. */
     out->slot_idx = entry.slot_idx;
+    if (entry.slot_idx >= 0 && entry.slot_idx < DecodeEngine::kPoolSize) {
+        if (e->codec == Codec::H265) {
+            H265Dpb_TransferHold(&e->dpb_h265, (uint32_t)entry.slot_idx,
+                                 DPB_HOLD_READY, DPB_HOLD_CONSUMER,
+                                 entry.epoch);
+        } else {
+            Dpb_TransferHold(&e->dpb_h264, (uint32_t)entry.slot_idx,
+                             DPB_HOLD_READY, DPB_HOLD_CONSUMER,
+                             entry.epoch);
+        }
+    }
     entry.slot_idx = -1;
     out->is_ref   = entry.is_ref;
     /* Zero-copy fields — valid in either populate_yuv mode but only
@@ -1284,9 +1356,11 @@ void DecodeEngine_ReleaseFrame(DecodeEngine *e, DecodedFrame *f)
     if (!e || !f) return;
     if (f->slot_idx < 0 || f->slot_idx >= DecodeEngine::kPoolSize) return;
     if (e->codec == Codec::H265)
-        H265Dpb_ReleaseExternalHold(&e->dpb_h265, (uint32_t)f->slot_idx);
+        H265Dpb_ReleaseHold(&e->dpb_h265, (uint32_t)f->slot_idx,
+                            DPB_HOLD_CONSUMER);
     else
-        Dpb_ReleaseExternalHold(&e->dpb_h264, (uint32_t)f->slot_idx);
+        Dpb_ReleaseHold(&e->dpb_h264, (uint32_t)f->slot_idx,
+                        DPB_HOLD_CONSUMER);
     f->slot_idx = -1;
 }
 
@@ -1302,35 +1376,41 @@ int DecodeEngine_Flush(DecodeEngine *e)
 {
     /* Drop any pending reorder window — flush in MFT terms means "the
      * caller is dropping output and starting fresh from the next IDR".
-     * Release the per-entry external holds before clearing so the DPB
-     * doesn't see leaked refcounts after the re-init below. */
-    auto release_hold = [&](int slot_idx) {
+     * Release the per-entry holds before clearing the queues so the
+     * DPB's lifecycle flags match. */
+    auto release_reorder = [&](int slot_idx) {
         if (slot_idx < 0 || slot_idx >= DecodeEngine::kPoolSize) return;
         if (e->codec == Codec::H265)
-            H265Dpb_ReleaseExternalHold(&e->dpb_h265, (uint32_t)slot_idx);
+            H265Dpb_ReleaseHold(&e->dpb_h265, (uint32_t)slot_idx,
+                                DPB_HOLD_REORDER);
         else
-            Dpb_ReleaseExternalHold(&e->dpb_h264, (uint32_t)slot_idx);
+            Dpb_ReleaseHold(&e->dpb_h264, (uint32_t)slot_idx,
+                            DPB_HOLD_REORDER);
     };
-    for (auto &entry : e->reorder_q) release_hold(entry.slot_idx);
-    for (auto &entry : e->ready_q)   release_hold(entry.slot_idx);
+    auto release_ready = [&](int slot_idx) {
+        if (slot_idx < 0 || slot_idx >= DecodeEngine::kPoolSize) return;
+        if (e->codec == Codec::H265)
+            H265Dpb_ReleaseHold(&e->dpb_h265, (uint32_t)slot_idx,
+                                DPB_HOLD_READY);
+        else
+            Dpb_ReleaseHold(&e->dpb_h264, (uint32_t)slot_idx,
+                            DPB_HOLD_READY);
+    };
+    for (auto &entry : e->reorder_q) release_reorder(entry.slot_idx);
+    for (auto &entry : e->ready_q)   release_ready  (entry.slot_idx);
     e->reorder_q.clear();
     e->ready_q.clear();
     e->submit_count = 0;
     e->max_num_reorder_pics = 0;
 
-    /* Re-init the DPB pool (same buffers as DecodeEngine_Init). */
-    DpbPoolEntry pool[DecodeEngine::kPoolSize];
-    for (int i = 0; i < DecodeEngine::kPoolSize; i++) {
-        pool[i].output_frame = e->pool_output[i].handle;
-        pool[i].colmv        = e->pool_colmv[i].handle;
-    }
+    /* Bump the DPB epoch and clear reference state on slots not held by
+     * a live DecodedFrame.  Consumer-held slots keep their pre-flush
+     * epoch so the consumer's eventual ReleaseFrame still asserts
+     * cleanly.  Pool buffers untouched. */
     if (e->codec == Codec::H265) {
-        if (H265Dpb_Init(&e->dpb_h265, pool, DecodeEngine::kPoolSize) != DPB_OK)
-            return Fail("H265Dpb_Init (flush)");
-        /* Persistent VPS/SPS/PPS in parsed_h265 stays — next IDR re-validates. */
+        H265Dpb_Flush(&e->dpb_h265);
     } else {
-        if (Dpb_Init(&e->dpb_h264, pool, DecodeEngine::kPoolSize) != DPB_OK)
-            return Fail("Dpb_Init (flush)");
+        Dpb_Flush(&e->dpb_h264);
     }
     return 0;
 }

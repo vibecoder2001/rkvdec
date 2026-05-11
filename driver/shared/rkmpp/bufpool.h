@@ -10,7 +10,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 
-#include "../../shared/rkmpp_ioctl.h"
+#include "../../../shared/rkmpp_ioctl.h"
 
 /* -----------------------------------------------------------------------
  * Per-file-object context

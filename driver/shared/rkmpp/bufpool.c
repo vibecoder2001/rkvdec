@@ -25,8 +25,8 @@
 #include <ntifs.h>
 #include <wdf.h>
 
-#include "../../shared/rkmpp_ioctl.h"
-#include "../../shared/rkiommu_ifc.h"
+#include "../../../shared/rkmpp_ioctl.h"
+#include "../../../shared/rkiommu_ifc.h"
 #include "bufpool.h"
 #include "profile.h"
 

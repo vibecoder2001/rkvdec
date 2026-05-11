@@ -2,8 +2,8 @@
 
 #include <ntddk.h>
 #include <wdf.h>
-#include "../../shared/rkiommu_ifc.h"
-#include "../../shared/rkmpp_ccu_ifc.h"
+#include "../../../shared/rkiommu_ifc.h"
+#include "../../../shared/rkmpp_ccu_ifc.h"
 
 typedef struct _RKMPP_IFC_CLIENT {
     RKIOMMU_INTERFACE   Iommu;

@@ -1,0 +1,50 @@
+;
+; rkvdec.inx — Rockchip RK3588 H.264 / HEVC video decoder driver.
+; Matches RKCP3550 (RKVDEC v2) only.  UID 0 = RVD0, UID 1 = RVD1.
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Media
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; will be stamped by stampinf
+CatalogFile = rkvdec.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rkvdec.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%rkvdec.DeviceDesc% = rkvdec_Inst, ACPI\RKCP3550
+
+[rkvdec_Inst.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rkvdec.sys
+
+[rkvdec_Inst.NT.Services]
+AddService = rkvdec, %SPSVCINST_ASSOCSERVICE%, rkvdec_Service_Inst
+
+[rkvdec_Service_Inst]
+DisplayName    = %rkvdec.SVCDESC%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\rkvdec.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "Rockchip Windows Drivers Project"
+DiskName               = "rkvdec Installation Disk"
+rkvdec.DeviceDesc      = "Rockchip RK3588 RKVDEC v2 H.264 / HEVC decoder"
+rkvdec.SVCDESC         = "rkvdec Service"

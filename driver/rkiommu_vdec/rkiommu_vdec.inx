@@ -1,0 +1,51 @@
+;
+; rkiommu_vdec.inx — Rockchip RK3588 vdec cluster IOMMU driver.
+; Matches RKCP3570 (rockchip,iommu-v2) — all _UID instances.
+; The topology table in topology.c gates which UIDs actually serve codec clients.
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = ; will be stamped by stampinf
+CatalogFile = rkiommu_vdec.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rkiommu_vdec.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%rkiommu_vdec.DeviceDesc% = rkiommu_vdec_Inst, ACPI\RKCP3570
+
+[rkiommu_vdec_Inst.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rkiommu_vdec.sys
+
+[rkiommu_vdec_Inst.NT.Services]
+AddService = rkiommu_vdec, %SPSVCINST_ASSOCSERVICE%, rkiommu_vdec_Service_Inst
+
+[rkiommu_vdec_Service_Inst]
+DisplayName    = %rkiommu_vdec.SVCDESC%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\rkiommu_vdec.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE  = 0x00000002
+ManufacturerName        = "Rockchip Windows Drivers Project"
+DiskName                = "rkiommu_vdec Installation Disk"
+rkiommu_vdec.DeviceDesc = "Rockchip RK3588 vdec cluster IOMMU"
+rkiommu_vdec.SVCDESC    = "rkiommu_vdec Service"

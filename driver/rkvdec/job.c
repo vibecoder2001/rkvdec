@@ -26,6 +26,14 @@ extern void RkMppGetPublic(_In_ WDFDEVICE Device, _Out_ RKMPP_DEVICE_PUBLIC *Out
 /* Defined in device.c — accessor pair for RKMPP_DEVICE.NeedsCoreReset. */
 extern LONG RkMppQueryAndClearNeedsCoreReset(_In_ WDFDEVICE Device);
 extern VOID RkMppSetNeedsCoreReset(_In_ WDFDEVICE Device);
+/* 2-tier reset escalation: when narrow CoreReset doesn't recover the
+ * codec (typically dec_e stuck at 1 across kicks), we set NeedsFullReset
+ * which JobStart escalates to CcuFullCoreReset0/1 + IOMMU Reattach. */
+extern LONG RkMppQueryAndClearNeedsFullReset(_In_ WDFDEVICE Device);
+extern VOID RkMppSetNeedsFullReset(_In_ WDFDEVICE Device);
+/* Returns previous value, atomically swapping in NewValue.  Used in
+ * JobComplete to detect "this fail follows another fail" → escalate. */
+extern LONG RkMppExchangeLastJobFailed(_In_ WDFDEVICE Device, LONG NewValue);
 
 /* Tracing wrapper for codec MMIO writes — matches BSP's
  * mpp_dev_debug=DEBUG_SET_REG output format so the two traces can be
@@ -141,8 +149,8 @@ RkMppJobReferencesBuffer(_In_ const RKMPP_JOB *Job,
 {
     if (!Job || Job->Owner != File || Cookie == 0) return FALSE;
 
-    for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
-        if (Job->Writes[i].BufferHandle == Cookie) return TRUE;
+    for (UINT32 i = 0; i < Job->DenseIovaSlotCount; i++) {
+        if (Job->DenseIovaSlots[i].BufferHandle == Cookie) return TRUE;
     }
     for (UINT32 i = 0; i < Job->BufRefCount; i++) {
         if (Job->BufRefs[i].BufferHandle == Cookie) return TRUE;
@@ -175,7 +183,6 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     Queue->NextId   = 0;
     Queue->Device   = Device;
     Queue->Interrupt = NULL;
-    RtlZeroMemory(Queue->PrevNonzeroMask, sizeof(Queue->PrevNonzeroMask));
 
     /* Auto-reset kick: each Set wakes the poller exactly once. */
     KeInitializeEvent(&Queue->KickEvent, SynchronizationEvent, FALSE);
@@ -310,6 +317,21 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
             *InFlightTimedOut = TRUE;
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "rkmpp: file-cleanup in-flight wait timed out\n");
+            /* Sever the in-flight job's references to the buffer-pool
+             * MDLs before the caller (EvtFileCleanup) runs BufFreeAll.
+             * The poller is still alive and will eventually call
+             * JobComplete, which dereferences OutputFrameMdl /
+             * ColmvCurMdl in KeFlushIoBuffers.  Without this clear,
+             * those flushes hit freed MDL memory → bugcheck.
+             * JobComplete already null-checks both fields and skips
+             * the flush; taking q->Lock here serializes against its
+             * acquisition of the same lock around the flushes. */
+            KeAcquireSpinLock(&q->Lock, &old);
+            if (q->InFlight == inFlight && inFlight->Owner == File) {
+                inFlight->OutputFrameMdl = NULL;
+                inFlight->ColmvCurMdl    = NULL;
+            }
+            KeReleaseSpinLock(&q->Lock, old);
             /* Don't free the in-flight job here — the poller still owns
              * it and will eventually move it to Completed.  Leaking the
              * struct is acceptable; the alternative (freeing while the
@@ -341,6 +363,38 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
     }
 
     return STATUS_SUCCESS;
+}
+
+/* -----------------------------------------------------------------------
+ * RkMppJobQueueHasOtherOwner — TRUE when InFlight or Pending contains at
+ * least one job whose Owner is NOT `File`.  Intended for EvtFileCleanup
+ * to decide whether the session-end PD power-cycle is safe (no other
+ * concurrent decode session on this engine) or whether it would yank the
+ * hardware out from under another File.
+ *
+ * Call AFTER RkMppJobsDrainOwner so this File's contribution is already
+ * gone — the call then reduces to "is anyone else still using me".
+ * --------------------------------------------------------------------- */
+BOOLEAN
+RkMppJobQueueHasOtherOwner(_In_ WDFDEVICE Device, _In_ WDFFILEOBJECT File)
+{
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+    KIRQL old;
+    BOOLEAN otherActive = FALSE;
+
+    KeAcquireSpinLock(&q->Lock, &old);
+    if (q->InFlight && q->InFlight->Owner != File) {
+        otherActive = TRUE;
+    } else {
+        for (PLIST_ENTRY e = q->Pending.Flink;
+             e != &q->Pending;
+             e = e->Flink) {
+            RKMPP_JOB *cand = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+            if (cand->Owner != File) { otherActive = TRUE; break; }
+        }
+    }
+    KeReleaseSpinLock(&q->Lock, old);
+    return otherActive;
 }
 
 /* -----------------------------------------------------------------------
@@ -702,7 +756,82 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
      * fresh PnP boot, the codec apparently expects to retain initialisation
      * state across kicks; resetting clobbers something it relies on, which
      * manifests as INT=0x10 dec_error_sta partway through frame. */
-    if (RkMppQueryAndClearNeedsCoreReset(Device)) {
+    if (RkMppQueryAndClearNeedsFullReset(Device)) {
+        /* Wide hang-recovery reset — kicks the codec out of stuck FSM
+         * states (dec_e=1 across kicks, no interrupt) that the narrow
+         * CON40-bits-6..9 toggle below can't recover.  The unwedge
+         * recipe is: hclk_rkvdec0_root + aclk_rkvdec0_root reset (lives
+         * inside the FullCoreReset0 SOFTRST_CON40 mask, bits 3..6),
+         * with strict quiesce of all I/O to rkvdec0 AND the IOMMU
+         * across the reset window.
+         *
+         * Cross-File concurrency note: this engine may be shared with
+         * another open File (scenario A).  Resetting here is safe for
+         * that File too because (a) we're at the *start* of a kick, not
+         * mid-DMA — the JobStart caller (SubmitDense) just transitioned
+         * us from Pending→InFlight under the queue lock, the codec is
+         * idle; (b) the dense-bank programming below rewrites every
+         * covered swreg for this kick so no register state from the
+         * other File is being preserved-then-lost; (c) the IOMMU
+         * Disable+Enable below preserves the domain mapping (just
+         * drops the walk cache), so the other File's iovas remain
+         * valid for their next kick.
+         *
+         * Sequence:
+         *   1. MaskIrq    — detach ISR (no MMIO; safe with clocks gated)
+         *   2. Disable    — final IOMMU MMIO write (AHB_CONTROL=0) before
+         *                   we yank the bus
+         *   3. FullCoreReset — PMU bus-idle → assert root+slave+core
+         *                      resets → udelay → deassert → release idle
+         *   4. Enable     — re-program DTE_ADDR + AHB paging on the
+         *                   freshly-reset IOMMU (more than just Reattach
+         *                   — this is the "must be set up again" the
+         *                   reset recipe requires)
+         *   5. UnmaskIrq  — re-arm ISR
+         *
+         * Without 1+2, a stray fault IRQ during the reset window reads
+         * IOMMU MMIO held in reset → UB.  Without 4 the next codec
+         * kick lands at iova 0 / undefined phys. */
+        PRKMPP_CCU_INTERFACE    ccu   = RkMppGetCcuIfc(Device);
+        PRKIOMMU_INTERFACE      iommu = RkMppGetIommuIfc(Device);
+        RKMPP_DEVICE_PUBLIC pub;
+        RkMppGetPublic(Device, &pub);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "rkmpp: escalating to FullCoreReset on UID=%u (job %llu)\n",
+                   pub.Uid, (unsigned long long)Job->Id);
+
+        if (iommu && iommu->MaskIrq) {
+            iommu->MaskIrq(iommu->Header.Context);
+        }
+        if (iommu && iommu->Disable) {
+            (void)iommu->Disable(iommu->Header.Context);
+        }
+        if (ccu) {
+            if (pub.Uid == 0 && ccu->FullCoreReset0) {
+                ccu->FullCoreReset0(ccu->Header.Context);
+            } else if (pub.Uid == 1 && ccu->FullCoreReset1) {
+                ccu->FullCoreReset1(ccu->Header.Context);
+            }
+        }
+        BOOLEAN reattachOk = TRUE;
+        if (iommu && iommu->Enable) {
+            NTSTATUS rs = iommu->Enable(iommu->Header.Context);
+            if (!NT_SUCCESS(rs)) {
+                reattachOk = FALSE;
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "rkmpp: post-FullReset IOMMU Enable failed 0x%08x; "
+                           "re-flagging for next kick\n", rs);
+                RkMppSetNeedsFullReset(Device);
+            }
+        }
+        if (iommu && iommu->UnmaskIrq) {
+            iommu->UnmaskIrq(iommu->Header.Context);
+        }
+        (void)reattachOk;
+        /* FullCoreReset subsumes the narrow path; clear the narrow flag
+         * so the per-job assert/deassert below skips. */
+        (void)RkMppQueryAndClearNeedsCoreReset(Device);
+    } else if (RkMppQueryAndClearNeedsCoreReset(Device)) {
         /* AssertRvdec{0,1}CoreReset/DeassertRvdec{0,1}CoreReset toggle the
          * narrow per-codec reset bundle.  CON40 bits 6..9 for RVD0,
          * CON41 bits 6..8 for RVD1.  Dispatch on UID — matches BSP
@@ -719,21 +848,6 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                 ccu->DeassertRvdec1CoreReset(ccu->Header.Context);
             }
         }
-        /* Codec regs are now back to power-on zero — drop the prev-mask
-         * so the next kick re-writes every nonzero reg (the skip logic
-         * relies on the mask reflecting what's currently in HW). */
-        RtlZeroMemory(q->PrevNonzeroMask, sizeof(q->PrevNonzeroMask));
-    }
-
-    /* Clear any stale latched status bits before the kick. */
-    {
-        ULONG sta = READ_REGISTER_ULONG(
-            (volatile ULONG *)((PUCHAR)mmio + ops->IntStatusOffset));
-        if (sta) {
-            WRITE_REGISTER_ULONG(
-                (volatile ULONG *)((PUCHAR)mmio + ops->IntStatusOffset),
-                sta & ~1u);
-        }
     }
 
     /* Ungate the codec's leaf clocks (clk_rkvdec0_core / ca / hevc_ca).
@@ -749,7 +863,12 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
      * (RVD0's CABAC / HEVC CABAC / core leaf clocks), UngateRvdec1LeafClocks
      * targets CLKGATE_CON41 bits 6..8 (RVD1's analogous leaves).
      * Dispatch on UID so each codec only touches its own clocks —
-     * matches BSP per-device clk_on semantics. */
+     * matches BSP per-device clk_on semantics.
+     *
+     * MUST happen before the IntStatus clear below — the prior
+     * JobComplete left leaf clocks gated; writing to slots in the
+     * codec's leaf-gated domain (IntStatus at SWREG+0x380) before
+     * ungating silently dropped the write. */
     {
         RKMPP_DEVICE_PUBLIC pub;
         RkMppGetPublic(Device, &pub);
@@ -762,6 +881,22 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
             }
         }
     }
+
+    /* Hard-clear the IRQ status word before the kick.  BSP's
+     * `mpp_write_req` walks the {reg_start=224, reg_num=16} bank every
+     * task and overwrites slot 224 (RKVDEC_REG_INT_EN) with the
+     * regbuilder's value (typically 0 in the user-mode wire), wiping
+     * any latched ERROR_STA(4) / TIMEOUT_STA(5) / BUF_EMPTY_STA(6) /
+     * COLMV_REF_ERR_STA(7).  Our hardcoded `bank_ranges` below skips
+     * the 224..240 bank entirely, so without this explicit zero those
+     * latches would survive and the next kick would re-enter the
+     * poller with the same error bits already asserted — the
+     * "H264 wedges with persistent IRQ error bits vs Linux" symptom.
+     *
+     * Must come AFTER the leaf-clock ungate above — the IntStatus slot
+     * is in the codec's leaf-gated clock domain. */
+    WRITE_REGISTER_ULONG(
+        (volatile ULONG *)((PUCHAR)mmio + ops->IntStatusOffset), 0);
 
     /* Configure the rkvdec2 internal AXI read caches.  BSP `rkvdec2_run`
      * (mpp_rkvdec2.c:344-350) writes these BEFORE the kick:
@@ -788,26 +923,59 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         TRACED_WRITE_ULONG(CACHE_OFF(0x590), 1);
 #undef CACHE_OFF
     }
-    /* Validate every (shifted) offset is in-range BEFORE issuing any MMIO
-     * write, so we can reject malformed register lists without leaving
-     * partial state on the hardware. */
-    BOOLEAN hasKick = FALSE;
-    for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
-        const RKMPP_REG_WRITE *w = &Job->Writes[i];
-        ULONG mmioOff = w->Offset + ops->SwregBase;
-        if (mmioOff >= mmioLen ||
-            (mmioLen - mmioOff) < sizeof(ULONG)) {
+    /* ---- Dense-bank dispatch ----------------------------------------
+     * Mirrors upstream Linux rkvdec-vdpu381.c: every word in every
+     * covered bank is written to MMIO every kick (in BSP ascending
+     * order), then idx 10 (kick) last.  No skip-if-zero, no
+     * PrevNonzeroMask — the bank's zero-init guarantees slots the
+     * regbuilder didn't touch land at MMIO=0 rather than stale.
+     *
+     * Iova substitution already happened in RkMppJobSubmitDense (slots
+     * carry the resolved (iova + offset)[31:0] in the bank itself), so
+     * the bulk write is a plain byte stream. */
+    const ULONG  swregBase = ops->SwregBase;
+    const struct {
+        ULONG          firstIdx;
+        ULONG          count;
+        const UINT32  *src;
+    } banks[6] = {
+        { RKMPP_DENSE_COMMON_FIRST,   RKMPP_DENSE_COMMON_WORDS,
+          Job->DenseBank.Common      },
+        { RKMPP_DENSE_CPARAM_FIRST,   RKMPP_DENSE_CPARAM_WORDS,
+          Job->DenseBank.CodecParams },
+        { RKMPP_DENSE_CADDR_FIRST,    RKMPP_DENSE_CADDR_WORDS,
+          Job->DenseBank.CommonAddr  },
+        { RKMPP_DENSE_CODADDR_FIRST,  RKMPP_DENSE_CODADDR_WORDS,
+          Job->DenseBank.CodecAddr   },
+        { RKMPP_DENSE_HIPOC_FIRST,    RKMPP_DENSE_HIPOC_WORDS,
+          Job->DenseBank.HighPoc     },
+        { RKMPP_DENSE_STAT_FIRST,     RKMPP_DENSE_STAT_WORDS,
+          Job->DenseBank.Stat        },
+    };
+
+    /* Bounds-check every bank against the MMIO window BEFORE any
+     * MMIO write so we never half-program the codec. */
+    for (int b = 0; b < 6; b++) {
+        const ULONG firstByte = banks[b].firstIdx * 4u + swregBase;
+        const ULONG lastByte  = firstByte + banks[b].count * 4u;
+        if (lastByte > mmioLen) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkmpp: job %llu swreg-off 0x%x (mmio 0x%x) out of "
-                       "range (len 0x%x)\n",
-                       (unsigned long long)Job->Id, w->Offset, mmioOff, mmioLen);
+                       "rkvdec: dense job %llu bank %d (idx %lu..%lu) "
+                       "out of MMIO range (len 0x%x)\n",
+                       (unsigned long long)Job->Id, b,
+                       banks[b].firstIdx,
+                       banks[b].firstIdx + banks[b].count - 1,
+                       mmioLen);
             RkMppJobComplete(Device, STATUS_INVALID_PARAMETER, 0);
             return;
         }
-        if (w->Offset == ops->KickRegOffset &&
-            (w->Value & ops->KickRegBit)) {
-            hasKick = TRUE;
-        }
+    }
+    /* Kick reg (idx 10) must also fit; it's inside common but we
+     * write it separately so double-check. */
+    const ULONG kickByte = RKMPP_DENSE_KICK_REG_IDX * 4u + swregBase;
+    if (kickByte + sizeof(ULONG) > mmioLen) {
+        RkMppJobComplete(Device, STATUS_INVALID_PARAMETER, 0);
+        return;
     }
 
     /* Pre-kick clean: push CPU-dirty cache lines for the just-written
@@ -821,92 +989,40 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                          /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
     }
 
-    {
-        /* Write the register list to MMIO in BSP-equivalent order.  BSP's
-         * mpp_write_req walks regs[s..e] in strict ascending order and
-         * writes EVERY entry in the bank (including zeros for unset slots).
-         * Our regbuilder produces entries in code-emit order with gaps —
-         * which leaves a different INTERMEDIATE codec state during the
-         * write sequence.  To match BSP exactly:
-         *   1. Build a flat 320-entry array indexed by reg idx.
-         *   2. Mark which entries our regbuilder set; rest default to 0.
-         *   3. For each BSP-bank range, write ALL entries (including zeros)
-         *      in ascending order.
-         * Skip idx 10 (kick) in this pass — it goes last as a separate write. */
-        static const struct { ULONG first, last; } bank_ranges[6] = {
-            {   8,  32 }, {  64, 112 }, { 128, 142 },
-            { 160, 199 }, { 200, 204 }, { 256, 277 },
-        };
-        ULONG bank_vals[6][80] = {0};
-        BOOLEAN bank_seen[6][80] = {0};
-        ULONG cur_nonzero[16] = {0};   /* bitmap of regs nonzero this kick */
-
-        for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
-            const RKMPP_REG_WRITE *w = &Job->Writes[i];
-            ULONG idx = w->Offset / 4;
-            if (idx == 10) continue;
-            for (int b = 0; b < 6; b++) {
-                if (idx >= bank_ranges[b].first && idx <= bank_ranges[b].last) {
-                    ULONG pos = idx - bank_ranges[b].first;
-                    bank_vals[b][pos] = w->Value;
-                    bank_seen[b][pos] = TRUE;
-                    if (w->Value != 0)
-                        cur_nonzero[idx >> 5] |= (1u << (idx & 31));
-                    break;
-                }
-            }
-        }
-        /* Skip MMIO writes for regs that were zero last kick AND are
-         * zero this kick — same optimization as the AV1 path.  Cuts
-         * the rkvdec2 bank-walk from ~155 writes down to ~80. */
-        const ULONG *prev = q->PrevNonzeroMask;
-        for (int b = 0; b < 6; b++) {
-            ULONG count = bank_ranges[b].last - bank_ranges[b].first + 1;
-            for (ULONG p = 0; p < count; p++) {
-                ULONG idx = bank_ranges[b].first + p;
-                if (idx == 10) continue;
-                const ULONG bit = 1u << (idx & 31);
-                const BOOLEAN was_nz = (prev[idx >> 5] & bit) != 0;
-                const BOOLEAN is_nz  = (cur_nonzero[idx >> 5] & bit) != 0;
-                if (!was_nz && !is_nz) continue;
-                TRACED_WRITE_ULONG(
-                    ((PUCHAR)mmio + idx * 4 + RKVDEC2_SWREG_BASE),
-                    bank_vals[b][p]);
-            }
-        }
-        /* Snapshot for next kick. */
-        for (int i = 0; i < 16; i++)
-            q->PrevNonzeroMask[i] = cur_nonzero[i];
-        /* Now the kick (idx 10) — written last, separately. */
-        for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
-            const RKMPP_REG_WRITE *w = &Job->Writes[i];
-            if (w->Offset / 4 == 10) {
-                TRACED_WRITE_ULONG(
-                    ((PUCHAR)mmio + w->Offset + RKVDEC2_SWREG_BASE),
-                    w->Value);
-                break;
-            }
+    /* Bulk-write each bank in BSP ascending order.  TRACED_WRITE_ULONG
+     * per word so the diagnostic trace shape matches the BSP
+     * mpp_write_req walk (one trace event per swreg).  Idx 10 inside
+     * Common bank is skipped here and written last as the kick. */
+    for (int b = 0; b < 6; b++) {
+        for (ULONG p = 0; p < banks[b].count; p++) {
+            const ULONG idx = banks[b].firstIdx + p;
+            if (idx == RKMPP_DENSE_KICK_REG_IDX) continue;
+            TRACED_WRITE_ULONG(
+                ((PUCHAR)mmio + idx * 4u + swregBase),
+                banks[b].src[p]);
         }
     }
 
-    /* Flush the IOMMU's TLB right before the kick — matches BSP
-     * rkvdec2_run -> mpp_iommu_flush_tlb.  Stale TLB entries from a
-     * previous decode session caused the codec to read/write at obsolete
-     * physical addresses (manifested as fault iovas in the 0xae0..0xe00
-     * range). */
-    {
-        PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(Device);
-        if (iommu && iommu->FlushTlb) {
-            iommu->FlushTlb(iommu->Header.Context);
-        }
+    /* Flush IOMMU TLB BEFORE the kick — matches BSP rkvdec2_run
+     * order (mpp_rkvdec2.c:363 → mpp_write START_EN at :372).
+     * Stale TLB entries from a previous decode session caused the
+     * codec to read/write at obsolete physical addresses (manifested
+     * as fault iovas in the 0xae0..0xe00 range). */
+    PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(Device);
+    if (iommu && iommu->FlushTlb) {
+        iommu->FlushTlb(iommu->Header.Context);
     }
 
-    if (hasKick) {
-        /* Real decode — engage the poller to watch INT_STATUS. */
+    /* Kick: write idx 10 last with the regbuilder-supplied value.
+     * Engaging the poller is gated on the kick bit; a zero KickValue
+     * is treated as "test/peek-only" and completes immediately. */
+    TRACED_WRITE_ULONG(
+        ((PUCHAR)mmio + RKMPP_DENSE_KICK_REG_IDX * 4u + swregBase),
+        Job->DenseKickValue);
+
+    if (Job->DenseKickValue & ops->KickRegBit) {
         KeSetEvent(&q->KickEvent, IO_NO_INCREMENT, FALSE);
     } else {
-        /* Test-only register write set (smoke tests, peek-only).
-         * Complete the job immediately without waiting for hardware. */
         RkMppJobComplete(Device, STATUS_SUCCESS, 0);
     }
 }
@@ -942,8 +1058,39 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     /* BSP parity: only request a reset when an error/timeout was observed.
      * RKVDEC_INT_ERROR_MASK = COLMV_REF_ERR | BUF_EMPTY | TIMEOUT | ERROR_STA
      * = bits 4,5,6,7.  Plus we treat NTSTATUS failure as an error. */
-    if (!NT_SUCCESS(Result) || (HardwareStatus & 0xF0u)) {
-        RkMppSetNeedsCoreReset(Device);
+    BOOLEAN failed = (!NT_SUCCESS(Result) || (HardwareStatus & 0xF0u));
+    if (failed) {
+        /* 2-tier escalation:
+         *
+         *   - Stuck-FSM signal → wide FullCoreReset immediately.  This
+         *     covers TIMEOUT_STA (codec hit its own watchdog mid-decode)
+         *     and the "poller never saw an IRQ" case (DEC_RDY_STA never
+         *     latched) — both leave the codec in a state that the
+         *     narrow CON40 bits-6..9 toggle can't unwedge.  Each
+         *     playback session typically only has one failure before
+         *     mpv tears down + re-attaches, so a "wait for two
+         *     consecutive failures" gate would never trip within a
+         *     session.
+         *   - Plain DEC_ERROR_STA + DEC_RDY_STA (codec finished with
+         *     a soft error) → narrow CoreReset.  Cheap, preserves
+         *     codec init state, sufficient for transient CABAC
+         *     desync.  If the soft-error pattern recurs the next
+         *     failure also satisfies the stuck-FSM rule above.
+         */
+        BOOLEAN dec_rdy = (HardwareStatus & RKVDEC2_INT_DEC_RDY_STA) != 0;
+        BOOLEAN dec_to  = (HardwareStatus & RKVDEC2_INT_DEC_TIMEOUT_STA) != 0;
+        BOOLEAN poll_to = (Result == (NTSTATUS)0xC0000507L /* STATUS_IO_TIMEOUT */);
+        BOOLEAN stuck   = dec_to || poll_to || !dec_rdy;
+        if (stuck) {
+            RkMppSetNeedsFullReset(Device);
+        } else {
+            RkMppSetNeedsCoreReset(Device);
+        }
+        /* Track for diagnostics; the previous "two consecutive failures"
+         * gate has been replaced by the per-failure stuck classifier
+         * above, so the value isn't load-bearing now but stays useful
+         * if we want to add a back-off later. */
+        (void)RkMppExchangeLastJobFailed(Device, 1);
 
         /* Charge the error to the file-object that submitted this job so
          * EvtFileCleanup can promote its session-end teardown to the
@@ -954,6 +1101,10 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
             PRKMPP_FILE_CTX fctx = RkMppFileGet(job->Owner);
             if (fctx) InterlockedIncrement(&fctx->ErrorCount);
         }
+    } else {
+        /* Successful kick clears the consecutive-failure tracker so a
+         * single isolated error later doesn't immediately escalate. */
+        RkMppExchangeLastJobFailed(Device, 0);
     }
 
     /* Cache invalidate DMA-output buffers the CPU will read after this kick.
@@ -1013,7 +1164,13 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
      * (RVD0's leaves), GateRvdec1LeafClocks targets CLKGATE_CON41
      * bits 6..8 (RVD1's leaves).  Dispatch on UID so each codec only
      * gates its own clocks — no cross-codec wedge, and RVD1 now gets
-     * the same per-kick clock-cycle break BSP rkvdec2_clk_off applies. */
+     * the same per-kick clock-cycle break BSP rkvdec2_clk_off applies.
+     *
+     * RVD0 was previously skipped here as a workaround for a CON40
+     * wedge; root cause turned out to be RVD0 leaf clocks running at
+     * ~1/4 BSP rate (148/396/148 MHz vs BSP's 594/1000/594), making
+     * the CDC settle after gate cycle exceed the codec FSM tolerance.
+     * Fixed by raising RVD0 CLKSEL_CON90/91 values in rkmpp_ccu. */
     {
         RKMPP_DEVICE_PUBLIC pub;
         RkMppGetPublic(Device, &pub);
@@ -1034,50 +1191,65 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
 }
 
 /* -----------------------------------------------------------------------
- * RkMppJobSubmit — IOCTL_RKMPP_SUBMIT_JOB handler
+ * Dense-bank submit / peek (rkvdec2 H.264 + H.265)
+ *
+ * Caller hands us a zero-init'd RKMPP_DENSE_BANK plus a list of
+ * (RegIdx, BufferHandle, IovaOffset) substitution slots.  We resolve
+ * each handle to an iova up-front and stamp (iova + offset)[31:0] into
+ * the bank at slot.RegIdx.  RkMppJobStart bulk-writes each bank in
+ * BSP order; idx 10 (kick) is written last as a separate MMIO write.
  * --------------------------------------------------------------------- */
 
 NTSTATUS
-RkMppJobSubmit(_In_ WDFDEVICE Device,
-               _In_ WDFFILEOBJECT File,
-               _In_ const RKMPP_SUBMIT_JOB_IN *In,
-               _Out_ RKMPP_SUBMIT_JOB_OUT *Out)
+RkMppJobSubmitDense(_In_ WDFDEVICE Device,
+                    _In_ WDFFILEOBJECT File,
+                    _In_ const RKMPP_SUBMIT_DENSE_JOB_IN *In,
+                    _Out_ RKMPP_SUBMIT_DENSE_JOB_OUT *Out)
 {
-    /* Validate register-write and buffer-ref counts. */
-    if (In->RegWriteCount > RKMPP_MAX_REG_WRITES ||
+    if (In->IovaSlotCount > RKMPP_MAX_DENSE_IOVA_SLOTS ||
         In->BufRefCount   > RKMPP_MAX_BUF_REFS) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* Allocate the job from NonPagedPool — it must be accessible at
-     * DISPATCH_LEVEL when the DPC fires. */
     RKMPP_JOB *job = (RKMPP_JOB *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(RKMPP_JOB), 'JppM');
     if (!job) return STATUS_INSUFFICIENT_RESOURCES;
 
     RtlZeroMemory(job, sizeof(*job));
     KeInitializeEvent(&job->Done, NotificationEvent, FALSE);
-    job->Owner = File;
+    job->Owner          = File;
+    job->DenseKickValue = In->KickValue;
 
-    /* Copy the register-write list, performing iova-handle substitution
-     * for any entry with BufferHandle != 0.  Iova is 64-bit but the
-     * register field is 32-bit; rkiommu's address space is 32 bits so
-     * the iova always fits. */
-    job->RegWriteCount = In->RegWriteCount;
-    for (UINT32 i = 0; i < In->RegWriteCount; i++) {
-        const RKMPP_REG_WRITE *src = &In->Writes[i];
-        RKMPP_REG_WRITE       *dst = &job->Writes[i];
-        dst->Offset       = src->Offset;
-        dst->BufferHandle = src->BufferHandle;
-        dst->IovaOffset   = src->IovaOffset;
-        dst->Reserved     = 0;
+    /* Copy the bank verbatim; iova-substitution stamps over selected
+     * slots below. */
+    RtlCopyMemory(&job->DenseBank, &In->Bank, sizeof(job->DenseBank));
 
+    /* Walk substitution slots: validate RegIdx falls in an address bank,
+     * resolve buffer handle → iova, write (iova + offset)[31:0] into
+     * the dense bank at the slot's idx.  Also classify the slot for
+     * per-kick cache maintenance — reg130 = output, reg131 = current
+     * colmv, reg128/129/161/163/180 = inputs the CPU just wrote and
+     * the codec is about to DMA. */
+    job->DenseIovaSlotCount = In->IovaSlotCount;
+    for (UINT32 i = 0; i < In->IovaSlotCount; i++) {
+        const RKMPP_DENSE_IOVA_SLOT *src = &In->IovaSlots[i];
+        RKMPP_DENSE_IOVA_SLOT       *dst = &job->DenseIovaSlots[i];
+        *dst = *src;
+
+        if (!RkMppDenseIsAddressReg(src->RegIdx)) {
+            ExFreePoolWithTag(job, 'JppM');
+            return STATUS_INVALID_PARAMETER;
+        }
         if (src->BufferHandle == 0) {
-            dst->Value = src->Value;
-            continue;
+            /* Caller filtered zero handles in user-mode (emit_iova) but
+             * keep the check tight: an iova slot with handle == 0 is
+             * indistinguishable from "no write" and would leave the
+             * bank slot unsubstituted.  Reject. */
+            ExFreePoolWithTag(job, 'JppM');
+            return STATUS_INVALID_PARAMETER;
         }
 
-        UINT64 iova = 0;
+        UINT64 iova    = 0;
         ULONG  bufSize = 0;
         NTSTATUS s = RkMppBufLookupIova(File, src->BufferHandle,
                                         &iova, &bufSize);
@@ -1089,39 +1261,34 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
             ExFreePoolWithTag(job, 'JppM');
             return STATUS_INVALID_PARAMETER;
         }
-        dst->Value = (UINT32)(iova + src->IovaOffset);
 
-        /* Direction-based cache maintenance:
-         *
-         *   Output frame  (reg130 / 0x208) — CPU will read post-decode.
-         *     Captured into OutputFrameMdl for the post-IRQ invalidate.
-         *
-         *   Inputs (CPU writes, codec reads this kick):
-         *     reg128 / 0x200 — RLC base (bitstream)
-         *     reg129 / 0x204 — RLCWRITE base (alias of bitstream)
-         *     reg131 / 0x20c — current colmv, zeroed by user-mode
-         *     reg161 / 0x284 — packed PPS
-         *     reg163 / 0x28C — packed RPS
-         *     reg180 / 0x2D0 — packed scaling list
-         *   Captured into CleanMdls[] for the pre-kick clean.
-         *
-         *   Everything else (refs, ref_colmv, RCB, error_ref, CABAC init)
-         *   is skipped — see RKMPP_JOB comment for why. */
+        /* Stamp (iova + offset)[31:0] into the dense bank at RegIdx. */
+        UINT32 *slot = NULL;
+        if (src->RegIdx >= RKMPP_DENSE_CADDR_FIRST &&
+            src->RegIdx <= RKMPP_DENSE_CADDR_LAST) {
+            slot = &job->DenseBank.CommonAddr[src->RegIdx
+                                              - RKMPP_DENSE_CADDR_FIRST];
+        } else if (src->RegIdx >= RKMPP_DENSE_CODADDR_FIRST &&
+                   src->RegIdx <= RKMPP_DENSE_CODADDR_LAST) {
+            slot = &job->DenseBank.CodecAddr[src->RegIdx
+                                              - RKMPP_DENSE_CODADDR_FIRST];
+        }
+        if (!slot) {
+            ExFreePoolWithTag(job, 'JppM');
+            return STATUS_INVALID_PARAMETER;
+        }
+        *slot = (UINT32)(iova + src->IovaOffset);
+
+        /* Cache-maintenance classification.  Byte offset = RegIdx * 4. */
         PMDL mdl = NULL;
         if (!NT_SUCCESS(RkMppBufLookupMdl(File, src->BufferHandle, &mdl)) ||
             mdl == NULL) {
             continue;
         }
-        /* Cache-maintenance MDL classification.
-         *   Output  — codec writes, CPU reads post-decode.  Invalidate after kick.
-         *   Input   — CPU writes, codec reads.  Clean before kick.
-         *
-         * rkvdec2 offsets: output reg130 = 0x208; current colmv reg131
-         * = 0x20c; inputs reg128/129/161/163/180 =
-         * 0x200/0x204/0x284/0x28C/0x2D0. */
-        if (src->Offset == 0x208u) {      /* rkvdec2 output frame */
+        const UINT32 byteOff = src->RegIdx * 4u;
+        if (byteOff == 0x208u) {                /* output frame */
             if (job->OutputFrameMdl == NULL) job->OutputFrameMdl = mdl;
-        } else if (src->Offset == 0x20Cu) { /* rkvdec2 current colmv */
+        } else if (byteOff == 0x20Cu) {         /* current colmv */
             if (job->ColmvCurMdl == NULL) job->ColmvCurMdl = mdl;
             BOOLEAN already = FALSE;
             for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
@@ -1131,9 +1298,9 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
                 job->CleanMdlCount < RTL_NUMBER_OF(job->CleanMdls)) {
                 job->CleanMdls[job->CleanMdlCount++] = mdl;
             }
-        } else if (src->Offset == 0x200u || src->Offset == 0x204u ||
-                   src->Offset == 0x284u || src->Offset == 0x28Cu ||
-                   src->Offset == 0x2D0u) {
+        } else if (byteOff == 0x200u || byteOff == 0x204u ||
+                   byteOff == 0x284u || byteOff == 0x28Cu ||
+                   byteOff == 0x2D0u) {         /* RLC + PPS + RPS + scanlist */
             BOOLEAN already = FALSE;
             for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
                 if (job->CleanMdls[k] == mdl) { already = TRUE; break; }
@@ -1144,6 +1311,7 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
             }
         }
     }
+
     job->BufRefCount = In->BufRefCount;
     if (In->BufRefCount > 0) {
         RtlCopyMemory(job->BufRefs, In->BufRefs,
@@ -1151,42 +1319,38 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     }
 
     PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
-
-    /* Assign a unique job ID atomically. */
     job->Id = (UINT64)InterlockedIncrement64(&q->NextId);
 
-    /* Per-job RaiseCluster removed — the device-lifetime Raise taken
-     * in PrepareHardware keeps the CCU refcount at >= 1 across the
-     * entire device lifetime, so the per-job 1<->2 bounce was always
-     * a short-circuit no-op.  The matching per-job DropCluster (which
-     * ran from DPC at DISPATCH_LEVEL) is removed too — see the
-     * RkMppJobComplete comment for why this matters for the
-     * FAST_MUTEX serialization in rkmpp_ccu. */
-
-    /* Enqueue the job under the spin lock.  Cap the pending-job count
-     * as a kernel-side safeguard against runaway user-mode submission
-     * — if a session keeps submitting faster than the codec can drain
-     * (e.g. zero-copy ProcessInput pumping at decode rate while EVR
-     * pulls at audio rate), the queue would grow without bound, holding
-     * DPB slots and eventually feeding the codec bad refs that wedge
-     * the hardware.  STATUS_DEVICE_BUSY tells the caller to back off
-     * and call IOCTL_RKMPP_WAIT_JOB before submitting more. */
-    enum { RKMPP_MAX_PENDING_JOBS = 8 };
+    /* Two-tier admission control:
+     *   - Per-device total cap (8): a hard backpressure ceiling for the
+     *     whole engine, unchanged from single-File days.
+     *   - Per-File cap (4): prevents one open handle from filling the
+     *     queue and starving a concurrent decode session on the same
+     *     engine.  Counts both Pending and InFlight owned by this File
+     *     so a single greedy File can't have 4 pending + 1 in flight
+     *     while a peer File starves. */
+    enum {
+        RKMPP_MAX_PENDING_JOBS          = 8,
+        RKMPP_MAX_PENDING_JOBS_PER_FILE = 4,
+    };
     KIRQL oldIrql;
     KeAcquireSpinLock(&q->Lock, &oldIrql);
 
-    /* Count pending entries — list is short (capped here), no LIST_FOR_EACH
-     * macro on Windows kernel so iterate manually. */
     ULONG pendingCount = 0;
+    ULONG ownerCount   = 0;
+    if (q->InFlight && q->InFlight->Owner == File) ownerCount++;
     for (PLIST_ENTRY e = q->Pending.Flink;
          e != &q->Pending;
          e = e->Flink) {
+        RKMPP_JOB *cand = CONTAINING_RECORD(e, RKMPP_JOB, Link);
         pendingCount++;
-        if (pendingCount >= RKMPP_MAX_PENDING_JOBS) break;
+        if (cand->Owner == File) ownerCount++;
+        if (pendingCount >= RKMPP_MAX_PENDING_JOBS &&
+            ownerCount   >= RKMPP_MAX_PENDING_JOBS_PER_FILE) break;
     }
-    if (pendingCount >= RKMPP_MAX_PENDING_JOBS) {
+    if (pendingCount >= RKMPP_MAX_PENDING_JOBS ||
+        ownerCount   >= RKMPP_MAX_PENDING_JOBS_PER_FILE) {
         KeReleaseSpinLock(&q->Lock, oldIrql);
-        /* No per-job CCU raise to undo (removed — see comment above). */
         ExFreePoolWithTag(job, 'JppM');
         return STATUS_DEVICE_BUSY;
     }
@@ -1197,7 +1361,6 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     } else {
         InsertTailList(&q->Pending, &job->Link);
     }
-
     KeReleaseSpinLock(&q->Lock, oldIrql);
 
     if (startNow) {
@@ -1208,20 +1371,11 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     return STATUS_SUCCESS;
 }
 
-/* -----------------------------------------------------------------------
- * RkMppJobPeek — IOCTL_RKMPP_PEEK_JOB handler
- *
- * Find a job by ID across Pending / InFlight / Completed and copy its
- * post-substitution register list back to user mode.  Used by tests to
- * confirm iova-handle substitution worked before the real hardware-kick
- * path is in (Phase 3b Task 11).
- * --------------------------------------------------------------------- */
-
 NTSTATUS
-RkMppJobPeek(_In_ WDFDEVICE Device,
-             _In_ WDFFILEOBJECT File,
-             _In_ UINT64 JobId,
-             _Out_ RKMPP_PEEK_JOB_OUT *Out)
+RkMppJobPeekDense(_In_ WDFDEVICE Device,
+                  _In_ WDFFILEOBJECT File,
+                  _In_ UINT64 JobId,
+                  _Out_ RKMPP_PEEK_DENSE_JOB_OUT *Out)
 {
     PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
     KIRQL oldIrql;
@@ -1230,9 +1384,7 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
     KeAcquireSpinLock(&q->Lock, &oldIrql);
 
     RKMPP_JOB *job = NULL;
-    if (q->InFlight && q->InFlight->Id == JobId) {
-        job = q->InFlight;
-    }
+    if (q->InFlight && q->InFlight->Id == JobId) job = q->InFlight;
     if (!job) {
         for (PLIST_ENTRY e = q->Pending.Flink;
              e != &q->Pending; e = e->Flink) {
@@ -1253,12 +1405,9 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
             status = STATUS_NOT_FOUND;
             goto done;
         }
-        Out->RegWriteCount = job->RegWriteCount;
-        Out->Reserved      = 0;
-        if (job->RegWriteCount > 0) {
-            RtlCopyMemory(Out->Writes, job->Writes,
-                          job->RegWriteCount * sizeof(RKMPP_REG_WRITE));
-        }
+        Out->StructSize = sizeof(*Out);
+        Out->KickValue  = job->DenseKickValue;
+        RtlCopyMemory(&Out->Bank, &job->DenseBank, sizeof(Out->Bank));
         status = STATUS_SUCCESS;
     }
 

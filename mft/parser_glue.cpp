@@ -129,11 +129,64 @@ static size_t ebsp_to_rbsp(const uint8_t *src, size_t src_len,
 
 /* ============================================================ Scaling list */
 
+/* H.264 zig-zag scan tables (spec 8.5.6 / Figure 7-3).  Element j is
+ * the raster position of the value at bitstream index j.  Used to
+ * convert scaling lists from the bitstream's zig-zag order to V4L2's
+ * raster order (also what our codec table layout expects). */
+static const uint8_t kH264ZigZag4x4[16] = {
+     0,  1,  4,  8,  5,  2,  3,  6,
+     9, 12, 13, 10,  7, 11, 14, 15,
+};
+static const uint8_t kH264ZigZag8x8[64] = {
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63,
+};
+
+/* H.264 Tables 7-3, 7-4 default scaling lists (raster order). */
+static const uint8_t kH264Default4x4Intra[16] = {
+     6, 13, 13, 20, 20, 20, 28, 28,
+    28, 28, 32, 32, 32, 36, 36, 42,
+};
+static const uint8_t kH264Default4x4Inter[16] = {
+    10, 14, 14, 20, 20, 20, 24, 24,
+    24, 24, 27, 27, 27, 30, 30, 34,
+};
+static const uint8_t kH264Default8x8Intra[64] = {
+     6, 10, 13, 16, 18, 23, 25, 27,
+    10, 11, 16, 18, 23, 25, 27, 29,
+    13, 16, 18, 23, 25, 27, 29, 31,
+    16, 18, 23, 25, 27, 29, 31, 33,
+    18, 23, 25, 27, 29, 31, 33, 36,
+    23, 25, 27, 29, 31, 33, 36, 38,
+    25, 27, 29, 31, 33, 36, 38, 40,
+    27, 29, 31, 33, 36, 38, 40, 42,
+};
+static const uint8_t kH264Default8x8Inter[64] = {
+     9, 13, 15, 17, 19, 21, 22, 24,
+    13, 13, 17, 19, 21, 22, 24, 25,
+    15, 17, 19, 21, 22, 24, 25, 27,
+    17, 19, 21, 22, 24, 25, 27, 28,
+    19, 21, 22, 24, 25, 27, 28, 30,
+    21, 22, 24, 25, 27, 28, 30, 32,
+    22, 24, 25, 27, 28, 30, 32, 33,
+    24, 25, 27, 28, 30, 32, 33, 35,
+};
+
 /* H.264 7.3.2.1.1.1 — fills the supplied `list` with scaling-list values
- * (default fallback handled by the caller). */
+ * (default fallback handled by the caller).  Bitstream values arrive in
+ * zig-zag scan order; V4L2 (and our packed-table layout) expects raster
+ * order, so each value is written to list[ZigZag[j]]. */
 static void parse_scaling_list(BitReader *br, uint8_t *list, int size,
                                int *use_default) {
+    const uint8_t *zz = (size == 16) ? kH264ZigZag4x4 : kH264ZigZag8x8;
     int last_scale = 8, next_scale = 8;
+    int last_value = 8;  /* track in scan order for the "next_scale==0" rule */
     for (int j = 0; j < size; j++) {
         if (next_scale != 0) {
             int delta_scale = br_se(br);
@@ -144,8 +197,10 @@ static void parse_scaling_list(BitReader *br, uint8_t *list, int size,
                 return;
             }
         }
-        list[j] = (next_scale == 0) ? (uint8_t)last_scale : (uint8_t)next_scale;
-        last_scale = list[j];
+        int v = (next_scale == 0) ? last_value : next_scale;
+        list[zz[j]] = (uint8_t)v;
+        last_scale = (next_scale == 0) ? last_scale : next_scale;
+        last_value = v;
     }
 }
 
@@ -175,10 +230,11 @@ static void parse_hrd_parameters(BitReader *br) {
  * restriction block correctly.  Output goes to *out_*. */
 static void parse_vui_parameters(BitReader *br,
                                  uint8_t *out_has_reorder,
-                                 uint8_t *out_max_reorder)
+                                 uint8_t *out_max_reorder,
+                                 H264ParseResult *out_colour = nullptr)
 {
-    *out_has_reorder = 0;
-    *out_max_reorder = 0;
+    if (out_has_reorder) *out_has_reorder = 0;
+    if (out_max_reorder) *out_max_reorder = 0;
 
     if (br_u1(br)) {                                /* aspect_ratio_info_present */
         uint32_t idc = br_u(br, 8);                 /* aspect_ratio_idc */
@@ -191,12 +247,20 @@ static void parse_vui_parameters(BitReader *br,
         (void)br_u1(br);                            /* overscan_appropriate_flag */
     }
     if (br_u1(br)) {                                /* video_signal_type_present */
+        if (out_colour) out_colour->has_vui_colour = 1;
         (void)br_u(br, 3);                          /* video_format */
-        (void)br_u1(br);                            /* video_full_range_flag */
+        uint8_t full_range = (uint8_t)br_u1(br);    /* video_full_range_flag */
+        if (out_colour) out_colour->vui_full_range_flag = full_range;
         if (br_u1(br)) {                            /* colour_description_present */
-            (void)br_u(br, 8);                      /* colour_primaries */
-            (void)br_u(br, 8);                      /* transfer_characteristics */
-            (void)br_u(br, 8);                      /* matrix_coefficients */
+            uint8_t cp = (uint8_t)br_u(br, 8);
+            uint8_t tc = (uint8_t)br_u(br, 8);
+            uint8_t mc = (uint8_t)br_u(br, 8);
+            if (out_colour) {
+                out_colour->has_vui_colour_desc       = 1;
+                out_colour->vui_colour_primaries      = cp;
+                out_colour->vui_transfer_characteristics = tc;
+                out_colour->vui_matrix_coefficients   = mc;
+            }
         }
     }
     if (br_u1(br)) {                                /* chroma_loc_info_present */
@@ -226,8 +290,8 @@ static void parse_vui_parameters(BitReader *br,
         (void)br_ue(br);                            /* max_dec_frame_buffering */
         if (mr > 16) mr = 16;                       /* spec cap is implementation but
                                                      * 16 is the largest H.264 DPB. */
-        *out_has_reorder = 1;
-        *out_max_reorder = (uint8_t)mr;
+        if (out_has_reorder) *out_has_reorder = 1;
+        if (out_max_reorder) *out_max_reorder = (uint8_t)mr;
     }
 }
 
@@ -235,13 +299,23 @@ static void parse_vui_parameters(BitReader *br,
  *   sps                — V4L2 control fields (mandatory)
  *   out_has_reorder    — set to 1 if VUI bitstream_restriction parsed
  *   out_max_reorder    — VUI max_num_reorder_frames (when has_reorder=1)
- *   out_has_reorder/out_max_reorder may be nullptr if caller doesn't need
- *   the VUI bound (full SPS still parses correctly either way). */
+ *   out_sm             — populated with SPS-level scaling lists when the
+ *                        stream sets seq_scaling_matrix_present_flag.
+ *                        Lists not explicitly provided by the bitstream
+ *                        are left zero (caller's job to flat-16 fill).
+ *   out_has_sps_sm     — set to 1 iff seq_scaling_matrix_present_flag was 1
+ *   any of out_*       — may be nullptr if caller doesn't need that
+ *                        signal (full SPS still parses correctly). */
 static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps,
                                  uint8_t *out_has_reorder = nullptr,
-                                 uint8_t *out_max_reorder = nullptr) {
+                                 uint8_t *out_max_reorder = nullptr,
+                                 struct v4l2_ctrl_h264_scaling_matrix *out_sm = nullptr,
+                                 uint8_t *out_has_sps_sm = nullptr,
+                                 H264ParseResult *out_vui_colour = nullptr) {
     if (out_has_reorder) *out_has_reorder = 0;
     if (out_max_reorder) *out_max_reorder = 0;
+    if (out_has_sps_sm)  *out_has_sps_sm  = 0;
+    if (out_sm)          memset(out_sm, 0, sizeof(*out_sm));
     memset(sps, 0, sizeof(*sps));
     sps->profile_idc          = (uint8_t)br_u(br, 8);
     sps->constraint_set_flags = (uint8_t)br_u(br, 8);
@@ -266,15 +340,30 @@ static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps,
         if (br_u1(br)) sps->flags |= V4L2_H264_SPS_FLAG_QPPRIME_Y_ZERO_TRANSFORM_BYPASS;
         int seq_scaling_matrix_present = br_u1(br);
         if (seq_scaling_matrix_present) {
-            /* Skip scaling lists at SPS level — we re-parse from PPS or
-             * use defaults.  Skipping requires reading the bits to keep
-             * the bit position correct. */
+            if (out_has_sps_sm) *out_has_sps_sm = 1;
             int count = (sps->chroma_format_idc == 3) ? 12 : 8;
             for (int i = 0; i < count; i++) {
                 if (br_u1(br)) {
-                    uint8_t tmp[64];
                     int defaultUsed = 0;
-                    parse_scaling_list(br, tmp, (i < 6) ? 16 : 64, &defaultUsed);
+                    if (out_sm && i < 6) {
+                        parse_scaling_list(br, out_sm->scaling_list_4x4[i],
+                                           16, &defaultUsed);
+                    } else if (out_sm && i < 8) {
+                        parse_scaling_list(br, out_sm->scaling_list_8x8[i - 6],
+                                           64, &defaultUsed);
+                    } else {
+                        /* chroma_format_idc==3 8x8 lists (i=8..11) — V4L2
+                         * scaling_matrix has slots for them; populate when
+                         * caller supplies the matrix, else skip. */
+                        uint8_t tmp[64];
+                        if (out_sm) {
+                            parse_scaling_list(br,
+                                               out_sm->scaling_list_8x8[i - 6],
+                                               64, &defaultUsed);
+                        } else {
+                            parse_scaling_list(br, tmp, 64, &defaultUsed);
+                        }
+                    }
                 }
             }
         }
@@ -326,7 +415,8 @@ static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps,
      * include bitstream_restriction), the caller falls back to a
      * conservative bound based on max_num_ref_frames. */
     if (br_u1(br)) {                                /* vui_parameters_present_flag */
-        parse_vui_parameters(br, out_has_reorder, out_max_reorder);
+        parse_vui_parameters(br, out_has_reorder, out_max_reorder,
+                             out_vui_colour);
     }
 
     return H264_PARSE_OK;
@@ -370,16 +460,58 @@ static H264ParseStatus parse_pps(BitReader *br, struct v4l2_ctrl_h264_pps *pps,
             *has_scaling = 1;
             memset(sm, 0, sizeof(*sm));
             int count_8x8 = (pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) ? 2 : 0;
-            for (int i = 0; i < 6 + count_8x8; i++) {
-                if (br_u1(br)) {
-                    int defaultUsed = 0;
+            int n_lists   = 6 + count_8x8;
+            uint8_t present[8]    = {0};
+            uint8_t use_default[8]= {0};
+            for (int i = 0; i < n_lists; i++) {
+                present[i] = (uint8_t)br_u1(br);
+                if (present[i]) {
+                    int du = 0;
                     if (i < 6) {
-                        parse_scaling_list(br, sm->scaling_list_4x4[i], 16,
-                                           &defaultUsed);
+                        parse_scaling_list(br, sm->scaling_list_4x4[i], 16, &du);
                     } else {
-                        parse_scaling_list(br, sm->scaling_list_8x8[i - 6], 64,
-                                           &defaultUsed);
+                        parse_scaling_list(br, sm->scaling_list_8x8[i - 6], 64, &du);
                     }
+                    use_default[i] = (uint8_t)du;
+                }
+            }
+            /* Resolve missing / use_default lists per H.264 7.4.2.2
+             * Table 7-2 fall-back Set A (the no-SPS-scaling case — the
+             * SPS-inheritance case isn't yet plumbed; we'd need the
+             * has_sps_scaling_matrix flag and the SPS lists here).
+             * Set A:
+             *   i=0,3,6,7 → default (Intra4, Inter4, Intra8, Inter8)
+             *   i=1       → list 0
+             *   i=2       → list 1
+             *   i=4       → list 3
+             *   i=5       → list 4
+             * Without this, missing chroma lists (i=2,5) decode with
+             * flat-16 instead of the encoder's Cb list, shifting Cr
+             * dequant and tinting reds/blues. */
+            auto fill_default = [&](int i) {
+                if (i == 0)      memcpy(sm->scaling_list_4x4[0], kH264Default4x4Intra, 16);
+                else if (i == 3) memcpy(sm->scaling_list_4x4[3], kH264Default4x4Inter, 16);
+                else if (i == 6) memcpy(sm->scaling_list_8x8[0], kH264Default8x8Intra, 64);
+                else if (i == 7) memcpy(sm->scaling_list_8x8[1], kH264Default8x8Inter, 64);
+            };
+            auto inherit_4x4 = [&](int dst, int src) {
+                memcpy(sm->scaling_list_4x4[dst], sm->scaling_list_4x4[src], 16);
+            };
+            for (int i = 0; i < n_lists; i++) {
+                if (present[i] && !use_default[i]) continue;
+                /* Either pic_scaling_list_present_flag[i]==0 (Set A
+                 * fall-back) or use_default_scaling_matrix_flag[i]==1
+                 * (caller signalled "use the table"). Same outcome. */
+                switch (i) {
+                case 0: fill_default(0); break;
+                case 1: inherit_4x4(1, 0); break;
+                case 2: inherit_4x4(2, 1); break;
+                case 3: fill_default(3); break;
+                case 4: inherit_4x4(4, 3); break;
+                case 5: inherit_4x4(5, 4); break;
+                case 6: fill_default(6); break;
+                case 7: fill_default(7); break;
+                default: break;
                 }
             }
         }
@@ -781,11 +913,31 @@ H264ParseStatus H264ParseAccessUnit(const uint8_t *buf, size_t len,
 
         switch (nal_unit_type) {
         case 7: {
+            uint8_t sps_has_sm = 0;
+            v4l2_ctrl_h264_scaling_matrix sps_sm{};
             H264ParseStatus s = parse_sps(&br, &out->sps,
                                           &out->has_sps_vui_reorder,
-                                          &out->sps_vui_max_num_reorder_frames);
+                                          &out->sps_vui_max_num_reorder_frames,
+                                          &sps_sm, &sps_has_sm,
+                                          /*out_vui_colour=*/out);
             if (s != H264_PARSE_OK) return s;
             out->has_sps = 1;
+            /* SPS-level scaling lists become the active matrix until a
+             * subsequent PPS overrides them.  Without this, High-profile
+             * streams that put scaling lists at SPS-level (common for
+             * x264-encoded movies — defined once globally) decode with
+             * flat=16 dequant → image structure intact, chroma colors
+             * shifted from the encoder's intent. */
+            if (sps_has_sm) {
+                out->scaling_matrix    = sps_sm;
+                out->has_scaling_matrix = 1;
+                /* Make sure the codec is told to use the scaling table
+                 * even if/when a PPS arrives that doesn't itself set
+                 * pic_scaling_matrix_present. */
+                if (out->has_pps) {
+                    out->pps.flags |= V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT;
+                }
+            }
             break;
         }
         case 8: {
@@ -794,7 +946,13 @@ H264ParseStatus H264ParseAccessUnit(const uint8_t *buf, size_t len,
                                           &has_scaling);
             if (s != H264_PARSE_OK) return s;
             out->has_pps = 1;
-            if (has_scaling) out->has_scaling_matrix = 1;
+            if (has_scaling) {
+                out->has_scaling_matrix = 1;
+            } else if (out->has_scaling_matrix) {
+                /* PPS doesn't override but SPS-level matrix is active —
+                 * propagate the flag so the codec uses the scaling table. */
+                out->pps.flags |= V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT;
+            }
             break;
         }
         case 1: case 5: {

@@ -337,7 +337,15 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
      * RkMppPollerThread) issues a dummy MMIO read + PERF_WORKING_CNT
      * poll after DEC_RDY before signalling completion; RkMppJobComplete
      * then calls KeFlushIoBuffers on DMA-output MDLs to invalidate stale
-     * CPU cache lines before any user-mode read. */
+     * CPU cache lines before any user-mode read.
+     *
+     * 2026-05-12 NOTE: a brief MmNonCached experiment made the RVD0
+     * H.264 B-frame divergence WORSE, not better — wedge moved earlier
+     * and more B-frames diverged.  Likely cause: with MmNonCached user
+     * mappings, user writes bypass CPU cache, but the kernel-VA mapping
+     * (cached PAGE_READWRITE) still holds the post-RtlZeroMemory zeros;
+     * pre-kick KeFlushIoBuffers clean of those stale kernel-VA lines
+     * clobbers the user's uncached writes in DRAM. */
     MEMORY_CACHING_TYPE userCacheType = MmCached;
     PVOID userVa = MmMapLockedPagesSpecifyCache(
         mdl, UserMode, userCacheType, NULL, FALSE, NormalPagePriority);

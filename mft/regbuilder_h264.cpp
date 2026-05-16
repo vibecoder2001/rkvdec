@@ -12,29 +12,38 @@
 
 namespace {
 
-/* Convenience: append one plain (non-substituted) register write. */
-static int emit_plain(H264RegWriteList *list, uint32_t off, uint32_t value) {
-    if (list->count >= RKMPP_MAX_REG_WRITES) return 1;
-    RKMPP_REG_WRITE *w = &list->entries[list->count++];
-    w->Offset       = off;
-    w->Value        = value;
-    w->BufferHandle = 0;
-    w->IovaOffset   = 0;
-    w->Reserved     = 0;
+/* Convenience: stamp one plain (non-substituted) register value into the
+ * dense bank.  Idx 10 (DEC_E kick) is routed to out->KickValue — the
+ * kernel writes the bank in bulk first, then idx 10 last as the kick.
+ * Returns 1 if the offset doesn't land in a covered bank range. */
+static int emit_plain(H26xDenseOutput *out, uint32_t off, uint32_t value) {
+    uint32_t idx = off / 4u;
+    if (idx == RKMPP_DENSE_KICK_REG_IDX) {
+        out->KickValue = value;
+        return 0;
+    }
+    uint32_t *slot = H26xDenseSlotFor(out, off);
+    if (!slot) return 1;
+    *slot = value;
     return 0;
 }
 
-/* Append an iova-substitution register write (kernel rewrites Value at
- * submit time using the buffer handle's resolved iova + IovaOffset). */
-static int emit_iova(H264RegWriteList *list, uint32_t off,
+/* Record an iova-substitution slot.  The bank entry at `off/4` stays at
+ * 0 (zero-init); the kernel resolves handle→iova and stamps the
+ * resolved value before the bulk MMIO write.  A zero handle is treated
+ * as "no write" (slot remains 0), matching the prior sparse-list
+ * semantics where callers gated EMIT_I on handle != 0. */
+static int emit_iova(H26xDenseOutput *out, uint32_t off,
                      uint64_t handle, uint32_t iova_offset) {
-    if (list->count >= RKMPP_MAX_REG_WRITES) return 1;
-    RKMPP_REG_WRITE *w = &list->entries[list->count++];
-    w->Offset       = off;
-    w->Value        = 0;
-    w->BufferHandle = handle;
-    w->IovaOffset   = iova_offset;
-    w->Reserved     = 0;
+    if (handle == 0) return 0;
+    if (out->IovaSlotCount >= RKMPP_MAX_DENSE_IOVA_SLOTS) return 1;
+    uint32_t idx = off / 4u;
+    if (!H26xDenseSlotFor(out, off)) return 1;
+    if (!H26xDenseIsAddressReg(idx))  return 1;
+    RKMPP_DENSE_IOVA_SLOT *s = &out->IovaSlots[out->IovaSlotCount++];
+    s->RegIdx       = idx;
+    s->IovaOffset   = iova_offset;
+    s->BufferHandle = handle;
     return 0;
 }
 
@@ -51,10 +60,10 @@ static void frame_dims(const v4l2_ctrl_h264_sps *sps,
 } /* anon namespace */
 
 extern "C"
-H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
-                                         const H264BufferRefs  *bufs,
-                                         uint32_t               current_pic_index,
-                                         H264RegWriteList      *out)
+H264RegBuildStatus H264BuildDenseRegs(const H264ParseResult *parsed,
+                                      const H264BufferRefs  *bufs,
+                                      uint32_t               current_pic_index,
+                                      H26xDenseOutput       *out)
 {
     if (!parsed || !bufs || !out) return H264_REGBUILD_MISSING_INPUT;
     if (!parsed->has_sps || !parsed->has_pps || !parsed->has_slice)
@@ -62,7 +71,10 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
     if (!bufs->bitstream || !bufs->output_frame)
         return H264_REGBUILD_MISSING_INPUT;
 
-    out->count = 0;
+    /* Caller is expected to zero-init `out`, but be defensive — the bank
+     * MUST start zero so the bulk MMIO write only sets bits the
+     * regbuilder actually means to set. */
+    memset(out, 0, sizeof(*out));
     const auto &sps   = parsed->sps;
     const auto &pps   = parsed->pps;
     (void)parsed->slice;
@@ -75,12 +87,33 @@ H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
         return H264_REGBUILD_UNSUPPORTED;
     }
 
+    /* Bit-depth + chroma-format gate.  Mirrors upstream Linux
+     * rkvdec_h264_validate_sps (drivers/media/platform/rockchip/rkvdec/
+     * rkvdec-h264-common.c): we accept 8-bit (minus8=0) and 10-bit
+     * (minus8=2) 4:2:0 (chroma_format_idc=1) only.  Luma and chroma
+     * bit-depth must match.  4:2:2 (NV16/NV20) is silicon-supported but
+     * the engine output path isn't wired up for it yet — reject loudly
+     * rather than emit wrong-stride output. */
+    if (sps.chroma_format_idc != 1)
+        return H264_REGBUILD_UNSUPPORTED;
+    if (sps.bit_depth_luma_minus8 != sps.bit_depth_chroma_minus8)
+        return H264_REGBUILD_UNSUPPORTED;
+    if (sps.bit_depth_luma_minus8 != 0 && sps.bit_depth_luma_minus8 != 2)
+        return H264_REGBUILD_UNSUPPORTED;
+
     uint32_t width_px, height_px;
     frame_dims(&sps, &width_px, &height_px);
     uint32_t mb_w     = (width_px  + 15) / 16;
     uint32_t mb_h     = (height_px + 15) / 16;
-    uint32_t luma_stride   = mb_w * 16;        /* NV12, 16-aligned */
-    uint32_t chroma_stride = mb_w * 16;        /* 4:2:0, same horiz stride as luma */
+    /* NV12 (8-bit) or NV15 (10-bit packed: 4 samples in 5 bytes) horiz stride.
+     * Matches upstream rkvdec-h264.c bytesperline derivation: width * bpp / 8,
+     * 16-aligned.  Chroma stride is identical for 4:2:0.  The codec selects
+     * the output bit-depth via the packed PPS unit (bit_depth_luma_minus8);
+     * these stride registers must match or the SAO write fabric corrupts
+     * adjacent rows. */
+    const uint32_t bpp_num = (sps.bit_depth_luma_minus8 == 2) ? 10u : 8u;
+    uint32_t luma_stride   = ((mb_w * 16u * bpp_num + 7u) / 8u + 15u) & ~15u;
+    uint32_t chroma_stride = luma_stride;
     uint32_t y_size        = luma_stride * (mb_h * 16);
 
 #define EMIT_P(off, val) do { if (emit_plain(out, (off), (val))) \

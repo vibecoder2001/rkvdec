@@ -27,10 +27,12 @@ typedef struct _RKMPP_JOB {
      * before freeing its buffer pool — keeps the codec from DMA'ing
      * to iovas whose backing memory we just freed. */
     WDFFILEOBJECT   Owner;
-    /* Snapshot of the submission inputs.  Phase 3 will translate BufRefs into
-     * iova substitutions on the register list before kicking hardware. */
-    UINT32          RegWriteCount;
-    RKMPP_REG_WRITE Writes[RKMPP_MAX_REG_WRITES];
+    /* Optional buffer-reference table the caller supplies alongside the
+     * iova slots.  Pins the listed handles for the lifetime of the job
+     * (RkMppJobBufferInUse consults BufRefs even for handles not used
+     * by the dense bank — useful for the H.264 output frame which is
+     * referenced as DECOUT_BASE this kick but might also be needed by
+     * later kicks as a ref). */
     UINT32          BufRefCount;
     RKMPP_BUFFER_REF BufRefs[RKMPP_MAX_BUF_REFS];
     /* MDLs requiring per-kick cache maintenance, tracked by direction.
@@ -65,6 +67,16 @@ typedef struct _RKMPP_JOB {
     PMDL            CleanMdls[8];
     PMDL            OutputFrameMdl;
     PMDL            ColmvCurMdl;
+
+    /* Dense register-bank payload — the only submission shape rkvdec
+     * accepts (rkav1d has its own driver binary using the sparse
+     * RKMPP_REG_WRITE[] format).  See mft/regbuilder_dense.h plus
+     * shared/rkmpp_ioctl.h for the bank layout and substitution slot
+     * convention. */
+    UINT32                DenseKickValue;
+    UINT32                DenseIovaSlotCount;
+    RKMPP_DENSE_BANK      DenseBank;
+    RKMPP_DENSE_IOVA_SLOT DenseIovaSlots[RKMPP_MAX_DENSE_IOVA_SLOTS];
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------
@@ -88,16 +100,6 @@ typedef struct _RKMPP_JOB_QUEUE {
     KEVENT          KickEvent;      /* signalled after register list written */
     KEVENT          ExitEvent;      /* signalled to terminate poller */
     PETHREAD        PollerThread;   /* referenced; ObDereferenced on teardown */
-
-    /* Per-bit mask of register indices [0..511] that were nonzero in
-     * the most recent kick.  Used to skip MMIO writes for regs that
-     * were zero last kick AND are zero this kick — the hardware retains
-     * their (zero) value so we don't need to re-write them.  Cuts
-     * per-kick MMIO from ~155 (rkvdec2) / ~511 (AV1) total writes down
-     * to ~80 active + a few "clear" writes for regs going nonzero→zero.
-     *
-     * Cleared on reset paths because the reset returns codec regs to zero. */
-    ULONG           PrevNonzeroMask[16];
 } RKMPP_JOB_QUEUE, *PRKMPP_JOB_QUEUE;
 
 /* -----------------------------------------------------------------------
@@ -111,15 +113,6 @@ VOID RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue);
  * EvtReleaseHardware / EvtDriverContextCleanup. */
 VOID RkMppJobQueueTeardown(_Inout_ RKMPP_JOB_QUEUE *Queue);
 
-/* IOCTL_RKMPP_SUBMIT_JOB handler.  File is required for buffer-handle
- * resolution: any RKMPP_REG_WRITE with BufferHandle != 0 is rewritten to
- * the iova of the matching buffer in this file's allocation list before
- * the job is queued. */
-NTSTATUS RkMppJobSubmit(_In_ WDFDEVICE Device,
-                        _In_ WDFFILEOBJECT File,
-                        _In_ const RKMPP_SUBMIT_JOB_IN *In,
-                        _Out_ RKMPP_SUBMIT_JOB_OUT *Out);
-
 /* IOCTL_RKMPP_WAIT_JOB handler. */
 NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
                       _In_ WDFFILEOBJECT File,
@@ -127,13 +120,24 @@ NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
                       _In_ UINT32 TimeoutMs,
                       _Out_ RKMPP_WAIT_JOB_OUT *Out);
 
-/* IOCTL_RKMPP_PEEK_JOB handler — return the post-substitution register
- * list for a queued or completed job.  Used by tests to verify iova
- * substitution before the real hardware-kick path is in. */
-NTSTATUS RkMppJobPeek(_In_ WDFDEVICE Device,
-                      _In_ WDFFILEOBJECT File,
-                      _In_ UINT64 JobId,
-                      _Out_ RKMPP_PEEK_JOB_OUT *Out);
+/* IOCTL_RKMPP_SUBMIT_DENSE_JOB handler.  The caller supplies a fully
+ * zero-init'd RKMPP_DENSE_BANK plus a list of address-bank slots whose
+ * buffer handles the kernel resolves into iovas (stamped into the bank
+ * before the bulk MMIO write at kick time).  File is required for
+ * handle lookup. */
+NTSTATUS RkMppJobSubmitDense(_In_ WDFDEVICE Device,
+                             _In_ WDFFILEOBJECT File,
+                             _In_ const RKMPP_SUBMIT_DENSE_JOB_IN *In,
+                             _Out_ RKMPP_SUBMIT_DENSE_JOB_OUT *Out);
+
+/* IOCTL_RKMPP_PEEK_DENSE_JOB handler — return the post-substitution
+ * dense bank for a queued or completed dense job.  Returns
+ * STATUS_NOT_FOUND if the JobId doesn't match a dense-flavoured job
+ * owned by `File`. */
+NTSTATUS RkMppJobPeekDense(_In_ WDFDEVICE Device,
+                           _In_ WDFFILEOBJECT File,
+                           _In_ UINT64 JobId,
+                           _Out_ RKMPP_PEEK_DENSE_JOB_OUT *Out);
 
 /* Return TRUE when Cookie is referenced by any pending, in-flight, or
  * completed-not-yet-waited job owned by File.  Used by explicit
@@ -162,6 +166,14 @@ NTSTATUS RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
                              _In_ WDFFILEOBJECT File,
                              _In_ ULONG TimeoutMs,
                              _Out_ BOOLEAN *InFlightTimedOut);
+
+/* TRUE when the queue has an in-flight or pending job owned by something
+ * other than `File`.  Use in EvtFileCleanup AFTER DrainOwner to decide
+ * whether the session-end PD power-cycle is safe (no other concurrent
+ * decode session on this engine) or whether it would yank hardware out
+ * from under another File. */
+BOOLEAN RkMppJobQueueHasOtherOwner(_In_ WDFDEVICE Device,
+                                   _In_ WDFFILEOBJECT File);
 
 /* ISR — declared here so device.c can pass it to WdfInterruptCreate. */
 EVT_WDF_INTERRUPT_ISR  RkMppEvtIsr;

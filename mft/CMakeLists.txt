@@ -3,6 +3,7 @@
 # the eventual MFT DLL can link the same code.
 
 add_library(rkmpp_mft STATIC
+    au_iter.cpp
     parser_glue.cpp
     parser_glue_h265.cpp
     avcc_to_annexb.cpp

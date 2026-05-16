@@ -59,6 +59,16 @@ typedef struct _RKMPP_DEVICE {
      * (mpp_common.c:2026: if reset_request > 0 mpp_dev_reset).  We mirror
      * that: 1 before first kick, set after error, cleared after reset. */
     volatile LONG          NeedsCoreReset;
+    /* Escalation flag set when a failure follows another recent failure —
+     * narrow CoreReset (CON40 bits 6..9 toggle) doesn't recover the codec
+     * once dec_e is stuck at 1 (mid-decode wedge).  When set, the next
+     * JobStart runs the wider FullCoreReset0/1 (PMU idle + NIU + CABAC +
+     * CORE bundle) and re-Attaches the IOMMU (FullCoreResetN zeroes
+     * DTE_ADDR as a side effect). */
+    volatile LONG          NeedsFullReset;
+    /* Tracks whether the most recent JobComplete reported failure, so we
+     * can detect "two failures in a row" and escalate. */
+    volatile LONG          LastJobFailed;
 } RKMPP_DEVICE, *PRKMPP_DEVICE;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RKMPP_DEVICE, RkMppDeviceGet);
@@ -75,6 +85,31 @@ RkMppSetNeedsCoreReset(_In_ WDFDEVICE Device)
 {
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     InterlockedExchange(&ctx->NeedsCoreReset, 1);
+}
+
+LONG
+RkMppQueryAndClearNeedsFullReset(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    return InterlockedExchange(&ctx->NeedsFullReset, 0);
+}
+
+VOID
+RkMppSetNeedsFullReset(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    InterlockedExchange(&ctx->NeedsFullReset, 1);
+    /* Cascade: full reset is a strict superset of core reset, but we
+     * also flag the narrow one so any code path that only checks the
+     * core flag still triggers SOMETHING. */
+    InterlockedExchange(&ctx->NeedsCoreReset, 1);
+}
+
+LONG
+RkMppExchangeLastJobFailed(_In_ WDFDEVICE Device, LONG NewValue)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    return InterlockedExchange(&ctx->LastJobFailed, NewValue);
 }
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE     RkMppEvtPrepareHardware;
@@ -369,6 +404,17 @@ RkMppEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTransl
     UNREFERENCED_PARAMETER(ResourcesTranslated);
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
 
+    /* Stop the poller before anything that takes MMIO out from under it.
+     * The poller's tight `READ_REGISTER_ULONG(mmio + IntStatusOffset)`
+     * loop runs at PASSIVE_LEVEL with no synchronization against PnP
+     * teardown.  If a kick is in flight when PnP-stop fires, the poller
+     * is still inside that read when DropCluster powers the codec PD
+     * off (→ SError) or MmUnmapIoSpace tears down the kernel VA
+     * (→ PAGE_FAULT_IN_NONPAGED_AREA).  Quiesce it first; the second
+     * call from EvtDeviceContextCleanup is a no-op once PollerThread
+     * is NULL. */
+    RkMppJobQueueTeardown(&ctx->JobQueue);
+
     /* Mirror PrepareHardware in reverse: drop the cluster raise we took
      * there, then release the ifcs and unmap MMIO.
      *
@@ -519,107 +565,126 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
     BOOLEAN timedOut = FALSE;
     (void)RkMppJobsDrainOwner(ctx->Device, FileObject, 500, &timedOut);
 
-    /* Two-tier session-end recovery (mirrors BSP's
-     * `rkvdec2_vdpu382_reset` → `rkvdec2_reset` escalation):
-     *
-     *   - Drain timeout → HARD tier: wide CRU bundle reset
-     *     (PMU idle + CON40 bits 2..9 + CON44 bits 4..6 + idle release).
-     *     Required because a stuck in-flight kick has the codec FSM in
-     *     a state nothing softer can recover.  Cost: also resets the
-     *     AXI/AHB/NIU bus blocks the IOMMU sits on, which is why the
-     *     post-reset Reattach is critical.
-     *
-     *   - Clean drain but session had error-flagged jobs → SOFT tier:
-     *     IOMMU force-reset only (RK_MMU_CMD_FORCE_RESET).  Resets the
-     *     MMU's internal walk caches / prefetcher / fault state without
-     *     touching CRU bits.  Safe for cross-codec hand-off — observed
-     *     2026-05-03 that the wide reset breaks HEVC's NIU routing
-     *     when invoked between H.264 and HEVC sessions.
-     *
-     *   - Clean drain, no errors → just the standard `Reattach` below. */
     LONG sessionErrors = InterlockedExchange(&ctx->ErrorCount, 0);
     PRKMPP_DEVICE devCtx = RkMppDeviceGet(ctx->Device);
 
     if (timedOut) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                    "rkmpp: FileCleanup in-flight wait timed out — "
-                   "wide CRU reset + WDF restart for full PD cycle\n");
-        RkMppSetNeedsCoreReset(ctx->Device);
-        if (devCtx && devCtx->Ifcs.CcuOpen) {
-            /* v8: per-codec hang-recovery dispatch on UID. */
-            if (devCtx->Uid == 0 && devCtx->Ifcs.Ccu.FullCoreReset0) {
-                devCtx->Ifcs.Ccu.FullCoreReset0(
-                    devCtx->Ifcs.Ccu.Header.Context);
-            } else if (devCtx->Uid == 1 && devCtx->Ifcs.Ccu.FullCoreReset1) {
-                devCtx->Ifcs.Ccu.FullCoreReset1(
-                    devCtx->Ifcs.Ccu.Header.Context);
-            }
-        }
-        /* Wide CRU reset clears CON40 reset bits but leaves PD power on,
-         * so codec FSM state that survives a reset (AXI write buffer in
-         * flight, internal pipeline registers not in the CRU bundle) can
-         * still wedge subsequent decodes.  Empirically the disable+enable
-         * cycle on RKCP3550 always recovers — that's a full PD cycle via
-         * EvtReleaseHardware → DropCluster (refcount → 0 → PMU power off)
-         * → EvtPrepareHardware → RaiseCluster (PMU power on).
-         * Replicate that programmatically via WdfDeviceSetFailed with
-         * AttemptRestart: WDF reports failure to PnP, the framework
-         * unloads + reloads the driver, which power-cycles the codec.
-         * In-flight work is lost — but the alternative is a system that
-         * needs Device Manager intervention to recover. */
-        WdfDeviceSetFailed(ctx->Device, WdfDeviceFailedAttemptRestart);
+                   "session-end PD power-cycle below; in-flight work lost\n");
     } else if (sessionErrors > 0) {
-        /* Originally invoked the soft-tier `Iommu.ForceReset` here, but
-         * issuing RK_MMU_CMD_FORCE_RESET on this SoC wedges the hardware
-         * (followup decode IOCTLs hang).  The Linux BSP's
-         * rk_iommu_force_reset wraps the same MMU op with additional
-         * pipeline quiescing (codec stall + power-domain off, see
-         * mpp_dev_reset) that we don't yet replicate; without that
-         * sequencing the soft tier is unsafe.  Defer to the existing
-         * NeedsCoreReset path: the next session's first kick will run
-         * the wide CRU `FullCoreReset` via RkMppJobStart, which is
-         * verified safe.  The unconditional `Reattach` below still
-         * drops the IOMMU walk cache, which is enough isolation for
-         * the common case (errored decode but no driver-side timeout).
-         *
-         * Re-enable the soft tier when we replicate BSP's stall +
-         * power-down + clock-gate sequencing around the FORCE_RESET. */
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                    "rkmpp: drain clean fileobject=%p but %d error-flagged "
-                   "jobs — flagging next-kick wide reset (soft tier disabled)\n",
+                   "jobs — session-end PD power-cycle below\n",
                    FileObject, sessionErrors);
-        RkMppSetNeedsCoreReset(ctx->Device);
     } else {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                   "rkmpp: drain done fileobject=%p clean\n",
-                   FileObject);
+                   "rkmpp: drain done fileobject=%p clean — "
+                   "session-end PD power-cycle below\n", FileObject);
     }
 
     RkMppBufFreeAll(FileObject);
 
-    /* Reattach the IOMMU domain on every session close, regardless of
-     * whether drain timed out.  Linux's `mpp_iommu_dev_deactivate` is
-     * called on every IRQ completion; we don't have per-IRQ deactivate
-     * machinery, but reattaching at session-close gives an equivalent
-     * guarantee that the next session never inherits walk-cache state
-     * from a prior session.  This is cheap (one Disable + Enable on the
-     * IOMMU, ~10 µs) and is the architectural answer to the
-     * kill-mid-decode wedge documented in
-     * memory:rkmpp_kernel_security_todos.md item 9.
+    /* Decide between two session-close hygiene paths:
      *
-     * Order matters: must run AFTER BufFreeAll so the buffer iovas have
-     * been UnmapMdl'd from the page tables.  Reattach preserves the
-     * domain (and any iovas still mapped by other sessions) — only the
-     * hardware-side walk caches are flushed. */
-    if (devCtx && devCtx->Ifcs.IommuOpen &&
-        devCtx->Ifcs.Iommu.Reattach) {
-        NTSTATUS rs = devCtx->Ifcs.Iommu.Reattach(
-            devCtx->Ifcs.Iommu.Header.Context);
-        if (!NT_SUCCESS(rs)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "rkmpp: post-drain Reattach failed 0x%08x\n", rs);
+     *   A. NO other File active on this engine — do the full PD power-
+     *      cycle (FullCoreReset0/1 = PD_RKVDEC{0,1} PowerOff → SOFTRST
+     *      toggle → PowerOn).  Clears codec FSM + IOMMU walk-cache state
+     *      so the next session never inherits anything from this one.
+     *      This is the empirical recipe that removes whole classes of
+     *      "wedge persists across mpv invocations" failures.
+     *
+     *   B. ANOTHER File still has Pending / InFlight on this engine —
+     *      a second concurrent decode is using us right now.  The wide
+     *      PD-cycle would yank the codec and IOMMU out from under their
+     *      in-flight DMA, corrupting their stream.  Downgrade to:
+     *        - IOMMU Reattach (Disable+Enable) to drop walk-cache state
+     *          tied to our just-unmapped iovas; preserves other Files'
+     *          domain mappings.
+     *        - Flag NeedsCoreReset so the OTHER File's next kick eats
+     *          a cheap narrow CON40/CON41 core-reset bundle — softer
+     *          cleanse of codec FSM than the full PD-cycle, but it
+     *          still scrubs any FSM bits our last kick left behind.
+     *      When the last remaining File on this engine closes, path A
+     *      runs and performs the full hygiene cycle then.
+     *
+     * The `timedOut` recovery path stays on A regardless: if our drain
+     * failed, the codec is wedged and the other File's next kick was
+     * going to fail anyway — better to recover the engine now.
+     *
+     * Note on race: the otherActive check is not atomic with the heavy
+     * path below — a peer can submit between observation and PD-cycle.
+     * That's acceptable: if the race-stomp causes the peer's first
+     * post-reset kick to error, JobStart's NeedsFullReset recovery
+     * path issues a fresh hygiene cycle on the kick after.  The
+     * alternative (a Quiescing latch checked in SubmitDense) added
+     * complexity without measurable benefit. */
+    BOOLEAN otherActive = RkMppJobQueueHasOtherOwner(ctx->Device, FileObject);
+
+    if (devCtx) {
+        PRKIOMMU_INTERFACE   iommu = devCtx->Ifcs.IommuOpen ? &devCtx->Ifcs.Iommu : NULL;
+        PRKMPP_CCU_INTERFACE ccu   = devCtx->Ifcs.CcuOpen   ? &devCtx->Ifcs.Ccu   : NULL;
+
+        if (otherActive && !timedOut) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "rkmpp: FileCleanup with concurrent File on UID=%u — "
+                       "skipping IOMMU/CCU touches (would disrupt peer DMA); "
+                       "flagging NeedsCoreReset for peer's next kick\n",
+                       devCtx->Uid);
+            /* Do NOT call Iommu.Reattach here.  It Disable+Enables the
+             * IOMMU, opening a ~10µs window with paging OFF — the peer's
+             * in-flight AXI transactions during that window go
+             * untranslated and fault.  BufFreeAll above already issued
+             * per-iova ZAP_CACHE via UnmapMdl, which is the only
+             * walk-cache state that needed flushing for our cleanup.
+             *
+             * The narrow per-codec reset bundle on the peer's next kick
+             * scrubs any codec FSM state our last kick left behind, at
+             * kick-start timing (codec idle) so it's peer-safe. */
+            RkMppSetNeedsCoreReset(ctx->Device);
+        } else {
+            if (timedOut && otherActive) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "rkmpp: FileCleanup drain timed out on UID=%u with "
+                           "concurrent File active — PD-cycle will disrupt it\n",
+                           devCtx->Uid);
+            }
+            if (iommu && iommu->MaskIrq) {
+                iommu->MaskIrq(iommu->Header.Context);
+            }
+            if (iommu && iommu->Disable) {
+                (void)iommu->Disable(iommu->Header.Context);
+            }
+            if (ccu) {
+                if (devCtx->Uid == 0 && ccu->FullCoreReset0) {
+                    ccu->FullCoreReset0(ccu->Header.Context);
+                } else if (devCtx->Uid == 1 && ccu->FullCoreReset1) {
+                    ccu->FullCoreReset1(ccu->Header.Context);
+                }
+            }
+            if (iommu && iommu->Enable) {
+                NTSTATUS rs = iommu->Enable(iommu->Header.Context);
+                if (!NT_SUCCESS(rs)) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                               "rkmpp: post-FileCleanup IOMMU Enable failed 0x%08x — "
+                               "next session will lazy-Enable on first MapMdl\n", rs);
+                }
+            }
+            if (iommu && iommu->UnmaskIrq) {
+                iommu->UnmaskIrq(iommu->Header.Context);
+            }
+
+            /* Power-cycle subsumes both narrow CoreReset and wide
+             * FullReset that JobStart would otherwise apply to the
+             * next session's first kick — clear the flags. */
+            (void)RkMppQueryAndClearNeedsCoreReset(ctx->Device);
+            (void)RkMppQueryAndClearNeedsFullReset(ctx->Device);
         }
     }
+
+    /* LastJobFailed is per-device; clear regardless of path so it doesn't
+     * leak across to the next kick on either File. */
+    (void)RkMppExchangeLastJobFailed(ctx->Device, 0);
 }
 
 VOID

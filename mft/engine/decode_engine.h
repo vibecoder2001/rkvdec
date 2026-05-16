@@ -14,7 +14,9 @@
  * register-list values themselves).
  */
 #pragma once
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <cstdint>
 #include <vector>
 
@@ -25,6 +27,7 @@
 #include "h264_packed_tables.h"
 #include "h265_packed_tables.h"
 #include "dpb.h"
+#include "decode_engine_backend.h"
 
 enum class Codec {
     H264 = 0,
@@ -34,23 +37,30 @@ enum class Codec {
 struct DecodeEngine {
     Codec codec = Codec::H264;
 
-    /* Device handle from CreateFile on the rkmpp interface. */
-    HANDLE device = INVALID_HANDLE_VALUE;
+    /* Device handle from CreateFile on the rkmpp interface.  Owned by
+     * the Windows backend's Open() but stored on the engine so the
+     * H.265 / AV1 submit paths (not yet routed through the vtable) can
+     * keep calling DeviceIoControl(e->device, ...) directly.  Typed as
+     * void* so this header compiles on Linux; the H.265 path casts back
+     * to HANDLE inside #ifdef _WIN32 in decode_engine.cpp. */
+    void *device = nullptr;
 
-    /* Buffer cookies + iovas + user VAs returned by IOCTL_RKMPP_ALLOC_BUFFER. */
-    struct Buf {
-        uint64_t handle = 0;
-        uint64_t iova   = 0;
-        void    *user_va = nullptr;
-        uint32_t size   = 0;
-    };
-    Buf bitstream;            /* Annex-B input */
-    Buf cabac_init;           /* H.264: 3712B; H.265: 27456B */
-    Buf pps_table;             /* H.264 SPS+PPS unit / HEVC 80*64 packed unit */
-    Buf rps_table;             /* H.264 384B / HEVC 3200B */
-    Buf scaling_list;          /* H.264 224B / HEVC 1360B */
-    Buf rcb;                   /* consolidated RCB scratch (codec-agnostic geometry) */
-    Buf error_ref;             /* fallback ref frame */
+    /* Pluggable kernel-surface backend.  Default: per-engine inline
+     * Windows backend wired up by DecodeEngine_Init.  Linux harnesses
+     * call DecodeEngine_InitWithBackend with their own. */
+    DecodeEngineBackend  backend_storage{};
+    DecodeEngineBackend *backend = nullptr;
+
+    /* Buffer cookies + iovas + user VAs populated by backend->AllocBuf.
+     * `dma_fd` is -1 on Windows; set to a real fd on Linux backends. */
+    using Buf = DecodeEngineBuf;
+    Buf bitstream{};           /* Annex-B input */
+    Buf cabac_init{};          /* H.264: 3712B; H.265: 27456B */
+    Buf pps_table{};           /* H.264 SPS+PPS unit / HEVC 80*64 packed unit */
+    Buf rps_table{};           /* H.264 384B / HEVC 3200B */
+    Buf scaling_list{};        /* H.264 224B / HEVC 1360B */
+    Buf rcb{};                 /* consolidated RCB scratch (codec-agnostic geometry) */
+    Buf error_ref{};           /* fallback ref frame */
     /* DPB pool: must be >= max_dec_pic_buffering of any stream we accept.
      * H.264 / HEVC profiles cap max_dec_pic_buffering at 16; B-pyramid
      * streams typically need 5..8 live slots.  Pool of 4 was the Phase 3
@@ -60,8 +70,8 @@ struct DecodeEngine {
      * reorder queue: 4 < 5 needed).  16 = spec maximum, no headroom math
      * needed; modest memory cost (~48 MiB at 1080p NV12). */
     static const int kPoolSize = 16;
-    Buf pool_output[kPoolSize]; /* DPB output frames */
-    Buf pool_colmv[kPoolSize];  /* per-slot colmv */
+    Buf pool_output[kPoolSize]{}; /* DPB output frames */
+    Buf pool_colmv[kPoolSize]{};  /* per-slot colmv */
 
     /* Slot of the most-recent successful DecodeOne_* — captured so
      * Submit can stash it in the queued ReorderEntry and PollFrame can
@@ -180,9 +190,20 @@ struct DecodeEngine {
 
 /* Open the rkmpp device and the per-stream resources for a frame of
  * `width x height` (px) of the requested codec.  Pre-fills the
- * codec-appropriate CABAC table + RCB sizing. */
+ * codec-appropriate CABAC table + RCB sizing.  Routes alloc + H.264
+ * submit through the default Windows backend. */
 int DecodeEngine_Init(DecodeEngine *e, Codec codec,
                       uint32_t width, uint32_t height);
+
+/* Same as DecodeEngine_Init but routes alloc + H.264 submit through a
+ * caller-supplied backend (e.g. the Linux /dev/mpp_service backend in
+ * tests/harness/linux_mpp_decode/).  `backend` must outlive the engine.
+ * H.265 / AV1 paths still use DeviceIoControl on e->device — passing a
+ * non-Windows backend is supported only for H.264 streams. */
+int DecodeEngine_InitWithBackend(DecodeEngine *e,
+                                 DecodeEngineBackend *backend,
+                                 Codec codec,
+                                 uint32_t width, uint32_t height);
 
 /* Free everything. */
 void DecodeEngine_Shutdown(DecodeEngine *e);

@@ -32,6 +32,7 @@
 #endif
 
 #include "../shared/rkmpp_ioctl.h"
+#include "regbuilder_dense.h"
 #include "parser_glue.h"
 
 #ifdef __cplusplus
@@ -74,19 +75,22 @@ typedef struct H264BufferRefs {
     uint64_t ref_colmv[16];
 } H264BufferRefs;
 
-/* Output: a packed register-write list ready to feed into
- * RKMPP_SUBMIT_JOB_IN.Writes[]. */
+/* Transitional sparse register-write list.  No longer emitted by the
+ * regbuilder — kept here because the Linux MppSvc transport (BSP
+ * ioctl surface) still consumes a sparse list, and backend_linux.cpp
+ * materialises one from the dense output.  Windows path goes
+ * dense-only via IOCTL_RKMPP_SUBMIT_DENSE_JOB. */
 typedef struct H264RegWriteList {
     RKMPP_REG_WRITE entries[RKMPP_MAX_REG_WRITES];
     uint32_t        count;
 } H264RegWriteList;
 
-/* Build the register list.
+/* Build the register payload as a dense bank (H26xDenseOutput).
  *
  * - `parsed`     — parsed access-unit; must have has_sps/has_pps/has_slice.
  * - `bufs`       — buffer handles for DMA addresses.
  * - `current_pic_index` — which DPB slot this picture occupies (0..15).
- * - `out`        — output list; caller zero-inits.
+ * - `out`        — output dense bank; caller zero-inits.
  *
  * Returns:
  *   0 on success, non-zero on validation failure.  Failure reasons are
@@ -98,10 +102,10 @@ typedef enum {
     H264_REGBUILD_UNSUPPORTED     = 3,
 } H264RegBuildStatus;
 
-H264RegBuildStatus H264BuildRegisterList(const H264ParseResult *parsed,
-                                         const H264BufferRefs  *bufs,
-                                         uint32_t               current_pic_index,
-                                         H264RegWriteList      *out);
+H264RegBuildStatus H264BuildDenseRegs(const H264ParseResult *parsed,
+                                      const H264BufferRefs  *bufs,
+                                      uint32_t               current_pic_index,
+                                      H26xDenseOutput       *out);
 
 #ifdef __cplusplus
 }

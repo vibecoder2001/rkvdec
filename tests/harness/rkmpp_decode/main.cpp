@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <initguid.h>
 #include "decode_engine.h"
+#include "au_iter.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -25,97 +26,15 @@ static int Usage() {
     return 1;
 }
 
-/* Find next 3- or 4-byte Annex-B start code at or after `from`.
- * Returns offset of the first NAL header byte (= byte after start
- * code), or SIZE_MAX. */
-static size_t find_start_code(const uint8_t *buf, size_t len, size_t from) {
-    for (size_t i = from; i + 3 <= len; i++) {
-        if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1)
-            return i + 3;
-        if (i + 4 <= len &&
-            buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1)
-            return i + 4;
-    }
-    return SIZE_MAX;
-}
-
-/* H.264 AU walker: a contiguous run of NAL units up to and including
- * the next slice NAL (type 1 or 5). */
-static bool au_next_h264(const uint8_t *buf, size_t len, size_t *pos,
-                         size_t *au_off, size_t *au_len) {
-    if (*pos >= len) return false;
-    size_t first_sc = find_start_code(buf, len, *pos);
-    if (first_sc == SIZE_MAX) return false;
-
-    bool found_slice = false;
-    size_t after_slice = len;
-    size_t nh_off = first_sc;
-    while (nh_off < len) {
-        uint8_t nal_unit_type = buf[nh_off] & 0x1F;
-        if (nal_unit_type == 1 || nal_unit_type == 5) {
-            found_slice = true;
-            size_t next_sc = find_start_code(buf, len, nh_off + 1);
-            after_slice = (next_sc == SIZE_MAX) ? len : (next_sc - 3);
-            break;
-        }
-        size_t next_sc = find_start_code(buf, len, nh_off + 1);
-        if (next_sc == SIZE_MAX || next_sc >= len) break;
-        nh_off = next_sc;
-    }
-    if (!found_slice) return false;
-
-    size_t sc_start = (first_sc >= 3) ? first_sc - 3 : 0;
-    *au_off = sc_start;
-    *au_len = after_slice - sc_start;
-    *pos    = after_slice;
-    return true;
-}
-
-/* HEVC AU walker.  HEVC NAL header: 2 bytes; nal_unit_type =
- * (byte0 >> 1) & 0x3F.  VCL slice NALs have type < 32 (TRAIL/RASL/
- * RADL ranges 0..9, IRAP ranges 16..21, plus reserved-VCL 10..15 and
- * 22..31).  Non-VCL: VPS=32, SPS=33, PPS=34, AUD=35, EOS=36, EOB=37,
- * FD=38, SEI 39/40, etc.
- *
- * To match the decode_engine slice locator, the AU spans from the
- * leading parameter-set / SEI / AUD start code through the slice
- * NAL — i.e., we find the *first* VCL NAL at or after pos and end
- * the AU just before the next start code that follows it. */
-static bool au_next_h265(const uint8_t *buf, size_t len, size_t *pos,
-                         size_t *au_off, size_t *au_len) {
-    if (*pos >= len) return false;
-    size_t first_sc = find_start_code(buf, len, *pos);
-    if (first_sc == SIZE_MAX) return false;
-
-    bool found_slice = false;
-    size_t after_slice = len;
-    size_t nh_off = first_sc;
-    while (nh_off < len) {
-        uint8_t nal_unit_type = (buf[nh_off] >> 1) & 0x3F;
-        if (nal_unit_type < 32) {
-            found_slice = true;
-            size_t next_sc = find_start_code(buf, len, nh_off + 1);
-            after_slice = (next_sc == SIZE_MAX) ? len : (next_sc - 3);
-            break;
-        }
-        size_t next_sc = find_start_code(buf, len, nh_off + 1);
-        if (next_sc == SIZE_MAX || next_sc >= len) break;
-        nh_off = next_sc;
-    }
-    if (!found_slice) return false;
-
-    size_t sc_start = (first_sc >= 3) ? first_sc - 3 : 0;
-    *au_off = sc_start;
-    *au_len = after_slice - sc_start;
-    *pos    = after_slice;
-    return true;
-}
-
+/* AU walker: thin pos-cursor adapter over mft/au_iter. */
 static bool au_next(Codec codec, const uint8_t *buf, size_t len, size_t *pos,
                     size_t *au_off, size_t *au_len) {
-    if (codec == Codec::H265)
-        return au_next_h265(buf, len, pos, au_off, au_len);
-    return au_next_h264(buf, len, pos, au_off, au_len);
+    AuIter it = { buf, len, *pos };
+    int ok = (codec == Codec::H265)
+                ? H265AuNext(&it, au_off, au_len, nullptr)
+                : H264AuNext(&it, au_off, au_len, nullptr);
+    *pos = it.pos;
+    return ok != 0;
 }
 
 int wmain(int argc, wchar_t **argv) {

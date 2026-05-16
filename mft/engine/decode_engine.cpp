@@ -1,14 +1,32 @@
 /* mft/engine/decode_engine.cpp */
 #include "decode_engine.h"
-#include "../../shared/rkmpp_ioctl.h"
+#include "repack_yuv.h"
+#include "../au_iter.h"
 
-#include <setupapi.h>
+#ifdef _WIN32
+#include "../../shared/rkmpp_ioctl.h"
+#endif
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <utility>
 
-static int Fail(const char *m, DWORD ec = 0) {
+#ifdef _WIN32
+#  define DECODE_ENV_GET(name, buf) \
+        (GetEnvironmentVariableA(name, buf, sizeof(buf)) > 0)
+#else
+#  include <time.h>
+#  include <stdio.h>
+#  define DECODE_ENV_GET(name, buf) ({ \
+        const char *_v = ::getenv(name); \
+        if (_v) { strncpy(buf, _v, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0; } \
+        _v != nullptr; \
+    })
+typedef unsigned long DWORD;   /* used by Fail's ec parameter; harmless on Linux */
+#endif
+
+static int Fail(const char *m, unsigned long ec = 0) {
     std::fprintf(stderr, "decode_engine: %s (%lu)\n", m, ec);
     return 1;
 }
@@ -28,8 +46,7 @@ static int OutputFillByte() {
     static int cached = -2;
     if (cached == -2) {
         char buf[16] = {};
-        DWORD n = GetEnvironmentVariableA("RKMPP_OUTPUT_FILL", buf, sizeof(buf));
-        if (n == 0) {
+        if (!DECODE_ENV_GET("RKMPP_OUTPUT_FILL", buf)) {
             cached = -1;
             std::fprintf(stderr,
                 "RKMPP_OUTPUT_FILL: unset (output buffer left as kernel-zeroed)\n");
@@ -54,8 +71,7 @@ static bool DecodeDebugEnabled() {
     static int cached = -1;
     if (cached < 0) {
         char buf[8] = {};
-        DWORD n = GetEnvironmentVariableA("RKMPP_DECODE_DEBUG", buf, sizeof(buf));
-        cached = (n > 0 && buf[0] != '0') ? 1 : 0;
+        cached = (DECODE_ENV_GET("RKMPP_DECODE_DEBUG", buf) && buf[0] != '0') ? 1 : 0;
     }
     return cached != 0;
 }
@@ -68,12 +84,12 @@ static bool TimingEnabled() {
     static int cached = -1;
     if (cached < 0) {
         char buf[8] = {};
-        DWORD n = GetEnvironmentVariableA("RKMPP_TIMING", buf, sizeof(buf));
-        cached = (n > 0 && buf[0] != '0') ? 1 : 0;
+        cached = (DECODE_ENV_GET("RKMPP_TIMING", buf) && buf[0] != '0') ? 1 : 0;
     }
     return cached != 0;
 }
 
+#ifdef _WIN32
 static int64_t QpcNow() {
     LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart;
 }
@@ -85,6 +101,13 @@ static int64_t QpcFreq() {
 static int64_t QpcUs(int64_t a, int64_t b) {
     return (b - a) * 1'000'000LL / QpcFreq();
 }
+#else
+static int64_t QpcNow() {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
+}
+static int64_t QpcUs(int64_t a, int64_t b) { return (b - a) / 1000LL; }
+#endif
 
 struct StageTimes {
     int64_t parse_us  = 0;
@@ -112,85 +135,39 @@ static void EmitTimingCsv(const StageTimes &t, const char *codec, int32_t poc) {
     std::fflush(stderr);
 }
 
-static int OpenDevice(HANDLE *out, Codec codec) {
-    HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_RKMPP, nullptr, nullptr,
-                                        DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
-    if (set == INVALID_HANDLE_VALUE) return Fail("SetupDiGetClassDevsW", GetLastError());
-
-    const uint32_t want_codec = (codec == Codec::H265)
-                                    ? RKMPP_CODEC_HEVC
-                                    : RKMPP_CODEC_H264;
-
-    SP_DEVICE_INTERFACE_DATA ifd{ sizeof(ifd) };
-    DWORD idx = 0;
-    while (SetupDiEnumDeviceInterfaces(set, nullptr, &GUID_DEVINTERFACE_RKMPP,
-                                       idx++, &ifd))
-    {
-        DWORD need = 0;
-        SetupDiGetDeviceInterfaceDetailW(set, &ifd, nullptr, 0, &need, nullptr);
-        std::vector<uint8_t> buf(need);
-        auto *det = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buf.data());
-        det->cbSize = sizeof(*det);
-        if (!SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, nullptr, nullptr))
-            continue;
-
-        HANDLE h = CreateFileW(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                               OPEN_EXISTING, 0, nullptr);
-        if (h == INVALID_HANDLE_VALUE) continue;
-
-        /* Caps probe — only accept RKCP3550 (rkv-decoder-v2 core 0/1) with
-         * the requested codec capability bit. */
-        RKMPP_CAPS caps{};  caps.StructSize = sizeof(caps);
-        DWORD got = 0;
-        if (DeviceIoControl(h, IOCTL_RKMPP_GET_CAPS, nullptr, 0,
-                            &caps, sizeof(caps), &got, nullptr) &&
-            caps.Hid == 0x3550 && (caps.SupportedCodecs & want_codec)) {
-            *out = h;
-            SetupDiDestroyDeviceInfoList(set);
-            return 0;
-        }
-        CloseHandle(h);
-    }
-    SetupDiDestroyDeviceInfoList(set);
-    return Fail("no RKCP3550 device with requested codec found");
-}
-
-static int AllocBuf(HANDLE dev, uint32_t size, RKMPP_BUFFER_USAGE usage,
-                    DecodeEngine::Buf *out) {
-    RKMPP_ALLOC_BUFFER_IN  in{};
-    RKMPP_ALLOC_BUFFER_OUT o{};
-    in.StructSize = sizeof(in);
-    in.Size       = size;
-    in.Usage      = (UINT32)usage;
-    DWORD got = 0;
-    if (!DeviceIoControl(dev, IOCTL_RKMPP_ALLOC_BUFFER, &in, sizeof(in),
-                         &o, sizeof(o), &got, nullptr))
-        return Fail("ALLOC_BUFFER", GetLastError());
-    out->handle  = o.BufferHandle;
-    out->iova    = o.Iova;
-    out->user_va = o.UserVa;
-    out->size    = o.SizeRoundedUp;
-    return 0;
-}
-
-static void FreeBuf(HANDLE dev, DecodeEngine::Buf *b) {
-    if (!b->handle) return;
-    RKMPP_FREE_BUFFER_IN in{ b->handle };
-    DWORD got = 0;
-    DeviceIoControl(dev, IOCTL_RKMPP_FREE_BUFFER, &in, sizeof(in),
-                    nullptr, 0, &got, nullptr);
-    *b = {};
-}
+/* OpenDevice / AllocBuf / FreeBuf + the WindowsBackend vtable live in
+ * mft/engine/backend_windows.cpp.  WindowsBackend_Init is the only
+ * symbol DecodeEngine_Init needs from there. */
 
 int DecodeEngine_Init(DecodeEngine *e, Codec codec,
                       uint32_t width, uint32_t height)
 {
+#ifdef _WIN32
+    /* Default backend: per-engine inline Windows backend whose ctx
+     * points at e->device (so H.265 / AV1 paths still see the handle). */
+    WindowsBackend_Init(&e->backend_storage, &e->device);
+    return DecodeEngine_InitWithBackend(e, &e->backend_storage,
+                                        codec, width, height);
+#else
+    (void)e; (void)codec; (void)width; (void)height;
+    return Fail("DecodeEngine_Init has no default backend on Linux; "
+                "call DecodeEngine_InitWithBackend(LinuxBackend_New(...))");
+#endif
+}
+
+int DecodeEngine_InitWithBackend(DecodeEngine *e,
+                                 DecodeEngineBackend *backend,
+                                 Codec codec,
+                                 uint32_t width, uint32_t height)
+{
     e->codec        = codec;
     e->frame_width  = width;
     e->frame_height = height;
+    e->backend      = backend;
 
-    if (OpenDevice(&e->device, codec) != 0) return 1;
+    if (e->backend->Open(e->backend->ctx,
+                         codec == Codec::H265 ? DE_CODEC_H265 : DE_CODEC_H264) != 0)
+        return 1;
 
     /* RCB sizing — codec-agnostic geometry on vdpu34x.  Reuse the H.264
      * sizer for both: the 10 sub-regions, alignment, and per-region
@@ -207,7 +184,16 @@ int DecodeEngine_Init(DecodeEngine *e, Codec codec,
      * plane was read 8 luma rows before codec's actual UV start). */
     auto align16 = [](uint32_t v) { return (v + 15u) & ~15u; };
     uint32_t height_pad  = align16(height);
-    uint32_t frame_bytes = width * height_pad * 3u / 2u;
+    /* Size for 10-bit (NV15 packed: 4 samples in 5 bytes => stride =
+     * width*10/8).  Same backing buffer serves 8-bit streams unchanged
+     * (just costs 1.25x the bytes — ~24 MiB at 4K).  Per-AU regbuilder
+     * picks the actual stride from the SPS; we don't need to reallocate
+     * on a profile / bit-depth change mid-stream. */
+    uint32_t stride_8  = align16(width);
+    uint32_t stride_10 = align16((width * 10u + 7u) / 8u);
+    uint32_t frame_bytes_8  = stride_8  * height_pad * 3u / 2u;
+    uint32_t frame_bytes_10 = stride_10 * height_pad * 3u / 2u;
+    uint32_t frame_bytes = frame_bytes_10;
 
     /* Colmv buffer geometry — same compressed path as H.264 (vdpu34x is
      * codec-agnostic for colmv on rk3588). */
@@ -239,18 +225,20 @@ int DecodeEngine_Init(DecodeEngine *e, Codec codec,
                 frame_bytes, rcb_total, colmv_bytes,
                 cabac_size, pps_size, rps_size, scaling_size);
 
-#define ALLOC(b, sz, usage) do { if (AllocBuf(e->device, (sz), (usage), &(b))) return 1; } while (0)
-    ALLOC(e->bitstream,    1u << 20,                       RkMppBufferUsageBitstreamInput);
-    ALLOC(e->cabac_init,   cabac_size,                     RkMppBufferUsageScratch);
-    ALLOC(e->pps_table,    pps_size,                       RkMppBufferUsageScratch);
-    ALLOC(e->rps_table,    rps_size,                       RkMppBufferUsageScratch);
-    ALLOC(e->scaling_list, scaling_size,                   RkMppBufferUsageScratch);
+#define ALLOC(b, sz, usage) do { \
+    if (e->backend->AllocBuf(e->backend->ctx, (sz), (usage), &(b))) return 1; \
+} while (0)
+    ALLOC(e->bitstream,    1u << 20,                       DE_BUF_BITSTREAM_INPUT);
+    ALLOC(e->cabac_init,   cabac_size,                     DE_BUF_SCRATCH);
+    ALLOC(e->pps_table,    pps_size,                       DE_BUF_SCRATCH);
+    ALLOC(e->rps_table,    rps_size,                       DE_BUF_SCRATCH);
+    ALLOC(e->scaling_list, scaling_size,                   DE_BUF_SCRATCH);
     ALLOC(e->rcb,          rcb_total > 4096 ? rcb_total : 4096,
-                                                           RkMppBufferUsageScratch);
-    ALLOC(e->error_ref,    frame_alloc,                    RkMppBufferUsageReferenceFrame);
+                                                           DE_BUF_SCRATCH);
+    ALLOC(e->error_ref,    frame_alloc,                    DE_BUF_REFERENCE_FRAME);
     for (int i = 0; i < DecodeEngine::kPoolSize; i++) {
-        ALLOC(e->pool_output[i], frame_alloc, RkMppBufferUsageOutputFrame);
-        ALLOC(e->pool_colmv[i],  colmv_bytes, RkMppBufferUsageScratch);
+        ALLOC(e->pool_output[i], frame_alloc, DE_BUF_OUTPUT_FRAME);
+        ALLOC(e->pool_colmv[i],  colmv_bytes, DE_BUF_SCRATCH);
     }
 #undef ALLOC
 
@@ -286,73 +274,27 @@ int DecodeEngine_Init(DecodeEngine *e, Codec codec,
 
 void DecodeEngine_Shutdown(DecodeEngine *e)
 {
-    if (e->device == INVALID_HANDLE_VALUE) return;
-    FreeBuf(e->device, &e->bitstream);
-    FreeBuf(e->device, &e->cabac_init);
-    FreeBuf(e->device, &e->pps_table);
-    FreeBuf(e->device, &e->rps_table);
-    FreeBuf(e->device, &e->scaling_list);
-    FreeBuf(e->device, &e->rcb);
-    FreeBuf(e->device, &e->error_ref);
+    if (!e->backend) return;
+    auto *be = e->backend;
+    be->FreeBuf(be->ctx, &e->bitstream);
+    be->FreeBuf(be->ctx, &e->cabac_init);
+    be->FreeBuf(be->ctx, &e->pps_table);
+    be->FreeBuf(be->ctx, &e->rps_table);
+    be->FreeBuf(be->ctx, &e->scaling_list);
+    be->FreeBuf(be->ctx, &e->rcb);
+    be->FreeBuf(be->ctx, &e->error_ref);
     for (int i = 0; i < DecodeEngine::kPoolSize; i++) {
-        FreeBuf(e->device, &e->pool_output[i]);
-        FreeBuf(e->device, &e->pool_colmv[i]);
+        be->FreeBuf(be->ctx, &e->pool_output[i]);
+        be->FreeBuf(be->ctx, &e->pool_colmv[i]);
     }
-    CloseHandle(e->device);
-    e->device = INVALID_HANDLE_VALUE;
+    be->Close(be->ctx);
+    e->backend = nullptr;
 }
 
-/* Find the first H.264 slice NAL (type 1 or 5) in an Annex-B AU.  Returns
- * the byte offset of the start code (so the slice prefix + header are
- * intact for the hardware) and the byte count from there to AU end. */
-static int find_slice_nal_h264(const uint8_t *au, size_t len,
-                               size_t *out_off, size_t *out_size)
-{
-    for (size_t i = 0; i + 4 < len; i++) {
-        bool sc3 = (au[i] == 0 && au[i+1] == 0 && au[i+2] == 1);
-        bool sc4 = (au[i] == 0 && au[i+1] == 0 && au[i+2] == 0 && au[i+3] == 1);
-        if (!sc3 && !sc4) continue;
-        size_t hdr_off = i + (sc3 ? 3 : 4);
-        if (hdr_off >= len) return 1;
-        uint8_t nal_type = au[hdr_off] & 0x1F;
-        if (nal_type == 1 || nal_type == 5) {
-            *out_off  = i;
-            *out_size = len - i;
-            return 0;
-        }
-        i = hdr_off;   /* skip past this header byte */
-    }
-    return 1;
-}
-
-/* HEVC slice NAL locator.  Walks the AU's Annex-B framing looking for
- * the first VCL NAL (nal_unit_type < 32 — types 0..9 trail/RASL etc.,
- * 16..21 IRAP slices, 10..15/22..31 reserved-VCL).  Returns the
- * pre-startcode offset so the staged slice prefix matches what the
- * hardware reads in BSP.  Strips leading VPS (32) / SPS (33) / PPS (34)
- * / AUD (35) / SEI (39,40) / FD (38) / EOS / EOB so STR_LEN ends up
- * being just the slice byte count. */
-static int find_slice_nal_h265(const uint8_t *au, size_t len,
-                               size_t *out_off, size_t *out_size)
-{
-    for (size_t i = 0; i + 4 < len; i++) {
-        bool sc3 = (au[i] == 0 && au[i+1] == 0 && au[i+2] == 1);
-        bool sc4 = (au[i] == 0 && au[i+1] == 0 && au[i+2] == 0 && au[i+3] == 1);
-        if (!sc3 && !sc4) continue;
-        size_t hdr_off = i + (sc3 ? 3 : 4);
-        if (hdr_off >= len) return 1;
-        /* HEVC NAL header: 2 bytes — forbidden_zero_bit(1) | nal_unit_type(6) | nuh_layer_id(6) | tid(3).
-         * type = (byte0 >> 1) & 0x3F. */
-        uint8_t nal_type = (au[hdr_off] >> 1) & 0x3F;
-        if (nal_type < 32) {
-            *out_off  = i;
-            *out_size = len - i;
-            return 0;
-        }
-        i = hdr_off;
-    }
-    return 1;
-}
+/* Annex-B slice NAL locators live in mft/au_iter.{h,cpp} — H264FindSliceNal
+ * for type 1/5 slice; H265FindSliceNal for the first VCL NAL (type < 32).
+ * Both return the pre-startcode offset so the staged slice prefix matches
+ * what BSP hardware reads. */
 
 /* Decode the H.264 path. */
 static int DecodeOne_H264(DecodeEngine *e,
@@ -364,7 +306,7 @@ static int DecodeOne_H264(DecodeEngine *e,
 
     /* 1. Locate the slice NAL. */
     size_t slice_off = 0, slice_size = 0;
-    if (find_slice_nal_h264(au, au_len, &slice_off, &slice_size) != 0)
+    if (H264FindSliceNal(au, au_len, &slice_off, &slice_size) != 0)
         return Fail("no H.264 slice NAL found");
     size_t sc_len   = (au[slice_off + 2] == 1) ? 3u : 4u;
     size_t skip     = sc_len - 3u;
@@ -487,19 +429,19 @@ static int DecodeOne_H264(DecodeEngine *e,
 
     if (DecodeDebugEnabled()) {
         FILE *f;
-        if (fopen_s(&f, "win_pps.bin", "wb") == 0) {
+        if ((f = fopen("win_pps.bin", "wb"))) {
             fwrite(e->pps_table.user_va, 1, RKH264_SPSPPS_UNIT_SIZE, f);
             fclose(f);
         }
-        if (fopen_s(&f, "win_rps.bin", "wb") == 0) {
+        if ((f = fopen("win_rps.bin", "wb"))) {
             fwrite(e->rps_table.user_va, 1, RKH264_RPS_SIZE, f);
             fclose(f);
         }
-        if (fopen_s(&f, "win_cabac.bin", "wb") == 0) {
+        if ((f = fopen("win_cabac.bin", "wb"))) {
             fwrite(e->cabac_init.user_va, 1, RKH264_CABAC_INIT_SIZE, f);
             fclose(f);
         }
-        if (fopen_s(&f, "win_bitstream.bin", "wb") == 0) {
+        if ((f = fopen("win_bitstream.bin", "wb"))) {
             fwrite(e->bitstream.user_va, 1, copy_len, f);
             fclose(f);
         }
@@ -515,24 +457,19 @@ static int DecodeOne_H264(DecodeEngine *e,
     {
         static int dump_au_idx = -1;
         dump_au_idx++;
-        size_t need = 0;
-        char *flag = nullptr;
-        if (_dupenv_s(&flag, &need, "RKMPP_DUMP_TABLES") == 0 && flag) {
-            bool on = (need >= 2 && flag[0] == '1');
-            free(flag);
-            if (on) {
-                char path[64];
-                FILE *f;
-                std::snprintf(path, sizeof(path), "win_rps_au%03d.bin", dump_au_idx);
-                if (fopen_s(&f, path, "wb") == 0) {
-                    fwrite(e->rps_table.user_va, 1, RKH264_RPS_SIZE, f);
-                    fclose(f);
-                }
-                std::snprintf(path, sizeof(path), "win_pps_au%03d.bin", dump_au_idx);
-                if (fopen_s(&f, path, "wb") == 0) {
-                    fwrite(e->pps_table.user_va, 1, RKH264_SPSPPS_UNIT_SIZE, f);
-                    fclose(f);
-                }
+        const char *flag = ::getenv("RKMPP_DUMP_TABLES");
+        if (flag && flag[0] == '1') {
+            char path[64];
+            FILE *f;
+            std::snprintf(path, sizeof(path), "win_rps_au%03d.bin", dump_au_idx);
+            if ((f = fopen(path, "wb"))) {
+                fwrite(e->rps_table.user_va, 1, RKH264_RPS_SIZE, f);
+                fclose(f);
+            }
+            std::snprintf(path, sizeof(path), "win_pps_au%03d.bin", dump_au_idx);
+            if ((f = fopen(path, "wb"))) {
+                fwrite(e->pps_table.user_va, 1, RKH264_SPSPPS_UNIT_SIZE, f);
+                fclose(f);
             }
         }
     }
@@ -597,9 +534,9 @@ static int DecodeOne_H264(DecodeEngine *e,
         refs.ref_colmv[i] = sel.ref_colmv[i];
     }
 
-    H264RegWriteList list{};
-    H264RegBuildStatus rs = H264BuildRegisterList(&parsed, &refs,
-                                                  sel.current_slot, &list);
+    H26xDenseOutput dense{};
+    H264RegBuildStatus rs = H264BuildDenseRegs(&parsed, &refs,
+                                               sel.current_slot, &dense);
     if (rs != H264_REGBUILD_OK) {
         std::fprintf(stderr, "regbuilder status=%d\n", (int)rs);
         Dpb_OnDecodeFailed(&e->dpb_h264);
@@ -608,59 +545,34 @@ static int DecodeOne_H264(DecodeEngine *e,
 
     if (TimingEnabled()) { int64_t t = QpcNow(); timing.regbuild_us = QpcUs(t0, t); t0 = t; }
 
-    RKMPP_SUBMIT_JOB_IN  sin{};
-    RKMPP_SUBMIT_JOB_OUT sout{};
-    sin.StructSize    = sizeof(sin);
-    sin.RegWriteCount = list.count;
-    sin.TimeoutMs     = 1000;
-    std::memcpy(sin.Writes, list.entries, list.count * sizeof(RKMPP_REG_WRITE));
-
-    DWORD got = 0;
-    if (!DeviceIoControl(e->device, IOCTL_RKMPP_SUBMIT_JOB, &sin, sizeof(sin),
-                         &sout, sizeof(sout), &got, nullptr))
-        return Fail("SUBMIT_JOB", GetLastError());
-
-    if (TimingEnabled()) { int64_t t = QpcNow(); timing.submit_us = QpcUs(t0, t); t0 = t; }
-
-    if (DecodeDebugEnabled()) {
-        RKMPP_PEEK_JOB_IN  pin{ sout.JobId };
-        RKMPP_PEEK_JOB_OUT pout{};
-        if (DeviceIoControl(e->device, IOCTL_RKMPP_PEEK_JOB, &pin, sizeof(pin),
-                            &pout, sizeof(pout), &got, nullptr)) {
-            std::printf("--- post-subst register list (%u entries) ---\n",
-                        pout.RegWriteCount);
-            for (uint32_t i = 0; i < pout.RegWriteCount; i++) {
-                std::printf("  [%2u] off=0x%03x val=0x%08x  (idx %u)%s\n",
-                            i,
-                            pout.Writes[i].Offset, pout.Writes[i].Value,
-                            pout.Writes[i].Offset / 4,
-                            pout.Writes[i].BufferHandle ? " <iova>" : "");
-            }
-        }
+    /* Backend handles SUBMIT + (debug PEEK) + WAIT synchronously.
+     * Returns the codec HardwareStatus reg in *hw_status; non-zero rc
+     * either means an IOCTL failed outright (negative / hard error) or
+     * that wout.Status was non-zero while wait succeeded (kept as the
+     * positive Status value).  The original logic only failed when BOTH
+     * Status != 0 AND the codec didn't set RDY in hw_status. */
+    uint32_t hw_status = 0;
+    int submit_rc = e->backend->SubmitDense(e->backend->ctx, &dense,
+                                            1000, &hw_status);
+    if (TimingEnabled()) {
+        int64_t t = QpcNow();
+        timing.submit_us = 0;     /* backend collapses submit+wait */
+        timing.wait_us   = QpcUs(t0, t);
+        t0 = t;
     }
-
-    RKMPP_WAIT_JOB_IN  win{ sout.JobId, 1000, 0 };
-    RKMPP_WAIT_JOB_OUT wout{};
-    if (!DeviceIoControl(e->device, IOCTL_RKMPP_WAIT_JOB, &win, sizeof(win),
-                         &wout, sizeof(wout), &got, nullptr))
-        return Fail("WAIT_JOB", GetLastError());
-
-    if (TimingEnabled()) { int64_t t = QpcNow(); timing.wait_us = QpcUs(t0, t); t0 = t; }
-
     if (DecodeDebugEnabled())
-        std::printf("decode: jobid=%llu status=0x%08x hwstatus=0x%08x writes=%u\n",
-                    (unsigned long long)sout.JobId, wout.Status,
-                    wout.HardwareStatus, list.count);
+        std::printf("decode: status=%d hwstatus=0x%08x iova_slots=%u\n",
+                    submit_rc, hw_status, dense.IovaSlotCount);
     const uint32_t kRdySta = 1u << 2;
-    bool have_output = (wout.HardwareStatus & kRdySta) != 0;
-    if (wout.Status != 0 && !have_output) {
+    bool have_output = (hw_status & kRdySta) != 0;
+    if (submit_rc != 0 && !have_output) {
         std::fprintf(stderr, "decode reported non-success status (no output)\n");
         Dpb_OnDecodeFailed(&e->dpb_h264);
         return 5;
     }
-    if (wout.Status != 0 && DecodeDebugEnabled()) {
+    if (submit_rc != 0 && DecodeDebugEnabled()) {
         std::fprintf(stderr, "decode partial: hwstatus=0x%08x has DEC_RDY but other flags too — dumping anyway\n",
-                     wout.HardwareStatus);
+                     hw_status);
     }
 
     if (DecodeDebugEnabled()) {
@@ -689,25 +601,21 @@ static int DecodeOne_H264(DecodeEngine *e,
     {
         static int colmv_dump_idx = -1;
         colmv_dump_idx++;
-        size_t need = 0;
-        char *flag = nullptr;
-        if (_dupenv_s(&flag, &need, "RKMPP_DUMP_COLMV") == 0 && flag) {
-            bool on = (need >= 2 && flag[0] == '1');
-            free(flag);
+        const char *flag = ::getenv("RKMPP_DUMP_COLMV");
+        if (flag && flag[0] == '1') {
             int max_au = 30;
-            char *maxs = nullptr;
-            if (_dupenv_s(&maxs, &need, "RKMPP_DUMP_COLMV_MAX_AU") == 0 && maxs) {
+            const char *maxs = ::getenv("RKMPP_DUMP_COLMV_MAX_AU");
+            if (maxs) {
                 int parsed_max = atoi(maxs);
                 if (parsed_max > 0) max_au = parsed_max;
-                free(maxs);
             }
-            if (on && colmv_dump_idx < max_au) {
+            if (colmv_dump_idx < max_au) {
                 char path[96];
                 std::snprintf(path, sizeof(path),
                               "our_colmv_au%03d_slot%u.bin",
                               colmv_dump_idx, sel.current_slot);
-                FILE *f = nullptr;
-                if (fopen_s(&f, path, "wb") == 0) {
+                FILE *f = fopen(path, "wb");
+                if (f) {
                     fwrite(e->pool_colmv[sel.current_slot].user_va, 1,
                            e->pool_colmv[sel.current_slot].size, f);
                     fclose(f);
@@ -727,18 +635,14 @@ static int DecodeOne_H264(DecodeEngine *e,
     bool is_ref_h264 = e->dpb_h264.slots[sel.current_slot].is_ref ? true : false;
     if (out_yuv && e->populate_yuv &&
         (is_ref_h264 || e->populate_yuv_nonrefs)) {
-        /* Codec writes Y for the full padded raster (height aligned up to
-         * 16) followed by UV.  Repack as packed display-height NV12: copy
-         * `height` Y rows from offset 0, then `height/2` UV rows from
-         * offset `width * height_pad` (skipping the Y padding rows). */
-        uint32_t height_pad = (e->frame_height + 15u) & ~15u;
-        uint32_t y_disp     = e->frame_width * e->frame_height;
-        uint32_t uv_disp    = e->frame_width * (e->frame_height / 2u);
-        uint32_t bytes      = y_disp + uv_disp;
-        out_yuv->resize(bytes);
+        const uint32_t bit_depth = (parsed.sps.bit_depth_luma_minus8 == 2) ? 10u : 8u;
+        const uint32_t height_pad = (e->frame_height + 15u) & ~15u;
+        const uint32_t coded_w    = (e->frame_width  + 15u) & ~15u;
+        const uint32_t src_stride = CodecOutputStride(coded_w, bit_depth);
         const uint8_t *src = (const uint8_t *)e->pool_output[sel.current_slot].user_va;
-        std::memcpy(out_yuv->data(),         src,                           y_disp);
-        std::memcpy(out_yuv->data() + y_disp, src + e->frame_width * height_pad, uv_disp);
+        RepackCodecOutputToNV12orP010(src, src_stride, height_pad,
+                                      e->frame_width, e->frame_height,
+                                      bit_depth, out_yuv);
         /* Localize "garbage YUV" issues: hash the first 4 KiB of the
          * post-memcpy buffer.  Distinct hashes here but recurring hashes
          * in the final file = reorder window bug; recurring hashes here
@@ -747,7 +651,8 @@ static int DecodeOne_H264(DecodeEngine *e,
             static int au_idx = 0;
             const uint8_t *p = out_yuv->data();
             uint32_t h = 0x811c9dc5;
-            for (int i = 0; i < 4096 && i < (int)bytes; i++) {
+            size_t nhash = out_yuv->size() < 4096u ? out_yuv->size() : 4096u;
+            for (size_t i = 0; i < nhash; i++) {
                 h ^= p[i]; h *= 16777619;
             }
             std::printf("post-memcpy au=%d slot=%u poc=%d hash=%08x\n",
@@ -766,7 +671,14 @@ static int DecodeOne_H264(DecodeEngine *e,
     return 0;
 }
 
-/* Decode the HEVC path. */
+#ifdef _WIN32
+/* Decode the HEVC path.
+ *
+ * NOTE: not yet routed through DecodeEngineBackend (decode-engine-
+ * backend-split.md scope).  Calls DeviceIoControl(e->device, ...)
+ * directly + uses MSVC-only fopen_s / Windows env-var APIs in its
+ * debug paths.  Wrapped #ifdef _WIN32 so the engine compiles on Linux,
+ * where the H.264-only LinuxBackend is the only one we exercise. */
 static int DecodeOne_H265(DecodeEngine *e,
                           const uint8_t *au, size_t au_len,
                           std::vector<uint8_t> *out_yuv)
@@ -811,7 +723,7 @@ static int DecodeOne_H265(DecodeEngine *e,
      * writes.  Earlier H.264 mistake (passing full AU length) sent the
      * codec into runaway parsing past slice end. */
     size_t slice_off = 0, slice_size = 0;
-    if (find_slice_nal_h265(au, au_len, &slice_off, &slice_size) != 0)
+    if (H265FindSliceNal(au, au_len, &slice_off, &slice_size) != 0)
         return Fail("no HEVC slice NAL found");
     size_t sc_len   = (au[slice_off + 2] == 1) ? 3u : 4u;
     size_t skip     = sc_len - 3u;
@@ -909,10 +821,10 @@ static int DecodeOne_H265(DecodeEngine *e,
         refs.ref_is_long_term[i] = 0;
     }
 
-    /* 6. Build register list. */
-    H265RegWriteList list{};
-    H265RegBuildStatus rs = H265BuildRegisterList(&parsed, &refs,
-                                                  sel.current_slot, &list);
+    /* 6. Build dense bank. */
+    H26xDenseOutput dense{};
+    H265RegBuildStatus rs = H265BuildDenseRegs(&parsed, &refs,
+                                               sel.current_slot, &dense);
     if (rs != H265_REGBUILD_OK) {
         std::fprintf(stderr, "h265 regbuilder status=%d\n", (int)rs);
         return Fail("h265 regbuilder failed");
@@ -920,35 +832,54 @@ static int DecodeOne_H265(DecodeEngine *e,
 
     if (TimingEnabled()) { int64_t t = QpcNow(); timing.regbuild_us = QpcUs(t0, t); t0 = t; }
 
-    /* 7. Submit. */
-    RKMPP_SUBMIT_JOB_IN  sin{};
-    RKMPP_SUBMIT_JOB_OUT sout{};
+    /* 7. Submit via the dense-bank IOCTL. */
+    RKMPP_SUBMIT_DENSE_JOB_IN  sin{};
+    RKMPP_SUBMIT_DENSE_JOB_OUT sout{};
     sin.StructSize    = sizeof(sin);
-    sin.RegWriteCount = list.count;
+    sin.IovaSlotCount = dense.IovaSlotCount;
+    sin.BufRefCount   = 0;
     sin.TimeoutMs     = 1000;
-    std::memcpy(sin.Writes, list.entries, list.count * sizeof(RKMPP_REG_WRITE));
+    sin.KickValue     = dense.KickValue;
+    sin.Bank          = dense.Bank;
+    if (dense.IovaSlotCount > 0) {
+        std::memcpy(sin.IovaSlots, dense.IovaSlots,
+                    dense.IovaSlotCount * sizeof(RKMPP_DENSE_IOVA_SLOT));
+    }
 
     DWORD got = 0;
-    if (!DeviceIoControl(e->device, IOCTL_RKMPP_SUBMIT_JOB, &sin, sizeof(sin),
+    if (!DeviceIoControl(e->device, IOCTL_RKMPP_SUBMIT_DENSE_JOB, &sin, sizeof(sin),
                          &sout, sizeof(sout), &got, nullptr))
-        return Fail("SUBMIT_JOB", GetLastError());
+        return Fail("SUBMIT_DENSE_JOB", GetLastError());
 
     if (TimingEnabled()) { int64_t t = QpcNow(); timing.submit_us = QpcUs(t0, t); t0 = t; }
 
     if (DecodeDebugEnabled()) {
-        RKMPP_PEEK_JOB_IN  pin{ sout.JobId };
-        RKMPP_PEEK_JOB_OUT pout{};
-        if (DeviceIoControl(e->device, IOCTL_RKMPP_PEEK_JOB, &pin, sizeof(pin),
+        RKMPP_PEEK_JOB_IN        pin{ sout.JobId };
+        RKMPP_PEEK_DENSE_JOB_OUT pout{};
+        if (DeviceIoControl(e->device, IOCTL_RKMPP_PEEK_DENSE_JOB, &pin, sizeof(pin),
                             &pout, sizeof(pout), &got, nullptr)) {
-            std::printf("--- post-subst register list (%u entries) ---\n",
-                        pout.RegWriteCount);
-            for (uint32_t i = 0; i < pout.RegWriteCount; i++) {
-                std::printf("  [%2u] off=0x%03x val=0x%08x  (idx %u)%s\n",
-                            i,
-                            pout.Writes[i].Offset, pout.Writes[i].Value,
-                            pout.Writes[i].Offset / 4,
-                            pout.Writes[i].BufferHandle ? " <iova>" : "");
-            }
+            std::printf("--- post-subst dense bank (kick=0x%08x) ---\n",
+                        pout.KickValue);
+            auto dump = [](const char *label, uint32_t first,
+                            const uint32_t *src, uint32_t n) {
+                for (uint32_t i = 0; i < n; i++) {
+                    if (src[i] == 0) continue;
+                    std::printf("  [%s idx %3u] = 0x%08x\n",
+                                label, first + i, src[i]);
+                }
+            };
+            dump("com ", RKMPP_DENSE_COMMON_FIRST,  pout.Bank.Common,
+                 RKMPP_DENSE_COMMON_WORDS);
+            dump("cpar", RKMPP_DENSE_CPARAM_FIRST,  pout.Bank.CodecParams,
+                 RKMPP_DENSE_CPARAM_WORDS);
+            dump("cadr", RKMPP_DENSE_CADDR_FIRST,   pout.Bank.CommonAddr,
+                 RKMPP_DENSE_CADDR_WORDS);
+            dump("codr", RKMPP_DENSE_CODADDR_FIRST, pout.Bank.CodecAddr,
+                 RKMPP_DENSE_CODADDR_WORDS);
+            dump("hpoc", RKMPP_DENSE_HIPOC_FIRST,   pout.Bank.HighPoc,
+                 RKMPP_DENSE_HIPOC_WORDS);
+            dump("stat", RKMPP_DENSE_STAT_FIRST,    pout.Bank.Stat,
+                 RKMPP_DENSE_STAT_WORDS);
         }
     }
 
@@ -961,9 +892,9 @@ static int DecodeOne_H265(DecodeEngine *e,
 
     if (TimingEnabled()) { int64_t t = QpcNow(); timing.wait_us = QpcUs(t0, t); t0 = t; }
     if (DecodeDebugEnabled())
-        std::printf("h265 decode: jobid=%llu status=0x%08x hwstatus=0x%08x writes=%u\n",
+        std::printf("h265 decode: jobid=%llu status=0x%08x hwstatus=0x%08x iova_slots=%u\n",
                     (unsigned long long)sout.JobId, wout.Status,
-                    wout.HardwareStatus, list.count);
+                    wout.HardwareStatus, dense.IovaSlotCount);
     const uint32_t kRdySta = 1u << 2;
     bool have_output = (wout.HardwareStatus & kRdySta) != 0;
     if (wout.Status != 0 && !have_output) {
@@ -1001,25 +932,21 @@ static int DecodeOne_H265(DecodeEngine *e,
     {
         static int colmv_dump_idx = -1;
         colmv_dump_idx++;
-        size_t need = 0;
-        char *flag = nullptr;
-        if (_dupenv_s(&flag, &need, "RKMPP_DUMP_COLMV") == 0 && flag) {
-            bool on = (need >= 2 && flag[0] == '1');
-            free(flag);
+        const char *flag = ::getenv("RKMPP_DUMP_COLMV");
+        if (flag && flag[0] == '1') {
             int max_au = 30;
-            char *maxs = nullptr;
-            if (_dupenv_s(&maxs, &need, "RKMPP_DUMP_COLMV_MAX_AU") == 0 && maxs) {
+            const char *maxs = ::getenv("RKMPP_DUMP_COLMV_MAX_AU");
+            if (maxs) {
                 int parsed_max = atoi(maxs);
                 if (parsed_max > 0) max_au = parsed_max;
-                free(maxs);
             }
-            if (on && colmv_dump_idx < max_au) {
+            if (colmv_dump_idx < max_au) {
                 char path[96];
                 std::snprintf(path, sizeof(path),
                               "our_colmv_au%03d_slot%u.bin",
                               colmv_dump_idx, sel.current_slot);
-                FILE *f = nullptr;
-                if (fopen_s(&f, path, "wb") == 0) {
+                FILE *f = fopen(path, "wb");
+                if (f) {
                     fwrite(e->pool_colmv[sel.current_slot].user_va, 1,
                            e->pool_colmv[sel.current_slot].size, f);
                     fclose(f);
@@ -1036,17 +963,18 @@ static int DecodeOne_H265(DecodeEngine *e,
     bool is_ref_h265 = e->dpb_h265.slots[sel.current_slot].is_ref ? true : false;
     if (out_yuv && e->populate_yuv &&
         (is_ref_h265 || e->populate_yuv_nonrefs)) {
-        /* See H.264 path: repack codec's padded-height NV12 (height padded
-         * up to 16) into packed display-height NV12 by skipping the Y
-         * padding rows when locating the UV plane. */
-        uint32_t height_pad = (e->frame_height + 15u) & ~15u;
-        uint32_t y_disp     = e->frame_width * e->frame_height;
-        uint32_t uv_disp    = e->frame_width * (e->frame_height / 2u);
-        uint32_t bytes      = y_disp + uv_disp;
-        out_yuv->resize(bytes);
+        /* Bit-depth-aware repack: HEVC Main10 streams have the codec
+         * emit NV15-packed luma+chroma at width*10/8 stride.  Main
+         * (8-bit) keeps NV12 plain.  See repack_yuv.h for the
+         * NV15 → P010 unpack details. */
+        const uint32_t bit_depth  = (sps->bit_depth_luma_minus8 == 2) ? 10u : 8u;
+        const uint32_t height_pad = (e->frame_height + 15u) & ~15u;
+        const uint32_t coded_w    = (e->frame_width  + 15u) & ~15u;
+        const uint32_t src_stride = CodecOutputStride(coded_w, bit_depth);
         const uint8_t *src = (const uint8_t *)e->pool_output[sel.current_slot].user_va;
-        std::memcpy(out_yuv->data(),         src,                           y_disp);
-        std::memcpy(out_yuv->data() + y_disp, src + e->frame_width * height_pad, uv_disp);
+        RepackCodecOutputToNV12orP010(src, src_stride, height_pad,
+                                      e->frame_width, e->frame_height,
+                                      bit_depth, out_yuv);
     }
 
     if (TimingEnabled()) {
@@ -1057,14 +985,20 @@ static int DecodeOne_H265(DecodeEngine *e,
     H265Dpb_OnDecodeComplete(&e->dpb_h265);
     return 0;
 }
+#endif  /* _WIN32 (DecodeOne_H265) */
 
 int DecodeEngine_DecodeOne(DecodeEngine *e,
                            const uint8_t *au, size_t au_len,
                            std::vector<uint8_t> *out_yuv)
 {
     if (au_len > e->bitstream.size) return Fail("AU larger than bitstream buf");
+#ifdef _WIN32
     if (e->codec == Codec::H265)
         return DecodeOne_H265(e, au, au_len, out_yuv);
+#else
+    if (e->codec == Codec::H265)
+        return Fail("H.265 path not built on Linux (decode-engine-backend-split.md)");
+#endif
     return DecodeOne_H264(e, au, au_len, out_yuv);
 }
 

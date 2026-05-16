@@ -7,6 +7,10 @@
 #include "winshim.h"
 #include "mft/regbuilder_h264.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* One DMA-buf allocation: heap fd + cpu mmap + size */
 typedef struct {
     int    dma_fd;
@@ -123,3 +127,7 @@ int  MppSvc_Submit(int svc_fd, const H264RegWriteList *rl,
  * Returns 0 = success (RDY bit set), 1 = timeout, -1 = error.
  */
 int  MppSvc_Poll(int svc_fd, uint32_t timeout_ms, const uint32_t *irq_readback);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif

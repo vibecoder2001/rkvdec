@@ -1,7 +1,13 @@
-/* driver/rkmpp/ioctl.c — IOCTL surface for rkmpp.sys.
- * Phase 1: IOCTL_RKMPP_GET_CAPS.
- * Phase 2: IOCTL_RKMPP_ALLOC_BUFFER, IOCTL_RKMPP_FREE_BUFFER,
- *           IOCTL_RKMPP_SUBMIT_JOB, IOCTL_RKMPP_WAIT_JOB.
+/* driver/rkvdec/ioctl.c — IOCTL surface for rkvdec.sys (H.264 + H.265).
+ *
+ * Surfaces:
+ *   IOCTL_RKMPP_GET_CAPS / ALLOC_BUFFER / FREE_BUFFER
+ *   IOCTL_RKMPP_SUBMIT_DENSE_JOB / PEEK_DENSE_JOB / WAIT_JOB
+ *
+ * The legacy sparse IOCTL_RKMPP_SUBMIT_JOB / PEEK_JOB are NOT handled
+ * here — rkvdec is dense-only.  rkav1d (separate driver binary) still
+ * uses the sparse path because its SWREG layout doesn't match the
+ * vdpu34x bank split.
  */
 #include <ntddk.h>
 #include <wdf.h>
@@ -19,8 +25,18 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RkMppEvtIoDeviceControl;
 
 NTSTATUS RkMppQueueInit(_In_ WDFDEVICE Device)
 {
+    /* Parallel dispatch: required for concurrent decode sessions on the
+     * same engine.  Sequential mode serialised ALL IRPs across all File
+     * handles, so stream 1's blocking WAIT_JOB (up to 1000ms) would
+     * monopolise the queue and stall every IOCTL from stream 2 — even
+     * its initial GET_CAPS / ALLOC_BUFFER calls.
+     *
+     * Handler reentrancy: SUBMIT/PEEK/WAIT/JobBufferInUse all hold the
+     * per-queue spinlock; bufpool ALLOC/FREE hold the per-File spinlock;
+     * GET_CAPS and INJECT_IOMMU_FAULT are read-only.  Multiple WAIT_JOB
+     * callers block on per-job KEVENTs without holding any queue resource. */
     WDF_IO_QUEUE_CONFIG cfg;
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&cfg, WdfIoQueueDispatchSequential);
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&cfg, WdfIoQueueDispatchParallel);
     cfg.EvtIoDeviceControl = RkMppEvtIoDeviceControl;
 
     WDFQUEUE q;
@@ -119,15 +135,15 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         break;
     }
 
-    /* ---- SUBMIT_JOB -------------------------------------------------- */
-    case IOCTL_RKMPP_SUBMIT_JOB: {
-        if (InputBufferLength < sizeof(RKMPP_SUBMIT_JOB_IN) ||
-            OutputBufferLength < sizeof(RKMPP_SUBMIT_JOB_OUT)) {
+    /* ---- SUBMIT_DENSE_JOB -------------------------------------------- */
+    case IOCTL_RKMPP_SUBMIT_DENSE_JOB: {
+        if (InputBufferLength < sizeof(RKMPP_SUBMIT_DENSE_JOB_IN) ||
+            OutputBufferLength < sizeof(RKMPP_SUBMIT_DENSE_JOB_OUT)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
-        RKMPP_SUBMIT_JOB_IN  *in;
-        RKMPP_SUBMIT_JOB_OUT *out;
+        RKMPP_SUBMIT_DENSE_JOB_IN  *in;
+        RKMPP_SUBMIT_DENSE_JOB_OUT *out;
         status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in),
                                                (PVOID*)&in, NULL);
         if (!NT_SUCCESS(status)) break;
@@ -139,32 +155,33 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        status = RkMppJobSubmit(WdfIoQueueGetDevice(Queue), file, in, out);
+        status = RkMppJobSubmitDense(WdfIoQueueGetDevice(Queue), file, in, out);
         if (NT_SUCCESS(status)) info = sizeof(*out);
         break;
     }
 
-    /* ---- PEEK_JOB ---------------------------------------------------- */
-    case IOCTL_RKMPP_PEEK_JOB: {
+    /* ---- PEEK_DENSE_JOB ---------------------------------------------- */
+    case IOCTL_RKMPP_PEEK_DENSE_JOB: {
         if (InputBufferLength < sizeof(RKMPP_PEEK_JOB_IN) ||
-            OutputBufferLength < sizeof(RKMPP_PEEK_JOB_OUT)) {
+            OutputBufferLength < sizeof(RKMPP_PEEK_DENSE_JOB_OUT)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
-        RKMPP_PEEK_JOB_IN  *in;
-        RKMPP_PEEK_JOB_OUT *out;
+        RKMPP_PEEK_JOB_IN        *in;
+        RKMPP_PEEK_DENSE_JOB_OUT *out;
         status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in),
                                                (PVOID*)&in, NULL);
         if (!NT_SUCCESS(status)) break;
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
-                                                 (PVOID*)&out, NULL);
+                                                (PVOID*)&out, NULL);
         if (!NT_SUCCESS(status)) break;
         WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
         if (!file) {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        status = RkMppJobPeek(WdfIoQueueGetDevice(Queue), file, in->JobId, out);
+        status = RkMppJobPeekDense(WdfIoQueueGetDevice(Queue), file,
+                                   in->JobId, out);
         if (NT_SUCCESS(status)) info = sizeof(*out);
         break;
     }

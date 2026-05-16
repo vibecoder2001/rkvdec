@@ -1,11 +1,14 @@
 add_executable(mft_play mft_play.cpp)
 target_include_directories(mft_play PRIVATE
     ${CMAKE_SOURCE_DIR}/../../mft/dll
+    ${CMAKE_SOURCE_DIR}/../../mft
 )
 target_link_libraries(mft_play PRIVATE
+    rkmpp_mft
     mfplat
     mfuuid
     mf
+    mfreadwrite
     evr
     strmiids
     shlwapi

@@ -185,9 +185,11 @@ RkmppAv1Status rkmpp_av1_build_regs(
 
     /* Caller is required to zero `out` first (per regbuilder_av1.h). */
 
-    /* 8-bit, 4:2:0, non-scalable for first-pass.  10-bit is gated by
-     * cap_10bit=0 on RK3588's AV1 cap struct anyway. */
-    if (seq->hbd != 0)            return RKMPP_AV1_ERR_UNSUPPORTED;
+    /* 4:2:0, 8-bit or 10-bit, non-scalable.  Profile-0 with hbd ∈ {0,1}.
+     * 12-bit (hbd_2) is silicon-supported on vdpu_av1d in theory but the
+     * BSP HAL and our engine repack path are wired for 8/10 only. */
+    if (seq->hbd != 0 && seq->hbd != 1)
+        return RKMPP_AV1_ERR_UNSUPPORTED;
     if (seq->monochrome != 0)     return RKMPP_AV1_ERR_UNSUPPORTED;
     if (hdr->frame_type == DAV1D_FRAME_TYPE_INTRA && hdr->show_existing_frame)
         return RKMPP_AV1_ERR_UNSUPPORTED;
@@ -871,19 +873,44 @@ RkmppAv1Status rkmpp_av1_build_regs(
          * the stride is rounded up.  PP's "in" side reads from the
          * codec's internal layout, which is also at coded stride. */
         const uint32_t cw = (w + 63u) & ~63u;
-        const uint32_t ch = (h +  7u) & ~7u;
+        /* Padded height matches upstream V4L2 frmsize.step_height =
+         * MB_DIM = 16 (rockchip_vpu_hw.c:99-106) — upstream's
+         * pp_out_height / pp_in_height / chroma_offset all use the
+         * 16-aligned dst_fmt.height (1088 for 1080p), not the display
+         * height.  The codec writes 17 SB rows × 64 px = 1088 luma rows
+         * regardless; cropping happens at display time.  Using display
+         * height in pp_out_height + 8-row alignment in the UV offset
+         * gave occasional bottom-right corner corruption on 10-bit
+         * AV1 (partial last-SB-row chroma writes into a smaller UV
+         * window than the codec was producing). */
+        const uint32_t ch = (h + 15u) & ~15u;
         out->vdpu_av1d_pp_cfg.swreg320.sw_pp_out_e   = 1;
         out->vdpu_av1d_pp_cfg.swreg322.sw_pp_in_format  = 0;
-        /* sw_pp_out_format=3 selects NV12 output (captured 0x000c0000
-         * has bits 18-19 set in swreg322 = pp_out_format value 3). */
-        out->vdpu_av1d_pp_cfg.swreg322.sw_pp_out_format = 3;
-        /* HAL writes hor_stride for both luma and chroma stride. */
-        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_y_stride = cw;
-        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_c_stride = cw;
+        /* sw_pp_out_format mapping per upstream kernel
+         * (drivers/media/platform/verisilicon/rockchip_vpu981_hw_av1_dec.c
+         * :2229-2241):
+         *   1  = P010   (16-bit-per-sample, 10 valid bits in upper 10)
+         *   3  = NV12   (8-bit)
+         *   10 = NV15   (Rockchip-specific packed 10-bit; 4 samples/5 bytes)
+         *   0  = default — unspecified, do not use.
+         *
+         * 10-bit picked NV15 (out_fmt=10).  P010 mode (out_fmt=1) had a
+         * deterministic bug in PP's right-edge handling — bottom-right
+         * SB column (cols 1856-1919 for 1920w, rows 942-1079) showed
+         * intra-prediction-like garbage instead of correctly-formatted
+         * P010 pixels.  NV15 + engine NV15→P010 unpack (see
+         * RepackCodecOutputToNV12orP010) routes through a different
+         * PP write path that the rk3588 silicon evidently handles
+         * cleanly.  Stride for NV15 = width * 10 / 8, 16-aligned. */
+        const uint32_t bpp_num   = seq->hbd ? 10u : 8u;
+        out->vdpu_av1d_pp_cfg.swreg322.sw_pp_out_format = seq->hbd ? 10u : 3u;
+        const uint32_t pp_stride = ((cw * bpp_num + 7u) / 8u + 15u) & ~15u;
+        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_y_stride = pp_stride;
+        out->vdpu_av1d_pp_cfg.swreg329.sw_pp_out_c_stride = pp_stride;
         out->vdpu_av1d_pp_cfg.swreg331.sw_pp_in_width    = cw / 2;
         out->vdpu_av1d_pp_cfg.swreg331.sw_pp_in_height   = ch / 2;
         out->vdpu_av1d_pp_cfg.swreg332.sw_pp_out_width   = w;
-        out->vdpu_av1d_pp_cfg.swreg332.sw_pp_out_height  = h;
+        out->vdpu_av1d_pp_cfg.swreg332.sw_pp_out_height  = ch;
         out->vdpu_av1d_pp_cfg.swreg394.sw_pp0_dup_hor    = 1;
         out->vdpu_av1d_pp_cfg.swreg394.sw_pp0_dup_ver    = 1;
     }

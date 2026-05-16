@@ -3,6 +3,7 @@ target_include_directories(mft_d3d_smoke PRIVATE
     ${CMAKE_SOURCE_DIR}/../../mft/dll
 )
 target_link_libraries(mft_d3d_smoke PRIVATE
+    rkmpp_mft   # for au_iter (H264AuNext / H265AuNext)
     mfplat
     mfuuid
     mf

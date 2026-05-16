@@ -3,6 +3,7 @@ target_include_directories(mft_decode PRIVATE
     ${CMAKE_SOURCE_DIR}/../../mft/dll
 )
 target_link_libraries(mft_decode PRIVATE
+    rkmpp_mft   # for au_iter (H264AuNext / H265AuNext)
     mfplat
     mfuuid
     mf

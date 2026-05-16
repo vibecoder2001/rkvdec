@@ -175,6 +175,14 @@ BOOLEAN RkMppJobBufferInUse(_In_ WDFDEVICE Device,
  *
  * Returns STATUS_SUCCESS even when in-flight timed out; the bool
  * out tells the caller whether to follow up with a hardware reset. */
+/* TRUE when the queue has an in-flight or pending job owned by something
+ * other than `File`.  Use in EvtFileCleanup AFTER DrainOwner to decide
+ * whether session-close hygiene that touches the IOMMU / codec block
+ * (Reattach, FullReset) is safe to run inline (no peer) or must be
+ * skipped (peer would be disrupted mid-DMA). */
+BOOLEAN RkMppJobQueueHasOtherOwner(_In_ WDFDEVICE Device,
+                                   _In_ WDFFILEOBJECT File);
+
 NTSTATUS RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
                              _In_ WDFFILEOBJECT File,
                              _In_ ULONG TimeoutMs,

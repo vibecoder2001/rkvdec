@@ -18,6 +18,7 @@
 #include <glob.h>
 
 #include "winshim.h"
+#include "mft/au_iter.h"
 #include "mft/parser_glue.h"
 #include "mft/regbuilder_h264.h"
 #include "mft/h264_packed_tables.h"
@@ -108,61 +109,8 @@ static int parse_shim_log(const char *path, ShimLog *out) {
     return 0;
 }
 
-/* ---- Annex-B H.264 NAL framing + AU collation -------------------- */
-typedef struct nal_iter {
-    const uint8_t *buf;
-    size_t         len;
-    size_t         pos;
-} nal_iter;
-
-static size_t find_start_code(const uint8_t *buf, size_t len, size_t from) {
-    for (size_t i = from; i + 3 <= len; i++) {
-        if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1) return i + 3;
-        if (i + 4 <= len && buf[i] == 0 && buf[i+1] == 0 &&
-            buf[i+2] == 0 && buf[i+3] == 1) return i + 4;
-    }
-    return SIZE_MAX;
-}
-
-/* H.264 slice NAL types: 1 (non-IDR) and 5 (IDR). */
-static int h264_nal_is_slice(uint8_t hdr0) {
-    uint8_t t = hdr0 & 0x1F;
-    return t == 1 || t == 5;
-}
-
-static int h264_au_next(nal_iter *it, size_t *au_off, size_t *au_len,
-                        size_t *slice_off) {
-    if (it->pos >= it->len) return 0;
-    size_t first_sc = find_start_code(it->buf, it->len, it->pos);
-    if (first_sc == SIZE_MAX) return 0;
-    size_t sc_start = first_sc - 3;
-    if (sc_start > 0 && it->buf[sc_start - 1] == 0) sc_start--;
-    size_t nh = first_sc;
-    int found = 0;
-    size_t end = it->len;
-    size_t slice_nh = 0;
-    while (nh < it->len) {
-        if (h264_nal_is_slice(it->buf[nh])) {
-            slice_nh = nh;
-            size_t nxt = find_start_code(it->buf, it->len, nh + 1);
-            if (nxt == SIZE_MAX) end = it->len;
-            else { end = nxt - 3; if (end > 0 && it->buf[end - 1] == 0) end--; }
-            found = 1; break;
-        }
-        size_t nxt = find_start_code(it->buf, it->len, nh + 1);
-        if (nxt == SIZE_MAX) break;
-        nh = nxt;
-    }
-    if (!found) return 0;
-    *au_off = sc_start;
-    *au_len = end - sc_start;
-    if (slice_off) {
-        size_t s = slice_nh - 3;
-        *slice_off = s;
-    }
-    it->pos = end;
-    return 1;
-}
+/* Annex-B H.264 walker lives in mft/au_iter.{h,cpp} (shared with
+ * decode_engine + linux_mpp_decode + mft_decode + rkmpp_decode). */
 
 /* ---- Bank descriptors (H.264 cmd=0x200/0x201 sub-messages) -------- *
  * From mpp.shim.h264.dma.log, AU 0:
@@ -219,33 +167,45 @@ static uint8_t *read_file_path(const char *path, size_t *out_len) {
     return buf;
 }
 
-static void mark_iova_positions(const H264RegWriteList *rl,
+static void mark_iova_positions(const H26xDenseOutput *out,
                                 uint32_t bank_first_idx, uint32_t bank_size,
                                 uint8_t *mask)
 {
     uint32_t n_words = bank_size / 4;
     memset(mask, 0, n_words);
-    for (uint32_t i = 0; i < rl->count; i++) {
-        const RKMPP_REG_WRITE *e = &rl->entries[i];
-        if (!e->BufferHandle) continue;
-        uint32_t idx = e->Offset / 4;
+    for (uint32_t i = 0; i < out->IovaSlotCount; i++) {
+        uint32_t idx = out->IovaSlots[i].RegIdx;
         if (idx >= bank_first_idx && idx < bank_first_idx + n_words)
             mask[idx - bank_first_idx] = 1;
     }
 }
 
-static void splat_bank(const H264RegWriteList *rl,
+/* Copy a contiguous bank's worth of dense-bank values into `out`, then
+ * stamp 0xDEADBEEF over the iova-substituted slots so a bytewise diff
+ * against the BSP capture doesn't flag them (the mask filters those
+ * indices anyway, but the sentinel makes the raw printout obvious).
+ * Also write Kick value into idx 10 if it falls in this bank. */
+static void splat_bank(const H26xDenseOutput *src,
                        uint32_t bank_first_idx, uint32_t bank_size,
-                       uint32_t *out)
+                       uint32_t *out_buf)
 {
     uint32_t n = bank_size / 4;
-    memset(out, 0, n * 4);
-    for (uint32_t i = 0; i < rl->count; i++) {
-        const RKMPP_REG_WRITE *e = &rl->entries[i];
-        uint32_t idx = e->Offset / 4;
-        if (idx < bank_first_idx || idx >= bank_first_idx + n) continue;
-        if (e->BufferHandle) out[idx - bank_first_idx] = 0xDEADBEEFu;
-        else                 out[idx - bank_first_idx] = e->Value;
+    memset(out_buf, 0, n * 4);
+    for (uint32_t p = 0; p < n; p++) {
+        uint32_t idx = bank_first_idx + p;
+        uint32_t *slot = H26xDenseSlotFor((H26xDenseOutput *)src, idx * 4u);
+        if (slot) out_buf[p] = *slot;
+    }
+    /* Kick value lives in src->KickValue (idx 10 = common bank pos 2). */
+    if (RKMPP_DENSE_KICK_REG_IDX >= bank_first_idx &&
+        RKMPP_DENSE_KICK_REG_IDX <  bank_first_idx + n) {
+        out_buf[RKMPP_DENSE_KICK_REG_IDX - bank_first_idx] = src->KickValue;
+    }
+    /* Mask iova-substituted slots with the diff sentinel. */
+    for (uint32_t i = 0; i < src->IovaSlotCount; i++) {
+        uint32_t idx = src->IovaSlots[i].RegIdx;
+        if (idx >= bank_first_idx && idx < bank_first_idx + n)
+            out_buf[idx - bank_first_idx] = 0xDEADBEEFu;
     }
 }
 
@@ -370,7 +330,8 @@ int main(int argc, char **argv) {
     static DpbCtx dpb;
     Dpb_Init(&dpb, pool, DPB_MAX_SLOTS);
 
-    nal_iter it = { .buf = bs, .len = bs_len, .pos = 0 };
+    AuIter it;
+    AuIter_Init(&it, bs, bs_len);
     int au_idx = 0;
     int total_diffs = 0;
 
@@ -378,7 +339,7 @@ int main(int argc, char **argv) {
 
     while (1) {
         size_t au_off, au_len, slice_off;
-        if (!h264_au_next(&it, &au_off, &au_len, &slice_off)) break;
+        if (!H264AuNext(&it, &au_off, &au_len, &slice_off)) break;
         if (au_idx >= log.n_aus) break;
 
         H264ParseStatus ps = H264ParseAccessUnit(bs + au_off, au_len,
@@ -437,10 +398,10 @@ int main(int argc, char **argv) {
             bufs.ref_colmv[i] = (cmv_slot >= 0) ? (24u + (uint64_t)cmv_slot) : 0;
         }
 
-        static H264RegWriteList rl;
-        memset(&rl, 0, sizeof(rl));
-        H264RegBuildStatus rs = H264BuildRegisterList(&parsed, &bufs,
-                                                      sel.current_slot, &rl);
+        static H26xDenseOutput dense;
+        memset(&dense, 0, sizeof(dense));
+        H264RegBuildStatus rs = H264BuildDenseRegs(&parsed, &bufs,
+                                                   sel.current_slot, &dense);
         if (rs != H264_REGBUILD_OK) {
             fprintf(stderr, "AU %d: regbuild fail %d\n", au_idx, rs);
             au_idx++;
@@ -543,8 +504,8 @@ int main(int argc, char **argv) {
                        kBanks[b].off, kBanks[b].size);
                 continue;
             }
-            splat_bank(&rl, kBanks[b].first_idx, kBanks[b].size, got);
-            mark_iova_positions(&rl, kBanks[b].first_idx, kBanks[b].size, iova_mask);
+            splat_bank(&dense, kBanks[b].first_idx, kBanks[b].size, got);
+            mark_iova_positions(&dense, kBanks[b].first_idx, kBanks[b].size, iova_mask);
 
             char label[24];
             snprintf(label, sizeof(label), "off=%u", kBanks[b].off);

@@ -88,6 +88,24 @@ typedef struct H264ParseResult {
     uint8_t  has_sps_vui_reorder;
     uint8_t  sps_vui_max_num_reorder_frames;
 
+    /* VUI colour-description info (spec E.2.1).  Captured from SPS so
+     * MFT can propagate to MF_MT_YUV_MATRIX / MF_MT_VIDEO_PRIMARIES /
+     * MF_MT_TRANSFER_FUNCTION / MF_MT_VIDEO_NOMINAL_RANGE on the output
+     * media type.  Without these the renderer guesses (often BT.601)
+     * which mis-renders BT.709 content as washed-out / shifted hue.
+     *
+     * `has_vui_colour` is 1 when video_signal_type_present_flag is set.
+     * `vui_full_range_flag` reflects video_full_range_flag (independent
+     *  of colour_description_present_flag).
+     * `has_vui_colour_desc` is 1 iff colour_description_present_flag was
+     *  set; only then are the three coefficient fields valid. */
+    uint8_t  has_vui_colour;
+    uint8_t  vui_full_range_flag;
+    uint8_t  has_vui_colour_desc;
+    uint8_t  vui_colour_primaries;          /* H.264 Table E-3 */
+    uint8_t  vui_transfer_characteristics;  /* H.264 Table E-4 */
+    uint8_t  vui_matrix_coefficients;       /* H.264 Table E-5 */
+
     /* Slice data (post emulation-prevention unescape, RBSP form, after
      * the slice header).  Pointer is into a caller-owned scratch buffer
      * supplied via H264ParseAccessUnit; valid until the next parse. */

@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "guids.h"
+#include "au_iter.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -49,78 +50,7 @@ typedef HRESULT (__stdcall *PFN_DllGetClassObject)(REFCLSID, REFIID, void **);
 
 enum class CodecCli { H264, H265, AV1 };
 
-/* -------- Annex-B AU walker (same logic as rkmpp_decode/main.cpp) -------- */
-
-static size_t find_start_code(const uint8_t *buf, size_t len, size_t from) {
-    for (size_t i = from; i + 3 <= len; i++) {
-        if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1)
-            return i + 3;
-        if (i + 4 <= len &&
-            buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1)
-            return i + 4;
-    }
-    return SIZE_MAX;
-}
-
-static bool au_next_h264(const uint8_t *buf, size_t len, size_t *pos,
-                         size_t *au_off, size_t *au_len) {
-    if (*pos >= len) return false;
-    size_t first_sc = find_start_code(buf, len, *pos);
-    if (first_sc == SIZE_MAX) return false;
-
-    bool found_slice = false;
-    size_t after_slice = len;
-    size_t nh_off = first_sc;
-    while (nh_off < len) {
-        uint8_t nut = buf[nh_off] & 0x1F;
-        if (nut == 1 || nut == 5) {
-            found_slice = true;
-            size_t next_sc = find_start_code(buf, len, nh_off + 1);
-            after_slice = (next_sc == SIZE_MAX) ? len : (next_sc - 3);
-            break;
-        }
-        size_t next_sc = find_start_code(buf, len, nh_off + 1);
-        if (next_sc == SIZE_MAX || next_sc >= len) break;
-        nh_off = next_sc;
-    }
-    if (!found_slice) return false;
-
-    size_t sc_start = (first_sc >= 3) ? first_sc - 3 : 0;
-    *au_off = sc_start;
-    *au_len = after_slice - sc_start;
-    *pos    = after_slice;
-    return true;
-}
-
-static bool au_next_h265(const uint8_t *buf, size_t len, size_t *pos,
-                         size_t *au_off, size_t *au_len) {
-    if (*pos >= len) return false;
-    size_t first_sc = find_start_code(buf, len, *pos);
-    if (first_sc == SIZE_MAX) return false;
-
-    bool found_slice = false;
-    size_t after_slice = len;
-    size_t nh_off = first_sc;
-    while (nh_off < len) {
-        uint8_t nut = (buf[nh_off] >> 1) & 0x3F;
-        if (nut < 32) {
-            found_slice = true;
-            size_t next_sc = find_start_code(buf, len, nh_off + 1);
-            after_slice = (next_sc == SIZE_MAX) ? len : (next_sc - 3);
-            break;
-        }
-        size_t next_sc = find_start_code(buf, len, nh_off + 1);
-        if (next_sc == SIZE_MAX || next_sc >= len) break;
-        nh_off = next_sc;
-    }
-    if (!found_slice) return false;
-
-    size_t sc_start = (first_sc >= 3) ? first_sc - 3 : 0;
-    *au_off = sc_start;
-    *au_len = after_slice - sc_start;
-    *pos    = after_slice;
-    return true;
-}
+/* -------- Annex-B AU walker — H.264/H.265 share mft/au_iter. ----------- */
 
 /* IVF temporal-unit walker: each frame in an IVF stream is preceded by
  * a 12-byte header (4-byte LE size, 8-byte LE pts) followed by the OBU
@@ -141,9 +71,13 @@ static bool au_next_av1(const uint8_t *b, size_t l, size_t *pos,
 
 static bool au_next(CodecCli c, const uint8_t *b, size_t l, size_t *pos,
                     size_t *off, size_t *len) {
-    if (c == CodecCli::AV1)  return au_next_av1 (b, l, pos, off, len);
-    if (c == CodecCli::H265) return au_next_h265(b, l, pos, off, len);
-    return au_next_h264(b, l, pos, off, len);
+    if (c == CodecCli::AV1)  return au_next_av1(b, l, pos, off, len);
+    AuIter it = { b, l, *pos };
+    int ok = (c == CodecCli::H265)
+                ? H265AuNext(&it, off, len, nullptr)
+                : H264AuNext(&it, off, len, nullptr);
+    *pos = it.pos;
+    return ok != 0;
 }
 
 /* -------- IMFSample helpers -------- */

@@ -79,63 +79,72 @@
 #define RDCC_CRU_SOFTRST_CON44   0xAB0u  /* VDPU NIU resets at bits 4..6 */
 
 /* CLKSEL_CON(89) = 0x300 + 89*4 = 0x464 — rkvdec0 root clock muxes/dividers.
- * Per linux-rockchip clk-rk3588.c the COMPOSITE clocks for aclk_rkvdec_ccu,
- * aclk_rkvdec0_root and hclk_rkvdec0_root all share this register:
+ * Per linux-rockchip clk-rk3588.c the COMPOSITE clocks share this register:
  *
- *   [15:14] aclk_rkvdec_ccu  mux  (gpll|cpll|aupll|spll)   → 0 = GPLL
- *   [13:9 ] aclk_rkvdec_ccu  div  (actual_div − 1)          → 1 = /2 (594 MHz)
- *   [8:7  ] aclk_rkvdec0_root mux (gpll|cpll|aupll|spll)   → 0 = GPLL
- *   [6:2  ] aclk_rkvdec0_root div (actual_div − 1)          → 1 = /2 (594 MHz)
- *   [1:0  ] hclk_rkvdec0_root mux (200m|100m|50m|24m)       → 0 = 200 MHz
+ *   [15:14] aclk_rkvdec_ccu   mux (gpll|cpll|aupll|spll) → 0 = GPLL
+ *   [13:9 ] aclk_rkvdec_ccu   div (actual_div − 1)         → 1 = /2 (594 MHz)
+ *   [8:7  ] aclk_rkvdec0_root mux (gpll|cpll|aupll|npll)  → 2 = AUPLL
+ *   [6:2  ] aclk_rkvdec0_root div (actual_div − 1)         → 0 = /1 (786 MHz)
+ *   [1:0  ] hclk_rkvdec0_root mux (200m|100m|50m|24m)      → 0 = 200 MHz
  *
- * Without this, ACLK_RKVDEC_CCU comes out of reset with an unconfigured mux
- * and the clock never actually ticks even after we ungate the gate bit.  The
- * rkvdec0 NIU then can't advance its bus-idle FSM and our PMU idle-deassert
- * never gets an ack.
- *
- * Hi-word-mask write: full 16-bit field set, value 0x0204 (bits 9 + 2). */
+ * 2026-05-12: rates updated to match BSP / RVD1 (UEFI-set) defaults.
+ * Previous values gave aclk_rkvdec0_root at gpll/2 = 594 MHz (vs BSP 786)
+ * and the leaf clocks at ~1/4 BSP.  The rate mismatch correlated with the
+ * RVD0 H.265 / H.264 wedge under per-kick gate cycling: at the slow
+ * leaf rates the gate cycle's CDC settle window after ungate is rate-
+ * relative and didn't fit the codec FSM's recovery window. */
 #define RDCC_CRU_CLKSEL_CON89    0x464u
 #define RDCC_CRU_CLKSEL_CON89_MASK   0xFFFFu
-#define RDCC_CRU_CLKSEL_CON89_VALUE  0x0204u
+#define RDCC_CRU_CLKSEL_CON89_VALUE  ((1u << 9) | (2u << 7))   /* 0x0300 */
 
-/* CLKSEL_CON(90) = 0x300 + 90*4 = 0x468 — leaf clocks for CABAC and HEVC CABAC.
- * Per edk2-rk3588 RK3588.h:
- *   bits  4..0  CLK_RKVDEC0_CA       div  → /8 = 187 MHz   (BSP wants 200 MHz)
- *   bit      5  CLK_RKVDEC0_CA       mux  → 0 = CPLL (1500 MHz)
- *   bits 10..6  CLK_RKVDEC0_HEVC_CA  div  → /3 = 333 MHz   (BSP wants 300 MHz)
- *   bits 12..11 CLK_RKVDEC0_HEVC_CA  mux  → 0 = MATRIX_1000M
+/* CLKSEL_CON(90) = 0x300 + 90*4 = 0x468 — leaf clocks for CABAC + HEVC CABAC.
+ * Per linux-rockchip clk-rk3588.c:
+ *   bits  4..0  clk_rkvdec0_ca      div → 1 = /2 (594 MHz from gpll)
+ *   bit      5  clk_rkvdec0_ca      mux → 0 = gpll
+ *   bits 10..6  clk_rkvdec0_hevc_ca div → 0 = /1 (1000 MHz from 1000m_src)
+ *   bits 12..11 clk_rkvdec0_hevc_ca mux → 3 = 1000m_src
  *
- * Without explicit rate setup the leaves come up at the 24 MHz reset default,
- * which is too slow for 200 ms decode budgets and explains "kick succeeds,
- * INT_STATUS reads 0 forever" on real hardware.  Div field = actual_div - 1. */
+ * 2026-05-12: rates updated to match BSP / RVD1.  Previous values gave
+ * 148 / 396 MHz, slow enough that the per-kick CON40 leaf-clock gate
+ * cycle's CDC settle window exceeded the codec FSM's tolerance. */
 #define RDCC_CRU_CLKSEL_CON90    0x468u
 #define RDCC_CRU_CLKSEL_CON90_MASK   0x1FFFu
-#define RDCC_CRU_CLKSEL_CON90_VALUE  ((7u << 0) | (0u << 5) | (2u << 6) | (0u << 11))
+#define RDCC_CRU_CLKSEL_CON90_VALUE  ((1u << 0) | (3u << 11))  /* 0x1801 */
 
 /* CLKSEL_CON(91) = 0x300 + 91*4 = 0x46C — clk_rkvdec0_core.
- *   bits 4..0  div  → /8 = 187 MHz   (BSP wants 200 MHz)
- *   bit     5  mux  → 0 = CPLL */
+ *   bits 4..0  div → 1 = /2 (594 MHz)
+ *   bit     5  mux → 0 = gpll
+ *
+ * 2026-05-12: rate updated from gpll/8 (148 MHz) to gpll/2 (594 MHz)
+ * to match BSP / RVD1.  See CON90 comment. */
 #define RDCC_CRU_CLKSEL_CON91    0x46Cu
 #define RDCC_CRU_CLKSEL_CON91_MASK   0x3Fu
-#define RDCC_CRU_CLKSEL_CON91_VALUE  ((7u << 0) | (0u << 5))
+#define RDCC_CRU_CLKSEL_CON91_VALUE  (1u << 0)                 /* 0x0001 */
 
 /* AV1 decoder clock + reset registers (jammy-branch BSP):
  *   CLKSEL_CON(163) at 0x300 + 163*4 = 0x58C
- *     bits [4:0]   ACLK_AV1_ROOT divider  (actual_div − 1)
- *     bits [7:5]   ACLK_AV1_ROOT mux      (gpll | cpll | aupll)
- *     bits [8:7]   PCLK_AV1_ROOT mux      (200m | 100m | 50m | 24m)  -- overlap [7]
+ *     bits [4:0]   ACLK_AV1 divider  (actual_div − 1)
+ *     bits [6:5]   ACLK_AV1 mux      (0=gpll | 1=cpll | 2=aupll)
+ *     bits [8:7]   PCLK_AV1_ROOT mux (0=200m | 1=100m | 2=50m | 3=24m)
+ *   (Earlier comment claimed bit 7 overlapped between the two muxes —
+ *   wrong; per BSP clk-rk3588.c aclk mux is bits[6:5], pclk mux is
+ *   bits[8:7], no overlap.)
  *   CLKGATE_CON(68) at 0x800 + 68*4 = 0x910
  *     bit 0  ACLK_AV1_ROOT  bit 3  PCLK_AV1_ROOT
  *   SOFTRST_CON(68) at 0xa00 + 68*4 = 0xB10
  *     bit 1  SRST_A_AV1_BIU   bit 4  SRST_P_AV1_BIU
  *     bit 2  SRST_A_AV1       bit 5  SRST_P_AV1
  *
- * Pick ACLK_AV1_ROOT = GPLL (mux 0) / 4 (BSP wants ~400 MHz; GPLL is
- * 1188 MHz so /3 = 396 MHz, /4 = 297 MHz — be conservative for first
- * bring-up and bump later if needed).  PCLK_AV1_ROOT = 100 MHz (mux 1). */
+ * 2026-05-12: rates updated to match BSP (verified via rk's
+ * /sys/kernel/debug/clk/clk_summary): aclk_av1 = gpll/3 = 396 MHz,
+ * pclk_av1 = mux 0 = 200 MHz.  Previous values (gpll/4 = 297 MHz +
+ * pclk mux 2 = 50 MHz) underclocked aclk by 25 % and pclk by 4×
+ * because of a div-off-by-one and the bogus "bit-7 overlap" comment
+ * making the author pick `1u << 7` thinking it was "100m mux=1" —
+ * actually selects 50m (mux=2). */
 #define RDCC_CRU_CLKSEL_CON163        0x58Cu
 #define RDCC_CRU_CLKSEL_CON163_MASK   0x01FFu  /* [8:0] */
-#define RDCC_CRU_CLKSEL_CON163_VALUE  ((3u << 0) | (0u << 5) | (1u << 7))
+#define RDCC_CRU_CLKSEL_CON163_VALUE  ((2u << 0) | (0u << 5) | (0u << 7))  /* 0x0002 */
 
 #define RDCC_CRU_CLKGATE_CON68        0x910u
 #define RDCC_CRU_CLKGATE_CON68_MASK   ((1u << 0) | (1u << 3))
@@ -357,12 +366,16 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
      * clock won't tick — the rkvdec0 NIU needs it ticking to ack
      * idle-deassert.
      *
-     * Leaves (core, ca, hevc_ca) need rate setup too: BSP kernel sets them
-     * to 200/200/300 MHz at probe.  Without that they'd run at 24 MHz OSC
-     * default, fast enough for register access but too slow for an actual
-     * decode within our 200 ms poll budget — the symptom is "kick fires,
-     * INT_STATUS reads 0 forever".  Pick CPLL/8 = 187 MHz for core/ca and
-     * MATRIX_1000M/3 = 333 MHz for hevc_ca; close enough to BSP targets. */
+     * Leaves (core, ca, hevc_ca) need rate setup too: per
+     * /sys/kernel/debug/clk/clk_summary on rk's BSP kernel they run at
+     * GPLL/2 = 594 MHz for core + ca and 1000m_src/1 = 1000 MHz for
+     * hevc_ca.  Without that they'd run at 24 MHz OSC default, fast
+     * enough for register access but too slow for an actual decode
+     * within our 200 ms poll budget — the symptom is "kick fires,
+     * INT_STATUS reads 0 forever".  An earlier version aimed for an
+     * older BSP target (200/200/300 MHz) and undershot to 148/396/148
+     * MHz due to mux misinterpretation; that triggered the RVD0 CON40
+     * gate-cycle wedge (see h264_bframe_divergence_open.md history). */
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON89,
                      RDCC_CRU_CLKSEL_CON89_MASK, RDCC_CRU_CLKSEL_CON89_VALUE);
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON90,
@@ -423,6 +436,35 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
 
     /* Resets were deasserted earlier (before each PD's idle handshake) —
      * the NIU has to be out of reset for the PMU bus-idle ack to fire. */
+
+    /* DEBUG (2026-05-12 RVD0/RVD1 rate asymmetry investigation): dump the
+     * CRU CON registers controlling clock rates + gate state for both
+     * cores so we can confirm what RVD1 actually runs at on Windows
+     * (vs BSP's 594/1000/594 MHz triple).  Remove once the wedge root
+     * cause is pinned down. */
+    {
+        ULONG con89 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x464));
+        ULONG con90 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x468));
+        ULONG con91 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x46C));
+        ULONG con93 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x474));
+        ULONG con94 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x478));
+        ULONG con40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8A0));
+        ULONG con41 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8A4));
+        ULONG rst40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0xAA0));
+        ULONG rst41 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0xAA4));
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: post-RaiseCluster CRU dump:\n"
+                   "  CLKSEL_CON89=0x%08x  (aclk_rkvdec_ccu mux/div)\n"
+                   "  CLKSEL_CON90=0x%08x  (RVD0 ca + hevc_ca)\n"
+                   "  CLKSEL_CON91=0x%08x  (RVD0 core)\n"
+                   "  CLKSEL_CON93=0x%08x  (RVD1 hclk_root + aclk_root + ca)\n"
+                   "  CLKSEL_CON94=0x%08x  (RVD1 hevc_ca + core)\n"
+                   "  CLKGATE_CON40=0x%08x (RVD0 leaves)\n"
+                   "  CLKGATE_CON41=0x%08x (RVD1 leaves)\n"
+                   "  SOFTRST_CON40=0x%08x SOFTRST_CON41=0x%08x\n",
+                   con89, con90, con91, con93, con94,
+                   con40, con41, rst40, rst41);
+    }
 
     /* Codec MMIO at 0xFDC30000 / 0xFDC38xxx / 0xFDC48xxx is now reachable. */
     g_raise_refcount = 1;
@@ -820,26 +862,60 @@ NTSTATUS RkMppCcuFullCoreReset0(_In_ PVOID Ctx)
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-               "rkmpp_ccu: FullCoreReset0 — wide CRU reset for RVD0\n");
+               "rkmpp_ccu: FullCoreReset0 — power-cycle PD_RKVDEC0 + wide CRU reset\n");
 
-    /* Quiesce the PD_RKVDEC0 bus.  Best-effort: if the bus is wedged
-     * the ack will time out, but we proceed anyway (the reset itself
-     * is what unwedges it). */
-    (void)RkMppPmuIdleRequest(&g_pdRkvdec0, TRUE);
+    /* Empirical recipe (proven to unwedge by CCU driver reinstall):
+     * full PD power-cycle around the SOFTRST bundle.  The earlier
+     * "PMU bus-idle only" sequence let the codec's internal FSM
+     * survive the SOFTRST toggle (clock domain stayed powered the
+     * whole time), so dec_e=1 stuck states persisted.  Power-cycling
+     * PD_RKVDEC0 forces the entire codec island through reset.
+     *
+     * Sequence mirrors Drop(rkvdec0-only) → Raise(rkvdec0-only)
+     * extracted from RaiseCluster/DropCluster:
+     *   1. PowerOff PD_RKVDEC0  (idle handshake → PMU pwr_off)
+     *   2. Assert SOFTRST_CON40 mask  (rkvdec0 group, no shared CON44)
+     *   3. Reapply CLKSEL_CON89/90/91  (defensive — sticky in practice)
+     *   4. Ungate CLKGATE_CON40 mask
+     *   5. Deassert SOFTRST_CON40 mask
+     *   6. PowerOn PD_RKVDEC0  (PMU pwr_off=0 → idle deassert)
+     *
+     * Serialised with RaiseCluster/DropCluster via g_ccu_mutex. */
+    ExAcquireFastMutex(&g_ccu_mutex);
 
-    /* Assert + deassert the per-codec CON40 bundle (no shared CON44). */
+    NTSTATUS s = RkMppPmuPowerOff(&g_pdRkvdec0);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "rkmpp_ccu: FullCoreReset0 PowerOff failed 0x%08x — "
+                   "continuing reset anyway\n", s);
+    }
+
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
                      g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
-    KeStallExecutionProcessor(5);
+    KeStallExecutionProcessor(20);
+
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON89,
+                     RDCC_CRU_CLKSEL_CON89_MASK, RDCC_CRU_CLKSEL_CON89_VALUE);
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON90,
+                     RDCC_CRU_CLKSEL_CON90_MASK, RDCC_CRU_CLKSEL_CON90_VALUE);
+    RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKSEL_CON91,
+                     RDCC_CRU_CLKSEL_CON91_MASK, RDCC_CRU_CLKSEL_CON91_VALUE);
+
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
+                     g_rdcc.ClkGateCon40Mask, 0);
 
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
                      g_rdcc.SoftRstCon40Mask, 0);
     KeStallExecutionProcessor(20);
 
-    /* Release the bus-idle request. */
-    (void)RkMppPmuIdleRequest(&g_pdRkvdec0, FALSE);
+    s = RkMppPmuPowerOn(&g_pdRkvdec0);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: FullCoreReset0 PowerOn failed 0x%08x\n", s);
+    }
 
-    return STATUS_SUCCESS;
+    ExReleaseFastMutex(&g_ccu_mutex);
+    return s;
 }
 
 /* RkMppCcuFullCoreReset1 — wide hang-recovery reset for RVD1 (v8 new).
@@ -852,21 +928,44 @@ NTSTATUS RkMppCcuFullCoreReset1(_In_ PVOID Ctx)
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-               "rkmpp_ccu: FullCoreReset1 — wide CRU reset for RVD1\n");
+               "rkmpp_ccu: FullCoreReset1 — power-cycle PD_RKVDEC1 + wide CRU reset\n");
 
-    (void)RkMppPmuIdleRequest(&g_pdRkvdec1, TRUE);
+    /* Mirror of FullCoreReset0 for the CON41 / PD_RKVDEC1 group.  No
+     * shared CON44 NIU bits touched.  See FullCoreReset0 for the
+     * sequence rationale (PD power-cycle is what the empirical
+     * "CCU driver reinstall unwedges" recipe boils down to). */
+    ExAcquireFastMutex(&g_ccu_mutex);
+
+    NTSTATUS s = RkMppPmuPowerOff(&g_pdRkvdec1);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "rkmpp_ccu: FullCoreReset1 PowerOff failed 0x%08x — "
+                   "continuing reset anyway\n", s);
+    }
 
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41,
                      g_rdcc.SoftRstCon41Mask, g_rdcc.SoftRstCon41Mask);
-    KeStallExecutionProcessor(5);
+    KeStallExecutionProcessor(20);
+
+    /* RVD1 leaf clocks (CON93/94) are UEFI-set to BSP-equivalent
+     * values; we never re-program them.  No CLKSEL reapply needed
+     * for the RVD1 path (matches RaiseCluster for rkvdec1). */
+
+    RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
+                     g_rdcc.ClkGateCon41Mask, 0);
 
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41,
                      g_rdcc.SoftRstCon41Mask, 0);
     KeStallExecutionProcessor(20);
 
-    (void)RkMppPmuIdleRequest(&g_pdRkvdec1, FALSE);
+    s = RkMppPmuPowerOn(&g_pdRkvdec1);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkmpp_ccu: FullCoreReset1 PowerOn failed 0x%08x\n", s);
+    }
 
-    return STATUS_SUCCESS;
+    ExReleaseFastMutex(&g_ccu_mutex);
+    return s;
 }
 
 /* RkMppCcuFullAv1Reset — wide hang-recovery reset for AV1 (v8 new).

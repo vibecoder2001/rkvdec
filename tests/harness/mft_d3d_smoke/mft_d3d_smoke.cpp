@@ -57,50 +57,17 @@ typedef HRESULT (__stdcall *PFN_DllGetClassObject)(REFCLSID, REFIID, void **);
 
 enum class CodecCli { H264, H265 };
 
-/* -------- Annex-B AU walker (lifted from mft_decode) -------- */
-
-static size_t find_start_code(const uint8_t *buf, size_t len, size_t from) {
-    for (size_t i = from; i + 3 <= len; i++) {
-        if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1) return i + 3;
-        if (i + 4 <= len &&
-            buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1)
-            return i + 4;
-    }
-    return SIZE_MAX;
-}
+/* -------- Annex-B AU walker — thin wrapper over mft/au_iter. ----------- */
+#include "au_iter.h"
 
 static bool au_next(CodecCli c, const uint8_t *buf, size_t len, size_t *pos,
                     size_t *au_off, size_t *au_len) {
-    if (*pos >= len) return false;
-    size_t first_sc = find_start_code(buf, len, *pos);
-    if (first_sc == SIZE_MAX) return false;
-    bool found_slice = false;
-    size_t after_slice = len, nh_off = first_sc;
-    while (nh_off < len) {
-        bool is_slice = false;
-        if (c == CodecCli::H264) {
-            uint8_t nut = buf[nh_off] & 0x1F;
-            is_slice = (nut == 1 || nut == 5);
-        } else {
-            uint8_t nut = (buf[nh_off] >> 1) & 0x3F;
-            is_slice = (nut < 32);
-        }
-        if (is_slice) {
-            found_slice = true;
-            size_t next_sc = find_start_code(buf, len, nh_off + 1);
-            after_slice = (next_sc == SIZE_MAX) ? len : (next_sc - 3);
-            break;
-        }
-        size_t next_sc = find_start_code(buf, len, nh_off + 1);
-        if (next_sc == SIZE_MAX || next_sc >= len) break;
-        nh_off = next_sc;
-    }
-    if (!found_slice) return false;
-    size_t sc_start = (first_sc >= 3) ? first_sc - 3 : 0;
-    *au_off = sc_start;
-    *au_len = after_slice - sc_start;
-    *pos    = after_slice;
-    return true;
+    AuIter it = { buf, len, *pos };
+    int ok = (c == CodecCli::H265)
+                ? H265AuNext(&it, au_off, au_len, nullptr)
+                : H264AuNext(&it, au_off, au_len, nullptr);
+    *pos = it.pos;
+    return ok != 0;
 }
 
 /* -------- D3D11 readback of an NV12 sample's texture -------- */

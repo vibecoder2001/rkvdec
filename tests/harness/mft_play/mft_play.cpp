@@ -24,6 +24,7 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mfobjects.h>
+#include <mfreadwrite.h>
 #include <mftransform.h>
 #include <evr.h>
 #include <d3d11.h>
@@ -40,6 +41,7 @@
 #include <cwchar>
 
 #include "guids.h"
+#include "av1_parser.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -144,10 +146,12 @@ public:
     D3D11VideoSink() : refs_(1) {}
     ~D3D11VideoSink() { Cleanup(); }
 
-    HRESULT Init(HWND hwnd, ID3D11Device *device, UINT width, UINT height) {
-        hwnd_   = hwnd;
-        width_  = width;
-        height_ = height;
+    HRESULT Init(HWND hwnd, ID3D11Device *device, UINT width, UINT height,
+                 bool ten_bit) {
+        hwnd_     = hwnd;
+        width_    = width;
+        height_   = height;
+        ten_bit_  = ten_bit;
         device_ = device; device_->AddRef();
         device_->GetImmediateContext(&context_);
 
@@ -225,34 +229,47 @@ public:
          * where decode budget per TU is wildly uneven).  Three slots
          * give the GPU one full Present cycle to drain before a slot
          * is reused. */
+        /* 10-bit path uses DXGI P010 with 16-bit-sample planes; R16_UNORM
+         * sampling of P010 (10 valid bits in upper 10 of 16) yields luma
+         * in [0, 65472/65535] ≈ [0, 0.999], the same usable [0,1] luma
+         * the 8-bit R8_UNORM path produces from NV12.  The ~0.1% scale
+         * mismatch is sub-LSB and the YUV→BGRA shader is reused as-is.
+         * Once the 10-bit display driver lands, the swap chain can swap
+         * to a 10-bit RGB format and gain HDR-range output. */
+        const DXGI_FORMAT tex_fmt = ten_bit_ ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+        const DXGI_FORMAT y_srv_fmt  = ten_bit_ ? DXGI_FORMAT_R16_UNORM
+                                                : DXGI_FORMAT_R8_UNORM;
+        const DXGI_FORMAT uv_srv_fmt = ten_bit_ ? DXGI_FORMAT_R16G16_UNORM
+                                                : DXGI_FORMAT_R8G8_UNORM;
         for (UINT i = 0; i < kRingSize; i++) {
             D3D11_TEXTURE2D_DESC td = {};
             td.Width              = width_;
             td.Height             = height_;
             td.MipLevels          = 1;
             td.ArraySize          = 1;
-            td.Format             = DXGI_FORMAT_NV12;
+            td.Format             = tex_fmt;
             td.SampleDesc.Count   = 1;
             td.Usage              = D3D11_USAGE_DEFAULT;
             td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
             HRCK(device_->CreateTexture2D(&td, nullptr, &ring_tex_[i]));
 
             D3D11_SHADER_RESOURCE_VIEW_DESC sd_y = {};
-            sd_y.Format        = DXGI_FORMAT_R8_UNORM;
+            sd_y.Format        = y_srv_fmt;
             sd_y.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             sd_y.Texture2D.MipLevels = 1;
             HRCK(device_->CreateShaderResourceView(ring_tex_[i], &sd_y,
                                                     &ring_y_srv_[i]));
 
             D3D11_SHADER_RESOURCE_VIEW_DESC sd_uv = sd_y;
-            sd_uv.Format = DXGI_FORMAT_R8G8_UNORM;
+            sd_uv.Format = uv_srv_fmt;
             HRCK(device_->CreateShaderResourceView(ring_tex_[i], &sd_uv,
                                                     &ring_uv_srv_[i]));
         }
 
         std::fprintf(stderr,
-            "D3D11VideoSink: swap chain %ux%u (window) BGRA, NV12 source %ux%u, "
-            "shader pipeline ready\n", cw, ch, width_, height_);
+            "D3D11VideoSink: swap chain %ux%u (window) BGRA, %s source %ux%u, "
+            "shader pipeline ready\n", cw, ch,
+            ten_bit_ ? "P010" : "NV12", width_, height_);
         std::fflush(stderr);
         return S_OK;
     }
@@ -272,7 +289,9 @@ public:
     }
 
     HRESULT RenderNV12(const BYTE *nv12, DWORD len) {
-        const UINT y_size = width_ * height_;
+        const UINT bpp       = ten_bit_ ? 2u : 1u;
+        const UINT row_pitch = width_ * bpp;
+        const UINT y_size    = row_pitch * height_;
         if (len < y_size + (y_size / 2)) return E_INVALIDARG;
 
         /* Pick the next slot in the texture ring; advance ring_idx_
@@ -281,9 +300,10 @@ public:
         const UINT slot = ring_idx_;
         ring_idx_ = (ring_idx_ + 1u) % kRingSize;
 
-        /* Upload NV12 bytes to this frame's ring texture (Y subresource
-         * 0, UV subresource 1).  Both at row pitch == width. */
-        const UINT row_pitch = width_;
+        /* Upload NV12 / P010 bytes to this frame's ring texture (Y
+         * subresource 0, interleaved UV subresource 1).  Row pitch is
+         * width * bytes_per_sample for both planes; total upload is
+         * width * height * 3/2 * bpp. */
         context_->UpdateSubresource(ring_tex_[slot], 0, nullptr,
                                     nv12, row_pitch, row_pitch * height_);
         context_->UpdateSubresource(ring_tex_[slot], 1, nullptr,
@@ -399,6 +419,7 @@ private:
     ID3D11Texture2D           *ring_tex_[kRingSize]    = {};
     ID3D11ShaderResourceView  *ring_y_srv_[kRingSize]  = {};
     ID3D11ShaderResourceView  *ring_uv_srv_[kRingSize] = {};
+    bool                       ten_bit_    = false;
 };
 
 /* No-op IMFSampleGrabberSinkCallback — used when --no-render is set.
@@ -648,6 +669,7 @@ static HRESULT AddOutputNode(IMFTopology *topo, HWND hwnd,
                              ID3D11Device *d3d11_dev,
                              const Args &args,
                              IMFMediaType *video_type,
+                             bool ten_bit,
                              IMFTopologyNode **out) {
     IMFActivate *output_activate = nullptr;
     if (args.no_render) {
@@ -684,7 +706,7 @@ static HRESULT AddOutputNode(IMFTopology *topo, HWND hwnd,
             UINT h = (UINT)(frame_size & 0xFFFFFFFF);
 
             D3D11VideoSink *sink = new D3D11VideoSink();
-            HRESULT hr = sink->Init(hwnd, d3d11_dev, w, h);
+            HRESULT hr = sink->Init(hwnd, d3d11_dev, w, h, ten_bit);
             if (FAILED(hr)) {
                 std::fprintf(stderr,
                     "D3D11VideoSink::Init failed 0x%08x — falling back to EVR\n",
@@ -971,24 +993,209 @@ int wmain(int argc, wchar_t **argv) {
             (unsigned)hr_mgr);
     }
 
-    /* The sample-grabber sink (used in both default D3D11 mode and
-     * --no-render mode) needs a media type matching the MFT's output:
-     * NV12 at the source video dimensions. */
-    IMFMediaType *grabber_type = nullptr;
-    if (!args.use_evr) {
+    /* AV1 + 10-bit: MF's MKV source surfaces neither av1C nor raw
+     * sequence_header in MF_MT_MPEG_SEQUENCE_HEADER / MF_MT_USER_DATA,
+     * so the MFT can't see the bit-depth before the first sample.
+     * Peek it ourselves via a throwaway IMFSourceReader on the same
+     * file: read the first AV1 sample, walk OBUs to OBU_SEQUENCE_HEADER,
+     * parse high_bitdepth.  Synthesize a 4-byte av1C blob and stamp it
+     * into the source stream's current media type so the topology
+     * resolver's SetInputType call carries it into the MFT. */
+    bool av1_hbd_peek = false;
+    if (clsid == CLSID_RkmppAv1Decoder) {
+        IMFSourceReader *rdr = nullptr;
+        if (SUCCEEDED(MFCreateSourceReaderFromURL(args.in_path, nullptr, &rdr))) {
+            /* Disable audio + only first video stream */
+            rdr->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
+            rdr->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+            /* Walk samples until we find an OBU_SEQUENCE_HEADER (usually
+             * the first sample's first OBU; some streams send a temporal
+             * delimiter first).  Limit iterations defensively. */
+            for (int attempt = 0; attempt < 4 && !av1_hbd_peek; attempt++) {
+                IMFSample *samp = nullptr;
+                DWORD     flags = 0;
+                LONGLONG  ts    = 0;
+                HRESULT hr_rs = rdr->ReadSample(
+                    (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                    0, nullptr, &flags, &ts, &samp);
+                if (FAILED(hr_rs) || !samp ||
+                    (flags & MF_SOURCE_READERF_ENDOFSTREAM)) {
+                    if (samp) samp->Release();
+                    break;
+                }
+                IMFMediaBuffer *mb = nullptr;
+                if (SUCCEEDED(samp->ConvertToContiguousBuffer(&mb))) {
+                    BYTE *p = nullptr; DWORD cap = 0, cur = 0;
+                    if (SUCCEEDED(mb->Lock(&p, &cap, &cur))) {
+                        /* Walk OBU stream.  Each OBU: 1-byte header
+                         * (forbidden:1=0 | type:4 | extension:1 |
+                         * has_size:1 | reserved:1), optional extension
+                         * byte, optional leb128 size (when has_size=1),
+                         * then payload. */
+                        size_t off = 0;
+                        while (off < cur) {
+                            uint8_t hdr = p[off++];
+                            uint8_t type     = (uint8_t)((hdr >> 3) & 0xF);
+                            bool    has_ext  = (hdr & 0x04) != 0;
+                            bool    has_size = (hdr & 0x02) != 0;
+                            if (has_ext) {
+                                if (off >= cur) break;
+                                off++;
+                            }
+                            size_t payload_len = 0;
+                            if (has_size) {
+                                int shift = 0;
+                                size_t leb = 0;
+                                while (off < cur && leb < 8) {
+                                    uint8_t b = p[off++]; leb++;
+                                    payload_len |= (size_t)(b & 0x7F) << shift;
+                                    shift += 7;
+                                    if (!(b & 0x80)) break;
+                                }
+                            } else {
+                                payload_len = cur - off;
+                            }
+                            if (off + payload_len > cur) break;
+                            if (type == 1 /* OBU_SEQUENCE_HEADER */) {
+                                Dav1dSequenceHeader seq{};
+                                if (Av1ParseSeqHeader(p + off, payload_len,
+                                                      &seq) == 0) {
+                                    if (seq.hbd) av1_hbd_peek = true;
+                                    std::fprintf(stderr,
+                                        "mft_play: peeked AV1 seq_hdr hbd=%d "
+                                        "(payload %zu bytes)\n",
+                                        (int)seq.hbd, payload_len);
+                                }
+                                off = cur;  /* done */
+                                break;
+                            }
+                            off += payload_len;
+                        }
+                        mb->Unlock();
+                    }
+                    mb->Release();
+                }
+                samp->Release();
+            }
+            rdr->Release();
+        }
+        if (av1_hbd_peek) {
+            /* Synthesize a 4-byte av1C config record with high_bitdepth=1,
+             * twelve_bit=0.  The MFT's SetInputType reads byte 2 bit 6
+             * (high_bitdepth) and bit 5 (twelve_bit).  Other bits left
+             * as placeholders — only the bit-depth flags matter for
+             * output-type negotiation; the engine still consumes the
+             * real seq_hdr from the in-band OBU stream. */
+            UINT8 av1c[4] = {
+                0x81,                    /* marker=1, version=1 */
+                0x00,                    /* seq_profile=0, seq_level_idx_0=0 */
+                (UINT8)(0x40),           /* high_bitdepth=1, others=0 */
+                0x00,                    /* reserved | no initial delay */
+            };
+            /* Stamp into the source stream's current media type so the
+             * topology resolver passes it to the MFT.  We hold a fresh
+             * GetCurrentMediaType + SetCurrentMediaType pair to make it
+             * sticky across the upcoming probe path. */
+            IMFMediaTypeHandler *mth_av1c = nullptr;
+            if (SUCCEEDED(sd->GetMediaTypeHandler(&mth_av1c))) {
+                IMFMediaType *mt_av1c = nullptr;
+                if (SUCCEEDED(mth_av1c->GetCurrentMediaType(&mt_av1c))) {
+                    mt_av1c->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                                     av1c, sizeof(av1c));
+                    HRESULT hr_set = mth_av1c->SetCurrentMediaType(mt_av1c);
+                    std::fprintf(stderr,
+                        "mft_play: stamped synthetic av1C (hbd=1) onto stream "
+                        "(SetCurrentMediaType=0x%08x)\n", (unsigned)hr_set);
+                    std::fflush(stderr);
+                    mt_av1c->Release();
+                }
+                mth_av1c->Release();
+            }
+        }
+    }
+
+    /* Probe the MFT for the actual output subtype it will emit.  The
+     * rkmpp MFT advertises NV12 for 8-bit and P010 for 10-bit streams,
+     * keyed off the SPS bit_depth parsed from the source's avcC/hvcC
+     * extradata in SetInputType.  We feed it the source's media type
+     * here and read back GetOutputAvailableType — same code path the
+     * topology resolver will exercise, so they stay in lockstep. */
+    bool      ten_bit       = false;
+    GUID      grabber_sub   = MFVideoFormat_NV12;
+    UINT64    frame_size_64 = 0;
+    {
         IMFMediaTypeHandler *mth = nullptr;
         HRCK(sd->GetMediaTypeHandler(&mth));
         IMFMediaType *src_type = nullptr;
         HRCK(mth->GetCurrentMediaType(&src_type));
-        UINT64 frame_size = 0;
-        HRCK(src_type->GetUINT64(MF_MT_FRAME_SIZE, &frame_size));
+        HRCK(src_type->GetUINT64(MF_MT_FRAME_SIZE, &frame_size_64));
+
+        /* Diagnostic: dump the codec-private blob keys so we can see
+         * which one (if any) the demuxer populated. */
+        auto dump_blob = [&](REFGUID key, const char *name) {
+            UINT32 blob_len = 0;
+            HRESULT hr_sz = src_type->GetBlobSize(key, &blob_len);
+            if (FAILED(hr_sz) || blob_len == 0) {
+                std::fprintf(stderr,
+                    "mft_play: src %s blob = (absent)\n", name);
+                return;
+            }
+            UINT8 *buf = new UINT8[blob_len];
+            HRESULT hr_b = src_type->GetBlob(key, buf, blob_len, nullptr);
+            if (FAILED(hr_b)) {
+                std::fprintf(stderr,
+                    "mft_play: src %s blob = (GetBlob 0x%08x)\n",
+                    name, (unsigned)hr_b);
+                delete[] buf;
+                return;
+            }
+            std::fprintf(stderr,
+                "mft_play: src %s blob = %u bytes, first 32:",
+                name, blob_len);
+            UINT32 dump_n = (blob_len < 32u) ? blob_len : 32u;
+            for (UINT32 j = 0; j < dump_n; j++)
+                std::fprintf(stderr, " %02x", (unsigned)buf[j]);
+            std::fprintf(stderr, "\n");
+            delete[] buf;
+        };
+        dump_blob(MF_MT_MPEG_SEQUENCE_HEADER, "MPEG_SEQUENCE_HEADER");
+        dump_blob(MF_MT_USER_DATA,            "USER_DATA");
+
+        if (mft) {
+            HRESULT hr_probe = mft->SetInputType(0, src_type, 0);
+            std::fprintf(stderr,
+                "mft_play: probe SetInputType -> 0x%08x\n",
+                (unsigned)hr_probe);
+            if (SUCCEEDED(hr_probe)) {
+                IMFMediaType *out_avail = nullptr;
+                if (SUCCEEDED(mft->GetOutputAvailableType(0, 0, &out_avail))
+                    && out_avail) {
+                    GUID sub = {};
+                    if (SUCCEEDED(out_avail->GetGUID(MF_MT_SUBTYPE, &sub))
+                        && sub == MFVideoFormat_P010) {
+                        ten_bit     = true;
+                        grabber_sub = MFVideoFormat_P010;
+                    }
+                    out_avail->Release();
+                }
+            }
+            std::fprintf(stderr,
+                "mft_play: probed output subtype = %s (ten_bit=%d)\n",
+                ten_bit ? "P010" : "NV12", ten_bit ? 1 : 0);
+        }
         src_type->Release();
         mth->Release();
+    }
 
+    /* The sample-grabber sink (used in both default D3D11 mode and
+     * --no-render mode) needs a media type matching the MFT's output:
+     * NV12 or P010 at the source video dimensions. */
+    IMFMediaType *grabber_type = nullptr;
+    if (!args.use_evr) {
         HRCK(MFCreateMediaType(&grabber_type));
         HRCK(grabber_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
-        HRCK(grabber_type->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_NV12));
-        HRCK(grabber_type->SetUINT64(MF_MT_FRAME_SIZE, frame_size));
+        HRCK(grabber_type->SetGUID(MF_MT_SUBTYPE,    grabber_sub));
+        HRCK(grabber_type->SetUINT64(MF_MT_FRAME_SIZE, frame_size_64));
     }
 
     /* --- topology --- */
@@ -999,7 +1206,7 @@ int wmain(int argc, wchar_t **argv) {
     HRCK(AddSourceNode   (topo, src, pd, sd, &src_node));
     HRCK(AddTransformNode(topo, mft,         &xform_node));
     HRCK(AddOutputNode   (topo, hwnd, dxgi_mgr, d3d11_dev,
-                          args, grabber_type, &out_node));
+                          args, grabber_type, ten_bit, &out_node));
     if (grabber_type) grabber_type->Release();
     HRCK(src_node ->ConnectOutput(0, xform_node, 0));
     HRCK(xform_node->ConnectOutput(0, out_node, 0));

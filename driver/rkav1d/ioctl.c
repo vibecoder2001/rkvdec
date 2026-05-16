@@ -19,8 +19,18 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RkMppEvtIoDeviceControl;
 
 NTSTATUS RkMppQueueInit(_In_ WDFDEVICE Device)
 {
+    /* Parallel dispatch: required for concurrent AV1 decode sessions on
+     * the same engine.  Sequential mode serialised ALL IRPs across all
+     * File handles, so stream 1's blocking WAIT_JOB would monopolise the
+     * queue and stall every IOCTL from stream 2 — even its initial
+     * GET_CAPS / ALLOC_BUFFER calls.
+     *
+     * Handler reentrancy: SUBMIT/PEEK/WAIT/JobBufferInUse all hold the
+     * per-queue spinlock; bufpool ALLOC/FREE hold the per-File spinlock;
+     * GET_CAPS and INJECT_IOMMU_FAULT are read-only.  Multiple WAIT_JOB
+     * callers block on per-job KEVENTs without holding any queue resource. */
     WDF_IO_QUEUE_CONFIG cfg;
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&cfg, WdfIoQueueDispatchSequential);
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&cfg, WdfIoQueueDispatchParallel);
     cfg.EvtIoDeviceControl = RkMppEvtIoDeviceControl;
 
     WDFQUEUE q;

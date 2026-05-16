@@ -23,39 +23,43 @@ static inline uint32_t set_bits(uint32_t reg, uint32_t value,
     return (reg & ~(mask << shift)) | ((value & mask) << shift);
 }
 
-/* Append a plain (non-substituted) register write. */
-static int emit_plain(H265RegWriteList *list, uint32_t off, uint32_t value) {
-    if (list->count >= RKMPP_MAX_REG_WRITES) return 1;
-    RKMPP_REG_WRITE *w = &list->entries[list->count++];
-    w->Offset       = off;
-    w->Value        = value;
-    w->BufferHandle = 0;
-    w->IovaOffset   = 0;
-    w->Reserved     = 0;
+/* Stamp one plain value into the dense bank.  Idx 10 (kick) is routed
+ * to out->KickValue.  Returns 1 on uncovered offset. */
+static int emit_plain(H26xDenseOutput *out, uint32_t off, uint32_t value) {
+    uint32_t idx = off / 4u;
+    if (idx == RKMPP_DENSE_KICK_REG_IDX) {
+        out->KickValue = value;
+        return 0;
+    }
+    uint32_t *slot = H26xDenseSlotFor(out, off);
+    if (!slot) return 1;
+    *slot = value;
     return 0;
 }
 
-/* Append an iova-substitution register write (kernel rewrites Value at
- * submit time using BufferHandle's resolved iova + IovaOffset). */
-static int emit_iova(H265RegWriteList *list, uint32_t off,
+/* Record an iova-substitution slot.  Zero handle is a no-op (slot
+ * remains 0), matching the sparse path's gating-on-handle pattern. */
+static int emit_iova(H26xDenseOutput *out, uint32_t off,
                      uint64_t handle, uint32_t iova_offset) {
-    if (list->count >= RKMPP_MAX_REG_WRITES) return 1;
-    RKMPP_REG_WRITE *w = &list->entries[list->count++];
-    w->Offset       = off;
-    w->Value        = 0;
-    w->BufferHandle = handle;
-    w->IovaOffset   = iova_offset;
-    w->Reserved     = 0;
+    if (handle == 0) return 0;
+    if (out->IovaSlotCount >= RKMPP_MAX_DENSE_IOVA_SLOTS) return 1;
+    uint32_t idx = off / 4u;
+    if (!H26xDenseSlotFor(out, off)) return 1;
+    if (!H26xDenseIsAddressReg(idx))  return 1;
+    RKMPP_DENSE_IOVA_SLOT *s = &out->IovaSlots[out->IovaSlotCount++];
+    s->RegIdx       = idx;
+    s->IovaOffset   = iova_offset;
+    s->BufferHandle = handle;
     return 0;
 }
 
 } /* anon namespace */
 
 extern "C"
-H265RegBuildStatus H265BuildRegisterList(const H265ParseResult *parsed,
-                                         const H265BufferRefs  *bufs,
-                                         uint32_t               current_pic_index,
-                                         H265RegWriteList      *out)
+H265RegBuildStatus H265BuildDenseRegs(const H265ParseResult *parsed,
+                                      const H265BufferRefs  *bufs,
+                                      uint32_t               current_pic_index,
+                                      H26xDenseOutput       *out)
 {
     if (!parsed || !bufs || !out) return H265_REGBUILD_MISSING_INPUT;
     if (!parsed->has_slice)       return H265_REGBUILD_MISSING_INPUT;
@@ -69,7 +73,9 @@ H265RegBuildStatus H265BuildRegisterList(const H265ParseResult *parsed,
     if (!bufs->cabac_init_table)
         return H265_REGBUILD_UNSUPPORTED;
 
-    out->count = 0;
+    /* Bank MUST start zero so the bulk MMIO write only sets bits the
+     * regbuilder actually means to set. */
+    memset(out, 0, sizeof(*out));
     (void)current_pic_index;  /* see reg028 note below */
 
     const H265Sps *sps = &parsed->sps[parsed->active_sps_id];
@@ -78,17 +84,31 @@ H265RegBuildStatus H265BuildRegisterList(const H265ParseResult *parsed,
     if (!sps->valid || !pps->valid)
         return H265_REGBUILD_MISSING_INPUT;
 
+    /* Bit-depth + chroma-format gate.  Mirrors the H.264 regbuilder:
+     * accept 8-bit (minus8=0) and 10-bit (minus8=2) 4:2:0 only, with
+     * luma == chroma bit-depth.  4:2:2/4:4:4 and 12-bit are silicon-
+     * supported on vdpu34x in theory but our engine output path isn't
+     * wired up for them — reject loudly. */
+    if (sps->chroma_format_idc != 1)
+        return H265_REGBUILD_UNSUPPORTED;
+    if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
+        return H265_REGBUILD_UNSUPPORTED;
+    if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
+        return H265_REGBUILD_UNSUPPORTED;
+
     /* Frame-geometry derivation matches gen_regs:836..914 — luma stride
-     * is hor_stride from the frame allocator (16-aligned for raster NV12),
-     * NOT CtbSizeY-aligned.  CtbSizeY only enters here through the
-     * RCB-info sizing (handled by h265_packed_tables).  The "surprising"
-     * stride note in the task brief was about the ALLOC-time stride
-     * (where you do round to CtbSizeY for AFBC); for NV12 raster we
-     * stay 16-aligned to match the H.264 path. */
+     * is hor_stride from the frame allocator (16-aligned for raster NV12,
+     * width*10/8 16-aligned for NV15 Main10), NOT CtbSizeY-aligned.
+     * CtbSizeY only enters here through the RCB-info sizing (handled by
+     * h265_packed_tables).  The packed SPS unit carries the bit-depth
+     * (h265_packed_tables.cpp:160-161); these stride registers must
+     * match or the SAO write fabric corrupts adjacent rows. */
     uint32_t width_px      = sps->pic_width_in_luma_samples;
     uint32_t height_px     = sps->pic_height_in_luma_samples;
-    uint32_t luma_stride   = (width_px  + 15u) & ~15u;
-    uint32_t chroma_stride = luma_stride;          /* 4:2:0 NV12 same horiz */
+    const uint32_t bpp_num = (sps->bit_depth_luma_minus8 == 2) ? 10u : 8u;
+    uint32_t coded_w_px    = (width_px + 15u) & ~15u;
+    uint32_t luma_stride   = ((coded_w_px * bpp_num + 7u) / 8u + 15u) & ~15u;
+    uint32_t chroma_stride = luma_stride;          /* 4:2:0 same horiz */
     uint32_t y_height      = (height_px + 15u) & ~15u;
     uint32_t y_size        = luma_stride * y_height;
 

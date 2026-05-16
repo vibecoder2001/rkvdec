@@ -22,6 +22,7 @@
  * mapping: rkmpp::CodecKind <-> ::Codec (separate enums, same intent). */
 #include "decode_engine.h"
 #include "decode_engine_av1.h"
+#include "../av1_parser.h"
 
 namespace rkmpp {
 
@@ -199,8 +200,13 @@ STDMETHODIMP DecoderMFT::GetOutputStreamInfo(DWORD id, MFT_OUTPUT_STREAM_INFO *p
                | MFT_OUTPUT_STREAM_FIXED_SAMPLE_SIZE
                | MFT_OUTPUT_STREAM_WHOLE_SAMPLES
                | MFT_OUTPUT_STREAM_SINGLE_SAMPLE_PER_BUFFER;
-    /* NV12 = width*height*3/2 once dimensions known, else 0. */
-    p->cbSize      = (width_ && height_) ? (width_ * height_ * 3 / 2) : 0;
+    /* NV12 = width*height*3/2; P010 doubles that (2 bytes/sample). */
+    if (width_ && height_) {
+        UINT32 base = width_ * height_ * 3u / 2u;
+        p->cbSize = (bit_depth_ == 10) ? (base * 2u) : base;
+    } else {
+        p->cbSize = 0;
+    }
     p->cbAlignment = 16;
     return S_OK;
 }
@@ -311,31 +317,61 @@ STDMETHODIMP DecoderMFT::SetInputType(DWORD id, IMFMediaType *type, DWORD flags)
      * Annex-B inline (no extradata) must NOT be treated as AVCC, or
      * AvccToAnnexB will reject every sample as malformed. */
     uint8_t length_size = 0;
+    /* Probe both MF_MT_MPEG_SEQUENCE_HEADER (MP4/AVI sources, and also
+     * MKV — which surprisingly puts raw Annex-B SPS+PPS here, not avcC)
+     * and MF_MT_USER_DATA (some sources stash codec data here instead).
+     * Heuristic: if the blob starts with an Annex-B start code, treat
+     * it as Annex-B verbatim; otherwise try avcC/hvcC parsing.  Either
+     * way the result lands in `annexb` for FeedExtradata + bit-depth
+     * detection below.  Containers that ship no extradata at all
+     * (MPEG-TS, raw Annex-B sources without a header attribute) fall
+     * through to inline-SPS detection in ProcessInput. */
+    auto looks_annexb = [](const uint8_t *p, size_t n) {
+        if (n >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) return true;
+        if (n >= 3 && p[0] == 0 && p[1] == 0 && p[2] == 1) return true;
+        return false;
+    };
     UINT32 hdr_len = 0;
-    if (SUCCEEDED(type->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hdr_len)) && hdr_len > 0) {
+    const GUID kHeaderKeys[2] = { MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_USER_DATA };
+    for (const GUID &key : kHeaderKeys) {
+        if (!annexb.empty()) break;
+        if (FAILED(type->GetBlobSize(key, &hdr_len)) || hdr_len == 0) continue;
         std::vector<uint8_t> hdr(hdr_len);
-        if (FAILED(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), hdr_len, nullptr)))
-            return MF_E_INVALIDMEDIATYPE;
+        if (FAILED(type->GetBlob(key, hdr.data(), hdr_len, nullptr))) continue;
 
-        /* Parse into a temporary instance so we can roll back on failure.
-         * AV1 extradata is `av1C` (OBU sequence header) — dav1d will
-         * pick up the SPS from the OBU stream itself, so just skip the
-         * parse and leave annexb empty. */
+        if (looks_annexb(hdr.data(), hdr.size())) {
+            /* Raw Annex-B SPS+PPS — already in the format the engine
+             * expects.  Use verbatim; length_size stays 0 (Annex-B
+             * framing for downstream samples too unless a later
+             * SetInputType call corrects it). */
+            std::fprintf(stderr,
+                "rkmpp MFT: SetInputType extradata = Annex-B "
+                "(%zu bytes)\n", hdr.size());
+            std::fflush(stderr);
+            annexb      = std::move(hdr);
+            length_size = 0;
+            continue;
+        }
+
+        /* avcC / hvcC path.  Parse into a temporary instance so we can
+         * roll back on failure.  AV1 extradata is `av1C` (OBU sequence
+         * header) — dav1d will pick up the SPS from the OBU stream
+         * itself, so just skip the parse and leave annexb empty. */
         DecoderMFT tmp(kind_);
         HRESULT hr = S_OK;
         if (kind_ == CodecKind::H264) {
             hr = tmp.ParseAvcCExtradata(hdr.data(), hdr.size());
         } else if (kind_ == CodecKind::HEVC) {
             hr = tmp.ParseHvcCExtradata(hdr.data(), hdr.size());
-        }
-        if (FAILED(hr)) {
-            /* Don't reject the type just because extradata is malformed —
-             * many sources put SPS/PPS inline. Phase 2B will re-validate
-             * once it sees the first slice. Log via debug only. */
         } else {
-            annexb     = std::move(tmp.extradata_annexb_);
+            continue;
+        }
+        if (SUCCEEDED(hr)) {
+            annexb      = std::move(tmp.extradata_annexb_);
             length_size = tmp.length_size_;
         }
+        /* Failure on this key is silently ignored — try the next, or
+         * fall through to inline-SPS handling. */
     }
 
     if (flags & MFT_SET_TYPE_TEST_ONLY) return S_OK;
@@ -349,6 +385,198 @@ STDMETHODIMP DecoderMFT::SetInputType(DWORD id, IMFMediaType *type, DWORD flags)
     fps_den_          = fd;
     extradata_annexb_ = std::move(annexb);
     length_size_      = length_size;
+
+    /* Resolve colour metadata for the output type.  Order:
+     *   1. Upstream demuxer attributes on the input type (highest signal).
+     *   2. H.264 VUI in the avcC SPS (now parsed in extradata).
+     *   3. Resolution heuristic: HD (>=720) → BT.709, SD → BT.601.
+     * Range defaults to limited (16..235); H.264 VUI overrides if it
+     * carries video_full_range_flag. */
+    yuv_matrix_         = 0;
+    video_primaries_    = 0;
+    transfer_function_  = 0;
+    nominal_range_      = 0;
+    bit_depth_          = 8;
+    (void)type->GetUINT32(MF_MT_YUV_MATRIX,         &yuv_matrix_);
+    (void)type->GetUINT32(MF_MT_VIDEO_PRIMARIES,    &video_primaries_);
+    (void)type->GetUINT32(MF_MT_TRANSFER_FUNCTION,  &transfer_function_);
+    (void)type->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE,&nominal_range_);
+
+    if (kind_ == CodecKind::AV1) {
+        /* Pick bit-depth before the first sample so mft_play's
+         * GetOutputAvailableType probe right after SetInputType lands
+         * on P010 (a host that picks NV12 there locks the whole
+         * downstream chain to 8-bit even if the in-band seq_hdr later
+         * has hbd=1).  The engine itself still consumes seq_hdr from
+         * the OBU stream — this is detection only.
+         *
+         * Two delivery formats observed in the wild for AV1:
+         *   (a) av1C AV1CodecConfigurationRecord (ISO 14496-31 §2.2.1):
+         *         byte 0: marker(1)=1 | version(7)=1   (≥ 0x80)
+         *         byte 1: seq_profile(3) | seq_level_idx_0(5)
+         *         byte 2: seq_tier_0(1) | high_bitdepth(1) | twelve_bit(1) | ...
+         *   (b) raw OBU sequence_header (some MF MKV / DMF sources):
+         *         byte 0: OBU header — obu_type(4)=1 in bits 6:3
+         *                 → byte0 & 0x78 == 0x08
+         *         then a leb128 size, then the seq_hdr OBU payload.
+         * Probe several keys; pick the first plausible match. */
+        const GUID kKeys[2] = {
+            MF_MT_MPEG_SEQUENCE_HEADER,
+            MF_MT_USER_DATA,
+        };
+        for (const GUID &key : kKeys) {
+            UINT32 av1c_len = 0;
+            if (FAILED(type->GetBlobSize(key, &av1c_len)) || av1c_len < 3) continue;
+            std::vector<uint8_t> blob(av1c_len);
+            if (FAILED(type->GetBlob(key, blob.data(), av1c_len, nullptr))) continue;
+
+            std::fprintf(stderr,
+                "rkmpp MFT: AV1 extradata len=%u, first 8:", av1c_len);
+            for (UINT32 i = 0; i < (av1c_len < 8 ? av1c_len : 8u); i++)
+                std::fprintf(stderr, " %02x", blob[i]);
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+
+            /* Form (a): av1C box body. */
+            if ((blob[0] & 0x80) /* marker */ && (blob[0] & 0x7F) == 1 /* version */) {
+                bool high_bitdepth = (blob[2] & 0x40) != 0;
+                bool twelve_bit    = (blob[2] & 0x20) != 0;
+                if (high_bitdepth && !twelve_bit) bit_depth_ = 10;
+                std::fprintf(stderr,
+                    "rkmpp MFT: av1C parse → high_bitdepth=%d twelve_bit=%d bit_depth=%u\n",
+                    high_bitdepth, twelve_bit, bit_depth_);
+                std::fflush(stderr);
+                break;
+            }
+
+            /* Form (b): raw OBU sequence_header.  Skip OBU header byte
+             * + leb128 size, then call the existing parser. */
+            uint8_t obu_type = (uint8_t)((blob[0] >> 3) & 0xF);
+            bool    has_size = (blob[0] & 0x02) != 0;
+            if (obu_type == 1 /* OBU_SEQUENCE_HEADER */) {
+                size_t off = 1;
+                if (has_size) {
+                    /* leb128 — at most 8 bytes; the seq_hdr is short. */
+                    size_t leb = 0;
+                    while (off < blob.size() && leb < 8) {
+                        bool more = (blob[off] & 0x80) != 0;
+                        off++; leb++;
+                        if (!more) break;
+                    }
+                }
+                if (off < blob.size()) {
+                    Dav1dSequenceHeader seq{};
+                    int prc = Av1ParseSeqHeader(blob.data() + off,
+                                                blob.size() - off, &seq);
+                    if (prc == 0 && seq.hbd) bit_depth_ = 10;
+                    std::fprintf(stderr,
+                        "rkmpp MFT: raw seq_hdr parse rc=%d hbd=%d bit_depth=%u\n",
+                        prc, seq.hbd, bit_depth_);
+                    std::fflush(stderr);
+                }
+                break;
+            }
+        }
+    }
+
+    if (kind_ == CodecKind::HEVC && !extradata_annexb_.empty()) {
+        /* Parse the hvcC SPS NAL out of extradata to extract bit-depth.
+         * Drives NV12-vs-P010 output choice in BuildOutputType for HEVC
+         * Main10 streams.  Use a temporary parse result so we don't
+         * disturb engine state; H265ParseResultInit zero-initialises. */
+        H265ParseResult tmp{};
+        H265ParseResultInit(&tmp);
+        std::vector<uint8_t> scratch(extradata_annexb_.size() * 2 + 64);
+        H265ParseStatus s = H265ParseAccessUnit(
+            extradata_annexb_.data(), extradata_annexb_.size(),
+            scratch.data(), scratch.size(), &tmp);
+        if ((s == H265_PARSE_OK || s == H265_PARSE_NEED_MORE) &&
+            tmp.active_sps_id >= 0 &&
+            tmp.sps[tmp.active_sps_id].valid &&
+            tmp.sps[tmp.active_sps_id].bit_depth_luma_minus8 == 2) {
+            bit_depth_ = 10;
+        }
+    }
+
+    if (kind_ == CodecKind::H264 && !extradata_annexb_.empty()) {
+        H264ParseResult vui{};
+        std::vector<uint8_t> scratch(extradata_annexb_.size() * 2 + 64);
+        H264ParseStatus s = H264ParseAccessUnit(
+            extradata_annexb_.data(), extradata_annexb_.size(),
+            scratch.data(), scratch.size(), &vui);
+        if ((s == H264_PARSE_OK || s == H264_PARSE_NEED_MORE) && vui.has_sps) {
+            /* Bit-depth from the extradata SPS — drives NV12-vs-P010
+             * output-type choice in BuildOutputType.  High-profile
+             * streams set bit_depth_luma_minus8 (== 2 for 10-bit); for
+             * baseline/main streams the parser pins it to 0 (8-bit). */
+            if (vui.sps.bit_depth_luma_minus8 == 2)
+                bit_depth_ = 10;
+            if (vui.has_vui_colour) {
+                if (nominal_range_ == 0)
+                    nominal_range_ = vui.vui_full_range_flag
+                                   ? MFNominalRange_0_255
+                                   : MFNominalRange_16_235;
+                if (vui.has_vui_colour_desc) {
+                    /* H.264 Table E-3 colour_primaries → MFVideoPrimaries */
+                    if (video_primaries_ == 0) {
+                        switch (vui.vui_colour_primaries) {
+                        case 1:  video_primaries_ = MFVideoPrimaries_BT709;       break;
+                        case 4:  video_primaries_ = MFVideoPrimaries_BT470_2_SysM;break;
+                        case 5:  video_primaries_ = MFVideoPrimaries_BT470_2_SysBG;break;
+                        case 6:  video_primaries_ = MFVideoPrimaries_SMPTE170M;   break;
+                        case 7:  video_primaries_ = MFVideoPrimaries_SMPTE240M;   break;
+                        case 9:  video_primaries_ = MFVideoPrimaries_BT2020;      break;
+                        default: break;
+                        }
+                    }
+                    /* Table E-4 transfer_characteristics → MFVideoTransFunc */
+                    if (transfer_function_ == 0) {
+                        switch (vui.vui_transfer_characteristics) {
+                        case 1:  case 6:
+                                 transfer_function_ = MFVideoTransFunc_709;   break;
+                        case 4:  transfer_function_ = MFVideoTransFunc_22;    break;
+                        case 5:  transfer_function_ = MFVideoTransFunc_28;    break;
+                        case 7:  transfer_function_ = MFVideoTransFunc_240M;  break;
+                        case 8:  transfer_function_ = MFVideoTransFunc_10;    break;
+                        case 11: transfer_function_ = MFVideoTransFunc_sRGB;  break;
+                        case 13: transfer_function_ = MFVideoTransFunc_sRGB;  break;
+                        case 16: transfer_function_ = MFVideoTransFunc_2084;  break;
+                        default: break;
+                        }
+                    }
+                    /* Table E-5 matrix_coefficients → MFVideoTransferMatrix */
+                    if (yuv_matrix_ == 0) {
+                        switch (vui.vui_matrix_coefficients) {
+                        case 1:  yuv_matrix_ = MFVideoTransferMatrix_BT709;    break;
+                        case 6:  yuv_matrix_ = MFVideoTransferMatrix_BT601;    break;
+                        case 7:  yuv_matrix_ = MFVideoTransferMatrix_SMPTE240M;break;
+                        case 9:  yuv_matrix_ = MFVideoTransferMatrix_BT2020_10;break;
+                        default: break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Resolution heuristic backstop. */
+    if (yuv_matrix_ == 0)
+        yuv_matrix_ = (height_ >= 720) ? MFVideoTransferMatrix_BT709
+                                       : MFVideoTransferMatrix_BT601;
+    if (video_primaries_ == 0)
+        video_primaries_ = (height_ >= 720) ? MFVideoPrimaries_BT709
+                                            : MFVideoPrimaries_SMPTE170M;
+    if (transfer_function_ == 0)
+        transfer_function_ = (height_ >= 720) ? MFVideoTransFunc_709
+                                              : MFVideoTransFunc_22;
+    if (nominal_range_ == 0)
+        nominal_range_ = MFNominalRange_16_235;
+
+    std::fprintf(stderr,
+        "rkmpp MFT: SetInputType end — bit_depth=%u, extradata_annexb=%zu bytes\n",
+        bit_depth_, extradata_annexb_.size());
+    std::fflush(stderr);
+
     return S_OK;
 }
 
@@ -356,8 +584,17 @@ HRESULT DecoderMFT::BuildOutputType(IMFMediaType **pp) {
     IMFMediaType *t = nullptr;
     HRESULT hr = MFCreateMediaType(&t);
     if (FAILED(hr)) return hr;
+    /* 10-bit streams → P010 (2 bytes/sample, 10 valid bits in upper 10
+     * of 16); 8-bit → NV12.  Sample size + default stride track the
+     * subtype: P010 doubles both vs NV12.  Engine emits one or the
+     * other based on the parsed SPS bit-depth on every frame. */
+    const bool is_p010 = (bit_depth_ == 10);
+    const GUID &subtype = is_p010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
+    const UINT32 bytes_per_sample = is_p010 ? 2u : 1u;
+    const UINT32 sample_size = width_ * height_ * 3u / 2u * bytes_per_sample;
+    const UINT32 default_stride = width_ * bytes_per_sample;
     hr = t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    if (SUCCEEDED(hr)) hr = t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    if (SUCCEEDED(hr)) hr = t->SetGUID(MF_MT_SUBTYPE, subtype);
     if (SUCCEEDED(hr)) hr = MFSetAttributeSize(t, MF_MT_FRAME_SIZE, width_, height_);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(t, MF_MT_FRAME_RATE, fps_num_, fps_den_);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(t, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -367,14 +604,20 @@ HRESULT DecoderMFT::BuildOutputType(IMFMediaType **pp) {
      * padding) and ends up reading UV from the wrong offsets — UV reads
      * as zeros from the trailing portion of the buffer, producing green
      * frames with partial Y bleed. Pin all the layout attributes
-     * EVR/sink stack expects. */
-    if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32)width_);
-    if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_SAMPLE_SIZE,
-                                         (UINT32)(width_ * height_ * 3 / 2));
+     * EVR/sink stack expects.  P010 uses 2-byte samples but is otherwise
+     * laid out identically. */
+    if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_DEFAULT_STRIDE, default_stride);
+    if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_SAMPLE_SIZE, sample_size);
     if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
     if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-    if (SUCCEEDED(hr)) hr = t->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE,
-                                         MFNominalRange_16_235);
+    if (SUCCEEDED(hr) && nominal_range_)
+        hr = t->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE,    nominal_range_);
+    if (SUCCEEDED(hr) && yuv_matrix_)
+        hr = t->SetUINT32(MF_MT_YUV_MATRIX,             yuv_matrix_);
+    if (SUCCEEDED(hr) && video_primaries_)
+        hr = t->SetUINT32(MF_MT_VIDEO_PRIMARIES,        video_primaries_);
+    if (SUCCEEDED(hr) && transfer_function_)
+        hr = t->SetUINT32(MF_MT_TRANSFER_FUNCTION,      transfer_function_);
     if (FAILED(hr)) { t->Release(); return hr; }
     *pp = t;
     return S_OK;
@@ -401,7 +644,15 @@ STDMETHODIMP DecoderMFT::SetOutputType(DWORD id, IMFMediaType *type, DWORD flags
     GUID major = {}, sub = {};
     if (FAILED(type->GetGUID(MF_MT_MAJOR_TYPE, &major)) || major != MFMediaType_Video)
         return MF_E_INVALIDMEDIATYPE;
-    if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &sub)) || sub != MFVideoFormat_NV12)
+    if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &sub)))
+        return MF_E_INVALIDMEDIATYPE;
+    /* Accept NV12 for 8-bit streams, P010 for 10-bit.  Reject the
+     * cross-product so consumers can't pick NV12 on a 10-bit stream
+     * (which would mean reading NV15 stride from a uint8 buffer
+     * sized for NV12 — guaranteed corruption). */
+    const bool is_p010 = (bit_depth_ == 10);
+    const GUID &expected = is_p010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
+    if (sub != expected)
         return MF_E_INVALIDMEDIATYPE;
     UINT32 w = 0, h = 0;
     if (FAILED(MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h)) ||
@@ -751,6 +1002,16 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
         int rc = Av1DecodeEngine_Submit(eng, au.data(), au.size(),
                                         (int64_t)pts);
         if (rc != 0) decode_errors_++;
+        /* Refresh bit_depth_ from the engine's cached sequence header.
+         * AV1 has no separate container extradata — seq_hdr arrives in
+         * the bitstream itself, so bit-depth is only knowable after the
+         * first OBU temporal unit is parsed.  Drives NV12-vs-P010
+         * output-type choice; ProcessOutput's size guard also self-
+         * corrects from the actual frame size. */
+        if (rc == 0 && eng->seq_hdr_valid &&
+            eng->cached_seq_hdr.hbd && bit_depth_ != 10) {
+            bit_depth_ = 10;
+        }
         return S_OK;
     }
 
@@ -850,6 +1111,29 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
         /* Don't fail the whole pipeline; report success but produce
          * nothing — the host calls ProcessOutput separately. */
     }
+    /* Refresh bit_depth_ from the engine's parsed SPS after the first
+     * successful submit.  For streams that carry SPS in container
+     * extradata (avcC), bit_depth_ was already set in SetInputType.
+     * For Annex-B streams with inline SPS (mft_decode harness, MPEG-TS
+     * sources, etc.) the SPS only becomes visible here — and without
+     * this refresh, ProcessOutput's expected-size check would reject
+     * every 10-bit frame as oversized (engine emits P010; MFT thinks
+     * NV12).  Output type stays as already-negotiated NV12 for inline
+     * streams; sample bytes still flow through correctly because
+     * GetOutputStreamInfo / sysmem allocation here uses bit_depth_,
+     * not the negotiated type. */
+    if (kind_ == CodecKind::H264 && rc == 0 &&
+        eng->parsed_h264.has_sps &&
+        eng->parsed_h264.sps.bit_depth_luma_minus8 == 2 &&
+        bit_depth_ != 10) {
+        bit_depth_ = 10;
+    }
+    if (kind_ == CodecKind::HEVC && rc == 0 &&
+        eng->parsed_h265.active_sps_id >= 0) {
+        const auto &sps = eng->parsed_h265.sps[eng->parsed_h265.active_sps_id];
+        if (sps.valid && sps.bit_depth_luma_minus8 == 2 && bit_depth_ != 10)
+            bit_depth_ = 10;
+    }
     (void)dur;
     return S_OK;
 }
@@ -934,12 +1218,20 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
             }
             mbuf->SetCurrentLength((DWORD)frame.yuv.size());
         } else {
-            const DWORD y_bytes    = (DWORD)width_ * height_;
-            const DWORD nv12_bytes = y_bytes + (DWORD)width_ * (height_ / 2u);
+            // Bit-depth-aware sizing: P010 doubles every byte count and
+            // stride vs NV12.  The engine has already repacked into
+            // frame.yuv at the target format (NV12 or P010) — use its
+            // size as the source of truth rather than recomputing.
+            const UINT  bytes_per_sample = (bit_depth_ == 10) ? 2u : 1u;
+            const DWORD row_bytes  = (DWORD)width_ * bytes_per_sample;
+            const DWORD y_bytes    = row_bytes * height_;
+            const DWORD plane_bytes = (DWORD)frame.yuv.size();
             const bool  use_2d     = (dxgi_manager_ != nullptr);
             if (use_2d) {
-                hr = MFCreate2DMediaBuffer(width_, height_,
-                                           MAKEFOURCC('N','V','1','2'),
+                const DWORD fourcc = (bit_depth_ == 10)
+                                     ? MAKEFOURCC('P','0','1','0')
+                                     : MAKEFOURCC('N','V','1','2');
+                hr = MFCreate2DMediaBuffer(width_, height_, fourcc,
                                            FALSE, &mbuf);
                 if (FAILED(hr)) { Av1DecodeEngine_ReleaseFrame(eng, &frame); return hr; }
                 IMF2DBuffer *buf2d = nullptr;
@@ -960,16 +1252,18 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
                 const uint8_t *src_y  = frame.yuv.data();
                 const uint8_t *src_uv = src_y + (size_t)y_bytes;
                 for (UINT32 r = 0; r < height_; r++)
-                    std::memcpy(dst + (size_t)r * pitch, src_y + (size_t)r * width_, width_);
+                    std::memcpy(dst + (size_t)r * pitch,
+                                src_y + (size_t)r * row_bytes, row_bytes);
                 BYTE *dst_uv = dst + (size_t)pitch * height_;
                 for (UINT32 r = 0; r < height_ / 2; r++)
-                    std::memcpy(dst_uv + (size_t)r * pitch, src_uv + (size_t)r * width_, width_);
+                    std::memcpy(dst_uv + (size_t)r * pitch,
+                                src_uv + (size_t)r * row_bytes, row_bytes);
                 if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
                 buf2d->Unlock2D();
                 buf2d->Release();
-                mbuf->SetCurrentLength(nv12_bytes);
+                mbuf->SetCurrentLength(plane_bytes);
             } else {
-                hr = MFCreateMemoryBuffer(nv12_bytes, &mbuf);
+                hr = MFCreateMemoryBuffer(plane_bytes, &mbuf);
                 if (FAILED(hr)) { Av1DecodeEngine_ReleaseFrame(eng, &frame); return hr; }
                 BYTE *dst = nullptr; DWORD cap = 0, cur = 0;
                 hr = mbuf->Lock(&dst, &cap, &cur);
@@ -979,10 +1273,10 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
                     return hr;
                 }
                 int64_t cp_t0 = MftTimingEnabled() ? MftQpcNow() : 0;
-                std::memcpy(dst, frame.yuv.data(), nv12_bytes);
+                std::memcpy(dst, frame.yuv.data(), plane_bytes);
                 if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
                 mbuf->Unlock();
-                mbuf->SetCurrentLength(nv12_bytes);
+                mbuf->SetCurrentLength(plane_bytes);
             }
         }
 
@@ -1089,14 +1383,29 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
      * allocator would hand back a region that recently held a prior
      * IMFMediaBuffer — visible to EVR as a previous-frame flash.  Skip
      * emission instead so the worst case is a missed frame, not a
-     * delivered-but-wrong frame. */
+     * delivered-but-wrong frame.
+     *
+     * Derive bit_depth_ from the actual frame size the engine emitted
+     * rather than checking against a precomputed expected size: MF's
+     * topology resolver can call SetInputType multiple times during
+     * negotiation, and a transient call without MF_MT_MPEG_SEQUENCE_HEADER
+     * would reset bit_depth_ to 8 — without this self-correction, every
+     * P010 frame would be rejected by the size guard.  The engine is
+     * the source of truth for bit-depth (it parses the inline SPS on
+     * every AU); resync bit_depth_ to match what it actually produced. */
     {
-        const size_t expected = (size_t)width_ * height_ * 3u / 2u;
-        if (frame.yuv.size() != expected) {
+        const size_t nv12_sz = (size_t)width_ * height_ * 3u / 2u;
+        const size_t p010_sz = nv12_sz * 2u;
+        const size_t actual  = frame.yuv.size();
+        if (actual == p010_sz) {
+            bit_depth_ = 10;
+        } else if (actual == nv12_sz) {
+            bit_depth_ = 8;
+        } else {
             std::fprintf(stderr,
-                "rkmpp MFT: skipping output — yuv size %zu != expected %zu "
-                "(slot=%d poc=%d pts=%lld)\n",
-                frame.yuv.size(), expected, frame.slot_idx, frame.poc,
+                "rkmpp MFT: skipping output — yuv size %zu matches neither "
+                "NV12 (%zu) nor P010 (%zu) (slot=%d poc=%d pts=%lld)\n",
+                actual, nv12_sz, p010_sz, frame.slot_idx, frame.poc,
                 (long long)frame.pts_hns);
             std::fflush(stderr);
             DecodeEngine_ReleaseFrame(eng, &frame);
@@ -1160,9 +1469,14 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
         }
     }
 
+    /* P010 doubles row pitch + sample size vs NV12; subresource layout
+     * (Y at 0, interleaved UV at 1) and pixel topology (4:2:0) are
+     * otherwise identical, so the D3D11 / 2D-buffer / 1D-buffer paths
+     * below all scale uniformly with bytes_per_sample. */
+    const UINT bytes_per_sample = (bit_depth_ == 10) ? 2u : 1u;
     if (use_d3d && width_ && height_) {
-        /* D3D11 output path: allocate an NV12 ID3D11Texture2D, copy
-         * the engine's NV12 frame into it via Map() (works on WARP and
+        /* D3D11 output path: allocate an NV12/P010 ID3D11Texture2D, copy
+         * the engine's frame into it via Map() (works on WARP and
          * on hypothetical real hardware alike since the decoder still
          * lives in CPU-allocated rkmpp DMA buffers), and wrap via
          * MFCreateDXGISurfaceBuffer.
@@ -1179,7 +1493,7 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
         td.Height             = height_;
         td.MipLevels          = 1;
         td.ArraySize          = 1;
-        td.Format             = DXGI_FORMAT_NV12;
+        td.Format             = (bit_depth_ == 10) ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
         td.SampleDesc.Count   = 1;
         td.Usage              = D3D11_USAGE_DEFAULT;
         td.BindFlags          = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
@@ -1195,17 +1509,17 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
             if (FAILED(hr)) return hr;
         }
 
-        /* Stage upload via UpdateSubresource.  NV12 in D3D11 has TWO
-         * subresources per array slice: Y at index 0 (width × height,
-         * row pitch = width), UV at index 1 (width × height/2 with
-         * interleaved CbCr, row pitch = width).  Updating only
-         * subresource 0 leaves the UV plane uninitialised → green
-         * frames in EVR (chroma defaults to neutral, but the texture's
-         * uninit memory shows as green/random on real GPUs).
+        /* Stage upload via UpdateSubresource.  NV12/P010 in D3D11 has
+         * TWO subresources per array slice: Y at index 0 (width × height,
+         * row pitch = width × bytes_per_sample), UV at index 1
+         * (width × height/2 interleaved CbCr).  Updating only subresource
+         * 0 leaves the UV plane uninitialised → green frames in EVR
+         * (chroma defaults to neutral, but the texture's uninit memory
+         * shows as green/random on real GPUs).
          *
          * Source buffer layout: contiguous Y followed by UV at offset
-         * width * height. */
-        const UINT row_pitch = width_;
+         * width * height * bytes_per_sample. */
+        const UINT row_pitch = width_ * bytes_per_sample;
         d3d_context_->UpdateSubresource(texture, 0, nullptr,
                                         frame.yuv.data(),
                                         row_pitch,
@@ -1244,13 +1558,16 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
          * IMF2DBuffer pitch may exceed width_ for hardware alignment,
          * so the copy is row-by-row from our packed `frame.yuv` source
          * into the 2D buffer's possibly-padded layout. */
-        const DWORD y_bytes  = (DWORD)width_ * height_;
-        const DWORD uv_bytes = (DWORD)width_ * (height_ / 2u);
-        const DWORD nv12_bytes = y_bytes + uv_bytes;
+        const DWORD row_bytes = (DWORD)width_ * bytes_per_sample;
+        const DWORD y_bytes   = row_bytes * height_;
+        const DWORD uv_bytes  = row_bytes * (height_ / 2u);
+        const DWORD plane_bytes = y_bytes + uv_bytes;
         const bool  use_2d   = (dxgi_manager_ != nullptr);
         if (use_2d) {
-            hr = MFCreate2DMediaBuffer(width_, height_,
-                                       MAKEFOURCC('N','V','1','2'),
+            const DWORD fourcc = (bit_depth_ == 10)
+                ? MAKEFOURCC('P','0','1','0')
+                : MAKEFOURCC('N','V','1','2');
+            hr = MFCreate2DMediaBuffer(width_, height_, fourcc,
                                        FALSE /* top-down */,
                                        &mbuf);
             if (FAILED(hr)) return hr;
@@ -1264,27 +1581,27 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
             const uint8_t *src_y  = frame.yuv.data();
             const uint8_t *src_uv = src_y + (size_t)y_bytes;
             for (UINT32 r = 0; r < height_; r++) {
-                std::memcpy(dst + (size_t)r * pitch, src_y + (size_t)r * width_, width_);
+                std::memcpy(dst + (size_t)r * pitch, src_y + (size_t)r * row_bytes, row_bytes);
             }
             BYTE *dst_uv = dst + (size_t)pitch * height_;
             for (UINT32 r = 0; r < height_ / 2; r++) {
-                std::memcpy(dst_uv + (size_t)r * pitch, src_uv + (size_t)r * width_, width_);
+                std::memcpy(dst_uv + (size_t)r * pitch, src_uv + (size_t)r * row_bytes, row_bytes);
             }
             if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
             buf2d->Unlock2D();
             buf2d->Release();
-            mbuf->SetCurrentLength(nv12_bytes);
+            mbuf->SetCurrentLength(plane_bytes);
         } else {
-            hr = MFCreateMemoryBuffer(nv12_bytes, &mbuf);
+            hr = MFCreateMemoryBuffer(plane_bytes, &mbuf);
             if (FAILED(hr)) return hr;
             BYTE *dst = nullptr; DWORD cap = 0, cur = 0;
             hr = mbuf->Lock(&dst, &cap, &cur);
             if (FAILED(hr)) { mbuf->Release(); return hr; }
             int64_t cp_t0 = MftTimingEnabled() ? MftQpcNow() : 0;
-            std::memcpy(dst, frame.yuv.data(), nv12_bytes);
+            std::memcpy(dst, frame.yuv.data(), plane_bytes);
             if (MftTimingEnabled()) mft_copy_us = MftQpcUs(cp_t0, MftQpcNow());
             mbuf->Unlock();
-            mbuf->SetCurrentLength(nv12_bytes);
+            mbuf->SetCurrentLength(plane_bytes);
         }
     }
 

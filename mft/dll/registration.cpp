@@ -74,14 +74,20 @@ static HRESULT DeleteClsidRegistry(REFGUID clsid) {
 
 static HRESULT RegisterOne(CodecKind kind) {
     MFT_REGISTER_TYPE_INFO in  = { MFMediaType_Video, DecoderInputSubtype(kind) };
-    MFT_REGISTER_TYPE_INFO out = { MFMediaType_Video, MFVideoFormat_NV12 };
+    /* Advertise both NV12 (8-bit streams) and P010 (10-bit High 10
+     * H.264 / HEVC Main10).  The MFT picks per-stream which one to
+     * surface from BuildOutputType once the SPS bit-depth is known. */
+    MFT_REGISTER_TYPE_INFO out[] = {
+        { MFMediaType_Video, MFVideoFormat_NV12 },
+        { MFMediaType_Video, MFVideoFormat_P010 },
+    };
     return MFTRegister(
         DecoderClsid(kind),
         MFT_CATEGORY_VIDEO_DECODER,
         const_cast<LPWSTR>(DecoderFriendlyName(kind)),
         MFT_ENUM_FLAG_SYNCMFT,
         1, &in,
-        1, &out,
+        (UINT32)(sizeof(out) / sizeof(out[0])), out,
         nullptr);
 }
 

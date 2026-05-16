@@ -1,6 +1,6 @@
 /* tests/harness/regbuilder_test/regbuilder_test.cpp
  *
- * Synthetic V4L2 controls + canned buffer handles → register list.
+ * Synthetic V4L2 controls + canned buffer handles → dense bank.
  * Asserts the right registers get written with the right plain values
  * and that DMA address registers carry the expected BufferHandle for
  * iova substitution at submit time.
@@ -17,11 +17,21 @@
                    std::printf(__VA_ARGS__); std::printf("\n"); return 1; } \
 } while (0)
 
-/* Find the first emitted write at `off`. */
-static const RKMPP_REG_WRITE* FindReg(const H264RegWriteList &list, uint32_t off)
+/* Return the bank value at swreg byte offset `off`, or 0 if the offset
+ * doesn't land in a covered bank. */
+static uint32_t BankValueAt(const H26xDenseOutput &out, uint32_t off)
 {
-    for (uint32_t i = 0; i < list.count; i++) {
-        if (list.entries[i].Offset == off) return &list.entries[i];
+    uint32_t *p = H26xDenseSlotFor(const_cast<H26xDenseOutput *>(&out), off);
+    return p ? *p : 0u;
+}
+
+/* Find the (first) iova slot targeting reg byte offset `off`. */
+static const RKMPP_DENSE_IOVA_SLOT*
+FindIovaSlot(const H26xDenseOutput &out, uint32_t off)
+{
+    uint32_t idx = off / 4u;
+    for (uint32_t i = 0; i < out.IovaSlotCount; i++) {
+        if (out.IovaSlots[i].RegIdx == idx) return &out.IovaSlots[i];
     }
     return nullptr;
 }
@@ -60,70 +70,67 @@ int main()
     bufs.error_ref        = 0xAA00000000000004ULL;
     /* RCB scratch all zero — should be skipped. */
 
-    H264RegWriteList list{};
-    H264RegBuildStatus s = H264BuildRegisterList(&parsed, &bufs, /*pic_idx=*/0, &list);
+    H26xDenseOutput dense{};
+    H264RegBuildStatus s = H264BuildDenseRegs(&parsed, &bufs, /*pic_idx=*/0, &dense);
     EXPECT(s == H264_REGBUILD_OK, "build status %d", (int)s);
-    EXPECT(list.count > 0,         "no writes emitted");
-    EXPECT(list.count <= RKMPP_MAX_REG_WRITES, "overflow: %u", list.count);
 
     /* Common-bank essentials. */
-    auto *r = FindReg(list, RKVDEC2_REG_DEC_MODE);
-    EXPECT(r && r->Value == 1u, "dec_mode wrong");
+    EXPECT(BankValueAt(dense, RKVDEC2_REG_DEC_MODE) == 1u, "dec_mode wrong");
+    EXPECT(BankValueAt(dense, RKVDEC2_REG_STR_LEN) == 0x40u,
+           "str_len got 0x%x", BankValueAt(dense, RKVDEC2_REG_STR_LEN));
+    EXPECT((BankValueAt(dense, RKVDEC2_REG_ERROR_MODE) &
+            RKVDEC2_CUR_PIC_IS_IDR) != 0u, "cur_pic_is_idr not set");
 
-    r = FindReg(list, RKVDEC2_REG_STR_LEN);
-    EXPECT(r && r->Value == 0x40u, "str_len got 0x%x", r ? r->Value : 0);
+    /* Codec params.  reg64 stays at zero — BSP H.264 capture shows
+     * reg64=0 (the FIRSTSLICE_FLAG isn't programmed from user-mode). */
+    EXPECT(BankValueAt(dense, RKVDEC2_REG_H264_FLAGS) == 0u,
+           "reg64 should be zero, got 0x%x",
+           BankValueAt(dense, RKVDEC2_REG_H264_FLAGS));
+    EXPECT(BankValueAt(dense, RKVDEC2_REG_CUR_TOP_POC) == 0x12345678u,
+           "top POC got 0x%x", BankValueAt(dense, RKVDEC2_REG_CUR_TOP_POC));
 
-    r = FindReg(list, RKVDEC2_REG_ERROR_MODE);
-    EXPECT(r && (r->Value & RKVDEC2_CUR_PIC_IS_IDR),
-           "cur_pic_is_idr not set");
-
-    /* Codec params. */
-    r = FindReg(list, RKVDEC2_REG_H264_FLAGS);
-    EXPECT(r && (r->Value & RKVDEC2_H264_FIRSTSLICE_FLAG),
-           "firstslice flag missing");
-
-    r = FindReg(list, RKVDEC2_REG_CUR_TOP_POC);
-    EXPECT(r && r->Value == 0x12345678u, "top POC got 0x%x", r ? r->Value : 0);
-
-    /* Address regs carry buffer handles for kernel iova substitution. */
-    r = FindReg(list, RKVDEC2_REG_RLC_BASE);
-    EXPECT(r && r->BufferHandle == bufs.bitstream &&
-                r->IovaOffset   == bufs.bitstream_offset,
+    /* Address regs are recorded as iova slots — bank slot stays zero,
+     * kernel substitutes at submit time. */
+    auto *iv = FindIovaSlot(dense, RKVDEC2_REG_RLC_BASE);
+    EXPECT(iv && iv->BufferHandle == bufs.bitstream &&
+                  iv->IovaOffset   == bufs.bitstream_offset,
            "RLC handle/offset wrong: h=%llx off=%u",
-           (unsigned long long)(r ? r->BufferHandle : 0),
-           r ? r->IovaOffset : 0);
+           (unsigned long long)(iv ? iv->BufferHandle : 0),
+           iv ? iv->IovaOffset : 0);
+    EXPECT(BankValueAt(dense, RKVDEC2_REG_RLC_BASE) == 0u,
+           "RLC bank slot should be 0 pre-substitution");
 
-    r = FindReg(list, RKVDEC2_REG_DECOUT_BASE);
-    EXPECT(r && r->BufferHandle == bufs.output_frame,
+    iv = FindIovaSlot(dense, RKVDEC2_REG_DECOUT_BASE);
+    EXPECT(iv && iv->BufferHandle == bufs.output_frame,
            "DECOUT handle wrong");
 
-    r = FindReg(list, RKVDEC2_REG_COLMV_CUR_BASE);
-    EXPECT(r && r->BufferHandle == bufs.colmv_cur, "COLMV_CUR handle wrong");
+    iv = FindIovaSlot(dense, RKVDEC2_REG_COLMV_CUR_BASE);
+    EXPECT(iv && iv->BufferHandle == bufs.colmv_cur,
+           "COLMV_CUR handle wrong");
 
-    /* RCB scratch buffers were zero — must NOT have been emitted. */
-    EXPECT(FindReg(list, RKVDEC2_REG_RCB_BASE_FIRST) == nullptr,
+    /* RCB scratch buffers were zero — should not be recorded as iova slots. */
+    EXPECT(FindIovaSlot(dense, RKVDEC2_REG_RCB_BASE_FIRST) == nullptr,
            "RCB[0] emitted with zero handle");
 
-    /* Optional tables not provided — their regs should be absent. */
-    EXPECT(FindReg(list, RKVDEC2_REG_PPS_BASE)      == nullptr,
+    /* Optional tables not provided — no iova slot recorded. */
+    EXPECT(FindIovaSlot(dense, RKVDEC2_REG_PPS_BASE) == nullptr,
            "PPS emitted with zero handle");
-    EXPECT(FindReg(list, RKVDEC2_REG_CABACTBL_BASE) == nullptr,
+    EXPECT(FindIovaSlot(dense, RKVDEC2_REG_CABACTBL_BASE) == nullptr,
            "CABAC emitted with zero handle");
 
-    /* INT_EN intentionally NOT written by the regbuilder — see
-     * regbuilder_h264.cpp.  Hardware comes up with interrupts on; the
-     * kernel poller acks status bits after each kick. */
-    EXPECT(FindReg(list, RKVDEC2_REG_INT_EN) == nullptr,
-           "INT_EN should not be emitted");
-    /* Start bit. */
-    r = FindReg(list, RKVDEC2_REG_START_EN);
-    EXPECT(r && r->Value == RKVDEC2_DEC_E, "kick bit wrong");
+    /* INT_EN intentionally NOT written by the regbuilder.  Hardware
+     * comes up with interrupts on; the kernel poller acks status bits
+     * after each kick. */
+    EXPECT(BankValueAt(dense, RKVDEC2_REG_INT_EN) == 0u,
+           "INT_EN should not be set in bank");
 
-    /* Kick must be the very last entry — hardware latches addresses
-     * on the dec_e rising edge, so anything after it would be a bug. */
-    EXPECT(list.entries[list.count - 1].Offset == RKVDEC2_REG_START_EN,
-           "kick is not the final write (idx %u, off 0x%x)",
-           list.count - 1, list.entries[list.count - 1].Offset);
+    /* Kick bit goes into KickValue, not into the common bank slot.
+     * Common[idx 10] (i.e. byte offset 0x28) must stay zero so the
+     * kernel's bulk-write doesn't kick prematurely. */
+    EXPECT(dense.KickValue == RKVDEC2_DEC_E, "kick value wrong: 0x%x",
+           dense.KickValue);
+    EXPECT(BankValueAt(dense, RKVDEC2_REG_START_EN) == 0u,
+           "kick slot in bank must be zero (kernel writes it last)");
 
     /* CABAC stream without cabac_init buffer should fail explicitly. */
     {
@@ -131,12 +138,13 @@ int main()
         p2.pps.flags |= V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
         H264BufferRefs b2 = bufs;
         b2.cabac_init_table = 0;
-        H264RegWriteList l2{};
-        H264RegBuildStatus s2 = H264BuildRegisterList(&p2, &b2, 0, &l2);
+        H26xDenseOutput d2{};
+        H264RegBuildStatus s2 = H264BuildDenseRegs(&p2, &b2, 0, &d2);
         EXPECT(s2 == H264_REGBUILD_UNSUPPORTED,
                "CABAC w/o cabac_init didn't fail (got %d)", (int)s2);
     }
 
-    std::printf("regbuilder_test OK (%u writes)\n", list.count);
+    std::printf("regbuilder_test OK (%u iova slots, kick=0x%08x)\n",
+                dense.IovaSlotCount, dense.KickValue);
     return 0;
 }

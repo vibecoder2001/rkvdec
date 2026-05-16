@@ -131,6 +131,25 @@ private:
      * AVCC NALs. Default 4 (most common). */
     uint8_t     length_size_ = 4;
 
+    /* Colour metadata to advertise on the output media type.  Set in
+     * SetInputType from (a) input-type attributes if upstream demuxer
+     * supplied them, (b) parsed H.264 VUI in the avcC SPS otherwise,
+     * (c) resolution-based defaults (HD → BT.709, SD → BT.601, limited
+     * range) as a last resort.  Without these, mpv / EVR fall back to
+     * a hardcoded BT.601 default that mis-renders BT.709 content as
+     * shifted hue / "all colors wrong but image recognizable". */
+    UINT32      yuv_matrix_         = 0; /* MFVideoTransferMatrix_* */
+    UINT32      video_primaries_    = 0; /* MFVideoPrimaries_*      */
+    UINT32      transfer_function_  = 0; /* MFVideoTransFunc_*      */
+    UINT32      nominal_range_      = 0; /* MFNominalRange_*        */
+
+    /* Active bit-depth from the parsed SPS (8 or 10), captured in
+     * SetInputType from the avcC SPS (or in ProcessInput on first slice
+     * when the stream carries inline SPS).  Drives BuildOutputType's
+     * NV12-vs-P010 subtype choice + sample-size calc.  Defaults to 8 so
+     * unset streams keep the legacy NV12 output path. */
+    UINT32      bit_depth_          = 8;
+
     /* Phase 2B queue of input AUs (raw container payload bytes); pop,
      * AVCC→Annex-B convert, and feed to the engine on ProcessOutput. */
     std::vector<std::vector<uint8_t>> input_queue_;

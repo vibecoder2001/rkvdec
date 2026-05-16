@@ -304,6 +304,20 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
             *InFlightTimedOut = TRUE;
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                        "rkav1d: file-cleanup in-flight wait timed out\n");
+            /* Sever the in-flight job's references to the buffer-pool
+             * MDLs before the caller (EvtFileCleanup) runs BufFreeAll.
+             * The poller is still alive and will eventually call
+             * JobComplete, which dereferences these MDLs in
+             * KeFlushIoBuffers.  JobComplete already null-checks each
+             * field; q->Lock serializes against its acquisition of the
+             * same lock around the flushes. */
+            KeAcquireSpinLock(&q->Lock, &old);
+            if (q->InFlight == inFlight && inFlight->Owner == File) {
+                inFlight->OutputFrameMdl    = NULL;
+                inFlight->InternalOutputMdl = NULL;
+                inFlight->AuxOutputMdl      = NULL;
+            }
+            KeReleaseSpinLock(&q->Lock, old);
             /* Don't free the in-flight job here — the poller still owns
              * it and will eventually move it to Completed.  Leaking the
              * struct is acceptable; the alternative (freeing while the
@@ -335,6 +349,35 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
     }
 
     return STATUS_SUCCESS;
+}
+
+/* -----------------------------------------------------------------------
+ * RkMppJobQueueHasOtherOwner — TRUE when InFlight or Pending contains at
+ * least one job whose Owner is NOT `File`.  Used by EvtFileCleanup to
+ * decide whether session-close hygiene (IOMMU Reattach, etc.) is safe
+ * to run inline (no peer) or must be skipped (peer is decoding right
+ * now and would be disrupted).
+ * --------------------------------------------------------------------- */
+BOOLEAN
+RkMppJobQueueHasOtherOwner(_In_ WDFDEVICE Device, _In_ WDFFILEOBJECT File)
+{
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+    KIRQL old;
+    BOOLEAN otherActive = FALSE;
+
+    KeAcquireSpinLock(&q->Lock, &old);
+    if (q->InFlight && q->InFlight->Owner != File) {
+        otherActive = TRUE;
+    } else {
+        for (PLIST_ENTRY e = q->Pending.Flink;
+             e != &q->Pending;
+             e = e->Flink) {
+            RKMPP_JOB *cand = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+            if (cand->Owner != File) { otherActive = TRUE; break; }
+        }
+    }
+    KeReleaseSpinLock(&q->Lock, old);
+    return otherActive;
 }
 
 /* -----------------------------------------------------------------------
@@ -507,14 +550,21 @@ have_status:
              * writes through the NoC to DRAM.
              *
              * Bounds: minimum 200 µs (covers basic AXI BVALID round-
-             * trip), maximum 10000 µs (4K worst case with chains of
-             * alt-refs).  Step 100 µs per poll.  Require 5 consecutive
-             * equal reads (= 500 µs of unchanged counter) before
-             * declaring the engine idle.
+             * trip), maximum 20000 µs (4K + 10-bit worst case).
+             * Step 100 µs per poll.  Require 10 consecutive equal
+             * reads (= 1000 µs of unchanged counter) before declaring
+             * the engine idle — 5 reads was sometimes hitting a
+             * transient pipeline stall mid-frame on 10-bit content and
+             * exiting before the actual tail writes started.
              *
-             * After PERF_WORKING_CNT settles, an unconditional 1500 µs
+             * After PERF_WORKING_CNT settles, an unconditional 4000 µs
              * settle gives the AXI write channel time to retire the
-             * codec's last pixel writes through the NoC to DRAM. */
+             * codec's last pixel writes through the NoC to DRAM.  The
+             * 1500 µs we used for 8-bit AV1 raced the codec's tail on
+             * 10-bit (P010, 2× the bytes vs NV12) and produced a
+             * ~50×200-pixel stale-frame corner at the bottom right.
+             * Cost: 4 ms × 30 fps = 120 ms/sec extra wait, still
+             * inside frame budget at 30 fps. */
             {
                 volatile ULONG *perf_cnt =
                     (volatile ULONG *)((PUCHAR)mmio + ops->PerfWorkingCntOffset);
@@ -522,21 +572,18 @@ have_status:
                 ULONG prev = READ_REGISTER_ULONG(perf_cnt);
                 ULONG stable = 0;
                 ULONG total_us = 200;
-                while (total_us < 10000) {
+                while (total_us < 20000) {
                     KeStallExecutionProcessor(100);
                     total_us += 100;
                     ULONG cur = READ_REGISTER_ULONG(perf_cnt);
                     if (cur == prev) {
-                        if (++stable >= 5) break;
+                        if (++stable >= 10) break;
                     } else {
                         stable = 0;
                         prev = cur;
                     }
                 }
-                /* Unconditional final settle for the AXI/NoC write
-                 * channel.  Cost: 1.5 ms × 30 fps = 45 ms/sec extra
-                 * wait, well within frame budget. */
-                KeStallExecutionProcessor(1500);
+                KeStallExecutionProcessor(4000);
             }
         }
 
@@ -1128,20 +1175,35 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
      * DPB slots and eventually feeding the codec bad refs that wedge
      * the hardware.  STATUS_DEVICE_BUSY tells the caller to back off
      * and call IOCTL_RKMPP_WAIT_JOB before submitting more. */
-    enum { RKMPP_MAX_PENDING_JOBS = 8 };
+    /* Two-tier admission control:
+     *   - Per-device total cap (8): the existing hard backpressure
+     *     ceiling for the whole engine.
+     *   - Per-File cap (4): prevents one open handle from filling the
+     *     queue and starving a concurrent decode session on this same
+     *     engine.  Counts Pending + InFlight owned by this File so a
+     *     single greedy File can't have 4 pending + 1 in flight while
+     *     a peer File starves. */
+    enum {
+        RKMPP_MAX_PENDING_JOBS          = 8,
+        RKMPP_MAX_PENDING_JOBS_PER_FILE = 4,
+    };
     KIRQL oldIrql;
     KeAcquireSpinLock(&q->Lock, &oldIrql);
 
-    /* Count pending entries — list is short (capped here), no LIST_FOR_EACH
-     * macro on Windows kernel so iterate manually. */
     ULONG pendingCount = 0;
+    ULONG ownerCount   = 0;
+    if (q->InFlight && q->InFlight->Owner == File) ownerCount++;
     for (PLIST_ENTRY e = q->Pending.Flink;
          e != &q->Pending;
          e = e->Flink) {
+        RKMPP_JOB *cand = CONTAINING_RECORD(e, RKMPP_JOB, Link);
         pendingCount++;
-        if (pendingCount >= RKMPP_MAX_PENDING_JOBS) break;
+        if (cand->Owner == File) ownerCount++;
+        if (pendingCount >= RKMPP_MAX_PENDING_JOBS &&
+            ownerCount   >= RKMPP_MAX_PENDING_JOBS_PER_FILE) break;
     }
-    if (pendingCount >= RKMPP_MAX_PENDING_JOBS) {
+    if (pendingCount >= RKMPP_MAX_PENDING_JOBS ||
+        ownerCount   >= RKMPP_MAX_PENDING_JOBS_PER_FILE) {
         KeReleaseSpinLock(&q->Lock, oldIrql);
         /* No per-job CCU raise to undo (removed — see comment above). */
         ExFreePoolWithTag(job, 'JppM');

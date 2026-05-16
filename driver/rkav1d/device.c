@@ -356,6 +356,12 @@ RkMppEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTransl
     UNREFERENCED_PARAMETER(ResourcesTranslated);
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
 
+    /* Stop the poller before DropAv1Cluster / MmUnmapIoSpace — otherwise
+     * an in-flight kick's READ_REGISTER_ULONG on IntStatus races the PD
+     * drop / VA unmap and bugchecks.  Idempotent vs the cleanup-path
+     * call from EvtDeviceContextCleanup. */
+    RkMppJobQueueTeardown(&ctx->JobQueue);
+
     /* Mirror PrepareHardware in reverse: drop the AV1 cluster raise we took
      * there, then release the ifcs and unmap MMIO. */
     if (ctx->Ifcs.CcuOpen && ctx->Ifcs.Ccu.DropAv1Cluster) {
@@ -697,29 +703,38 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
                    "rkav1d: drain done fileobject=%p clean\n", FileObject);
     }
 
+    /* Capture peer-active state BEFORE BufFreeAll: a peer can be mid-DMA
+     * right now from its own iovas, and we must not touch the IOMMU
+     * (Reattach = Disable+Enable opens a ~10µs window with paging OFF —
+     * peer's in-flight AXI transactions then go untranslated and fault).
+     * BufFreeAll's per-buffer UnmapMdl already issues ZAP_CACHE on this
+     * File's iovas, which is the only walk-cache state that needs
+     * flushing for our cleanup — the belt-and-suspenders Reattach was
+     * redundant for that purpose and unsafe for peers. */
+    BOOLEAN otherActive = RkMppJobQueueHasOtherOwner(ctx->Device, FileObject);
+
     RkMppBufFreeAll(FileObject);
 
-    /* Reattach the IOMMU domain on every session close, regardless of
-     * whether drain timed out.  Linux's `mpp_iommu_dev_deactivate` is
-     * called on every IRQ completion; we don't have per-IRQ deactivate
-     * machinery, but reattaching at session-close gives an equivalent
-     * guarantee that the next session never inherits walk-cache state
-     * from a prior session.  This is cheap (one Disable + Enable on the
-     * IOMMU, ~10 µs) and is the architectural answer to the
-     * kill-mid-decode wedge documented in
-     * memory:rkmpp_kernel_security_todos.md item 9.
-     *
-     * Order matters: must run AFTER BufFreeAll so the buffer iovas have
-     * been UnmapMdl'd from the page tables.  Reattach preserves the
-     * domain (and any iovas still mapped by other sessions) — only the
-     * hardware-side walk caches are flushed. */
-    if (devCtx && devCtx->Ifcs.IommuOpen &&
-        devCtx->Ifcs.Iommu.Reattach) {
-        NTSTATUS rs = devCtx->Ifcs.Iommu.Reattach(
-            devCtx->Ifcs.Iommu.Header.Context);
-        if (!NT_SUCCESS(rs)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "rkav1d: post-drain Reattach failed 0x%08x\n", rs);
+    if (devCtx && devCtx->Ifcs.IommuOpen && devCtx->Ifcs.Iommu.Reattach) {
+        if (otherActive) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "rkav1d: FileCleanup with concurrent File active — "
+                       "skipping Reattach (would disrupt peer DMA); per-iova "
+                       "ZAP_CACHE from UnmapMdl already flushed our walk-cache\n");
+            /* Flag a narrow per-codec reset for the peer's next kick so
+             * any FSM state our last kick left behind is scrubbed. */
+            RkMppSetNeedsCoreReset(ctx->Device);
+        } else {
+            /* No peer — safe to Reattach.  Drops the entire IOMMU walk
+             * cache (cross-AU pollution from this session's iovas, the
+             * "kill-mid-decode wedge" hardening from
+             * memory:rkmpp_kernel_security_todos.md item 9). */
+            NTSTATUS rs = devCtx->Ifcs.Iommu.Reattach(
+                devCtx->Ifcs.Iommu.Header.Context);
+            if (!NT_SUCCESS(rs)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "rkav1d: post-drain Reattach failed 0x%08x\n", rs);
+            }
         }
     }
 }

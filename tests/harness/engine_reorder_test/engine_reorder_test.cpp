@@ -246,7 +246,7 @@ int test_h265_path_no_spill()
 /* ============================================================
  * Test 5 — input capacity must exceed reorder threshold.
  * ============================================================
- * ow-rickroll_1080p.mp4 advertises max_num_ref_frames=4.  The MFT
+ * rickroll_1080p.mp4 advertises max_num_ref_frames=4.  The MFT
  * used to hard-cap H.264 input at queue depth 4.  That deadlocked:
  * four decoded frames sat in reorder_q, ready_q was empty, and the
  * fifth input (the one that would bump the first output) was refused.

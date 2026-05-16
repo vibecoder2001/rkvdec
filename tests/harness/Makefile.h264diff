@@ -12,6 +12,7 @@ INCS    = -I. -I$(MFT) -I$(SHARED) -I$(EXTERNAL)/v4l2-h264-controls
 LDLIBS  = -lstdc++
 
 CPP_OBJS = \
+    $(MFT)/au_iter.o \
     $(MFT)/parser_glue.o \
     $(MFT)/parser_glue_h265.o \
     $(MFT)/regbuilder_h264.o \

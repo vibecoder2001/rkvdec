@@ -12,6 +12,7 @@
 #include "decode_engine_av1.h"
 #include "../../shared/rkmpp_ioctl.h"
 #include "av1_default_cdfs.h"
+#include "repack_yuv.h"
 
 #include <setupapi.h>
 
@@ -698,12 +699,44 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
      * producing a sparse-superblock pattern in pool_output.       */
     const uint32_t coded_w    = (frame_w + 63u) & ~63u;
     const uint32_t y_h_int    = (frame_h + 15u) & ~15u;
-    const uint32_t y_size_int = coded_w * y_h_int;
-    /* PP NV12 output uses the same coded stride; reg328 = UV offset
-     * within pool_output relative to reg326. */
-    const uint32_t coded_w_out  = coded_w;
-    const uint32_t coded_h_out  = (frame_h + 7u) & ~7u;
-    const uint32_t y_size_out   = coded_w_out * coded_h_out;
+    /* Codec INTERNAL layout (TILE_OUT_LU / TILE_OUT_CH / TILE_OUT_MV)
+     * is bit-depth-aware: luma byte size = coded_w * coded_h * depth/8.
+     * Matches upstream rockchip_vpu981_av1_dec_luma_size().  For 10-bit
+     * streams the internal Y plane is 1.25× wider than 8-bit, so the
+     * UV-offset register (reg99) and MV-offset register (reg133) MUST
+     * scale with bit-depth — otherwise the codec scribbles Y bytes
+     * over the start of UV and produces the "tiling corruption"
+     * symptom that survives even after the PP output format is
+     * correctly set to P010. */
+    const uint32_t bit_depth_int = p_seq_hdr->hbd ? 10u : 8u;
+    const uint32_t y_size_int    = coded_w * y_h_int * bit_depth_int / 8u;
+    /* PP raster output byte stride:
+     *   8-bit  → NV12  (sw_pp_out_format=3): bytesperline = width
+     *   10-bit → P010  (sw_pp_out_format=1): bytesperline = width * 2
+     * Matches upstream kernel rockchip_vpu981_hw_av1_dec.c:2225-2241.
+     * 16-aligned for the PP write fabric.  reg328 (UV-plane base
+     * offset relative to reg326) is the BYTE size of the Y plane,
+     * not a pixel count — chroma_offset = bytesperline * height. */
+    /* Codec PP-output bytes/sample: NV12 = 8, NV15 (10-bit) = 10 bits
+     * packed (4 samples / 5 bytes).  Matches the sw_pp_out_format
+     * choice in regbuilder_av1.cpp. */
+    const uint32_t bpp_bits_out  = p_seq_hdr->hbd ? 10u : 8u;
+    const uint32_t coded_w_out   = coded_w;
+    /* PP-output Y-plane storage height = (frame_h + 15) & ~15.  Matches
+     * upstream V4L2 P010/NV12 frmsize.step_height = MB_DIM = 16
+     * (rockchip_vpu_hw.c:99-106) — upstream's pp_out_height (reg332) AND
+     * chroma_offset (reg328) both use dst_fmt.height, which v4l2_apply_
+     * frmsize_constraints rounded up to 16 (1088 for a 1080p stream).
+     * The codec writes 17 SB rows × 64 = 1088 luma rows either way;
+     * cropping happens on the display side.  regbuilder_av1.cpp uses
+     * the same `(h + 15) & ~15` for pp_out_height so codec + buffer
+     * agree.  An 8-row alignment here gave bottom-right corner
+     * corruption on 10-bit AV1 (last partial SB row's chroma writes
+     * spilled into the UV plane the repack thought it was reading). */
+    const uint32_t coded_h_out   = (frame_h + 15u) & ~15u;
+    const uint32_t pp_stride_out =
+        ((coded_w_out * bpp_bits_out + 7u) / 8u + 15u) & ~15u;
+    const uint32_t y_size_out    = pp_stride_out * coded_h_out;
 
     /* Filter column buffer sub-offsets within filter_mem.
      * Matches hal_av1d_vdpu.c:vdpu_av1d_filtermem_alloc() + mpp_dev_set_reg_offset().
@@ -894,10 +927,27 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
      * NV12 buffer get written; without it, codec runs VCD cleanly to
      * tile_out_internal but PP module stays idle and pool_output
      * stays zero. */
+    /* Registers that upstream verisilicon writes as explicit 0 and that
+     * the regbuilder doesn't touch (so the bank value is 0 there too).
+     * The default skip-on-zero optimization would leave these UNWRITTEN,
+     * which means the codec block keeps whatever stale value the prior
+     * session left in the MMIO register.  For 10-bit AV1 specifically,
+     * a stale bit in swreg260 (PP-mode flags: pp_format_p010_e,
+     * ppd_blend_exist, pp_crop_exist, pp_up/down_level, pp_exist, etc.)
+     * or swreg266 (sw_error_conceal_e) appears to corrupt the right-edge
+     * SB column for the bottom 1-2 SB rows.  Force-write 0 to these
+     * regs every kick so the codec block enters every AV1 session in a
+     * known state. */
+    static const uint32_t kAv1ForceWriteIdx[] = { 260, 266 };
+    auto force_writes = [&](uint32_t idx) {
+        for (uint32_t f : kAv1ForceWriteIdx)
+            if (f == idx) return true;
+        return false;
+    };
     for (uint32_t idx = 2; idx < 512; idx++) {
         if (IsAv1DmaLsb(idx)) continue;
         if (dma_msb_mask[idx >> 5] & (1u << (idx & 31))) continue;
-        if (r32[idx] == 0) continue;
+        if (r32[idx] == 0 && !force_writes(idx)) continue;
         PUSH_REG(idx * 4, r32[idx], 0, 0);
     }
     /* Authoritative DMA writes (substitute via BufferHandle). */
@@ -978,28 +1028,15 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
 
     /* 7. Copy output buffer into Av1DecodedFrame YUV, cropping from PP's
      * coded raster stride down to the display width the caller sees. */
-    f->yuv.resize(size_t(frame_w) * frame_h * 3 / 2);
     {
-        const uint8_t *src    = (const uint8_t *)e->pool_output[slot_idx].user_va;
-        uint8_t       *dst    = f->yuv.data();
-        const size_t   src_p  = coded_w_out;
-        const size_t   dst_p  = frame_w;
-        if (src_p == dst_p) {
-            /* Plane is contiguous — collapse per-row memcpy to one big
-             * memcpy per plane.  Hits for every multiple-of-64 width
-             * (1920, 2560, 3840 — the common cases). */
-            std::memcpy(dst, src, src_p * frame_h);
-            std::memcpy(dst + (size_t)frame_w * frame_h,
-                        src + src_p * coded_h_out,
-                        src_p * (frame_h / 2u));
-        } else {
-            for (uint32_t r = 0; r < frame_h; r++)
-                std::memcpy(dst + r * dst_p, src + r * src_p, dst_p);
-            const uint8_t *src_uv = src + (size_t)coded_w_out * coded_h_out;
-            uint8_t       *dst_uv = dst + (size_t)frame_w     * frame_h;
-            for (uint32_t r = 0; r < frame_h / 2u; r++)
-                std::memcpy(dst_uv + r * dst_p, src_uv + r * src_p, dst_p);
-        }
+        /* PP-output is NV12 (8-bit) or NV15-packed (10-bit, 4 samples
+         * per 5 bytes); engine returns NV12 or P010 to the host.  See
+         * regbuilder_av1.cpp:sw_pp_out_format note for why we use NV15
+         * (out_fmt=10) rather than P010 (out_fmt=1) for hbd=1. */
+        const uint32_t bit_depth = p_seq_hdr->hbd ? 10u : 8u;
+        const uint8_t *src = (const uint8_t *)e->pool_output[slot_idx].user_va;
+        RepackCodecOutputToNV12orP010(src, pp_stride_out, coded_h_out,
+                                      frame_w, frame_h, bit_depth, &f->yuv);
     }
     f->slot_idx = slot_idx;
 
@@ -1171,7 +1208,10 @@ static int DrainPictures(Av1DecodeEngine *e, int64_t pts_hns) {
             const uint32_t w = (uint32_t)e->saved_states[dpb_slot].saved.width[0];
             const uint32_t h = (uint32_t)e->saved_states[dpb_slot].saved.height;
             const uint32_t coded_w_out = (w + 63u) & ~63u;
-            const uint32_t coded_h_out = (h +  7u) & ~7u;
+            /* 16-row alignment — matches DecodeOne_AV1's coded_h_out
+             * (the codec wrote pool_output's UV plane at offset
+             * pp_stride * ((h + 15) & ~15) on the original kick). */
+            const uint32_t coded_h_out = (h + 15u) & ~15u;
 
             Av1DecodedFrame f;
             f.width  = w;
@@ -1183,20 +1223,15 @@ static int DrainPictures(Av1DecodeEngine *e, int64_t pts_hns) {
             f.dur_hns = 10'000'000LL / 30;
             f.slot_idx = -1;  /* no pool hold for show_existing copies */
 
-            /* Crop from coded stride to display width (same as HW kick output). */
-            f.yuv.resize(size_t(w) * h * 3 / 2);
-            {
-                const uint8_t *src    = (const uint8_t *)e->pool_output[pool_slot].user_va;
-                uint8_t       *dst    = f.yuv.data();
-                const size_t   src_p  = coded_w_out;
-                const size_t   dst_p  = w;
-                for (uint32_t row = 0; row < h; row++)
-                    std::memcpy(dst + row * dst_p, src + row * src_p, dst_p);
-                const uint8_t *src_uv = src + (size_t)coded_w_out * coded_h_out;
-                uint8_t       *dst_uv = dst + (size_t)w * h;
-                for (uint32_t row = 0; row < h / 2u; row++)
-                    std::memcpy(dst_uv + row * dst_p, src_uv + row * src_p, dst_p);
-            }
+            /* Same repack as the HW-kick path: NV12 passthrough for 8-bit,
+             * NV15 → P010 unpack for 10-bit.  pp_stride matches what the
+             * regbuilder configured the codec to write on the original
+             * kick: width * bit_depth / 8, 16-aligned. */
+            const uint32_t bit_depth = e->cached_seq_hdr.hbd ? 10u : 8u;
+            const uint32_t pp_stride = ((coded_w_out * bit_depth + 7u) / 8u + 15u) & ~15u;
+            const uint8_t *src = (const uint8_t *)e->pool_output[pool_slot].user_va;
+            RepackCodecOutputToNV12orP010(src, pp_stride, coded_h_out,
+                                          w, h, bit_depth, &f.yuv);
             e->reorder_q.push_back(std::move(f));
             Av1BumpLowestPts(e);
 
@@ -1397,7 +1432,10 @@ int Av1DecodeEngine_Init(Av1DecodeEngine *e, Av1EngineMode mode,
          * silently overruns into the chroma region. */
         const uint32_t coded_w_alloc   = (width  + 63u) & ~63u;
         const uint32_t y_h_int_alloc   = (height + 15u) & ~15u;
-        const uint32_t luma_alloc      = coded_w_alloc * y_h_int_alloc;
+        /* Codec internal Y/UV is bit-depth-aware (see DecodeOne_AV1's
+         * y_size_int).  Allocate for the 10-bit upper bound (1.25×
+         * the 8-bit cost) so 10-bit kicks don't overrun the buffer. */
+        const uint32_t luma_alloc      = coded_w_alloc * y_h_int_alloc * 10u / 8u;
         const uint32_t chroma_alloc    = luma_alloc >> 1;
         const uint32_t num_sbs_alloc   = ((width  + 63u) / 64u + 1u) *
                                          ((height + 63u) / 64u + 1u);
@@ -1424,8 +1462,18 @@ int Av1DecodeEngine_Init(Av1DecodeEngine *e, Av1EngineMode mode,
          * display width truncates the last few bytes of each row pair,
          * causing PP to either silently corrupt content or fault.    */
         const uint32_t coded_w     = (width  + 63u) & ~63u;
-        const uint32_t coded_h     = (height +  7u) & ~7u;
-        const uint32_t output_size = coded_w * coded_h * 3u / 2u;
+        /* Matches DecodeOne_AV1's coded_h_out alignment — see comment
+         * there.  Codec writes 17 SB rows × 64 = 1088 luma rows on a
+         * 1080p stream; pool_output must fit the full padded plane. */
+        const uint32_t coded_h     = (height + 15u) & ~15u;
+        /* Size for the worst case — 10-bit P010 (2 bytes / sample;
+         * pp_out_format=1 in regbuilder_av1.cpp, matches upstream
+         * kernel rockchip_vpu981_hw_av1_dec).  Same buffer serves
+         * 8-bit streams unchanged (2× the bytes — ~6 MiB at 1080p).
+         * Per-AU regbuilder picks the actual stride / format from
+         * seq->hbd. */
+        const uint32_t pp_stride_max = ((coded_w * 16u + 7u) / 8u + 15u) & ~15u;
+        const uint32_t output_size   = pp_stride_max * coded_h * 3u / 2u;
         for (int i = 0; i < Av1DecodeEngine::kPoolSize; i++) {
             if (AllocHwBuf(e->device, output_size, RkMppBufferUsageOutputFrame,
                            &e->pool_output[i]) != 0)

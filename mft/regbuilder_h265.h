@@ -36,6 +36,7 @@
 #endif
 
 #include "../shared/rkmpp_ioctl.h"
+#include "regbuilder_dense.h"
 #include "parser_glue_h265.h"
 #include "h264_packed_tables.h"      /* H264RcbInfo (struct reused for HEVC) */
 
@@ -103,13 +104,6 @@ typedef struct H265BufferRefs {
     uint8_t  ref_is_long_term[16];
 } H265BufferRefs;
 
-/* Output: a packed register-write list ready to feed into
- * RKMPP_SUBMIT_JOB_IN.Writes[].  Identical shape to H264RegWriteList. */
-typedef struct H265RegWriteList {
-    RKMPP_REG_WRITE entries[RKMPP_MAX_REG_WRITES];
-    uint32_t        count;
-} H265RegWriteList;
-
 typedef enum {
     H265_REGBUILD_OK              = 0,
     H265_REGBUILD_MISSING_INPUT   = 1,
@@ -117,7 +111,7 @@ typedef enum {
     H265_REGBUILD_UNSUPPORTED     = 3,
 } H265RegBuildStatus;
 
-/* Build the register list.
+/* Build the register payload as a dense bank (H26xDenseOutput).
  *
  * - `parsed`  — parsed access-unit; must have an active VPS/SPS/PPS and
  *               a slice header (parsed->has_slice).  The active set is
@@ -126,13 +120,13 @@ typedef enum {
  * - `current_pic_index` — slot index for the current picture in the
  *               caller's DPB pool, only used to seed reg028.sw_film_idx
  *               when fast-mode is enabled (we leave it at 0 today).
- * - `out`     — output list; caller zero-inits.
+ * - `out`     — output dense bank; caller zero-inits.
  *
  * Returns 0 on success.  Failure modes match the H.264 enum. */
-H265RegBuildStatus H265BuildRegisterList(const H265ParseResult *parsed,
-                                         const H265BufferRefs  *bufs,
-                                         uint32_t               current_pic_index,
-                                         H265RegWriteList      *out);
+H265RegBuildStatus H265BuildDenseRegs(const H265ParseResult *parsed,
+                                      const H265BufferRefs  *bufs,
+                                      uint32_t               current_pic_index,
+                                      H26xDenseOutput       *out);
 
 #ifdef __cplusplus
 }

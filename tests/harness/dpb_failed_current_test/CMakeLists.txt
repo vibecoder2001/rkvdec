@@ -1,0 +1,3 @@
+add_executable(dpb_failed_current_test dpb_failed_current_test.cpp)
+target_link_libraries(dpb_failed_current_test PRIVATE rkmpp_mft)
+add_test(NAME dpb_failed_current_test COMMAND dpb_failed_current_test)

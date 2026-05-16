@@ -20,6 +20,8 @@ typedef struct _RKMPP_FILE_CTX {
     LIST_ENTRY    Buffers;    /* list of RKMPP_BUFFER.Link */
     KSPIN_LOCK    Lock;       /* guards Buffers list */
     WDFDEVICE     Device;     /* back-pointer so cleanup can reach the ifcs */
+    UINT64        AllocatedBytes; /* rounded bytes currently charged to file */
+    UINT32        BufferCount;    /* buffers currently charged to file */
     volatile LONG ErrorCount; /* count of error-flagged jobs this session;
                                  read by EvtFileCleanup to decide whether
                                  to invoke the soft-tier IOMMU force-reset

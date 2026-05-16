@@ -127,6 +127,22 @@ static VOID RkMppJobComplete(_In_ WDFDEVICE Device,
                              _In_ UINT32 HardwareStatus);
 static KSTART_ROUTINE RkMppPollerThread;
 
+static BOOLEAN
+RkMppJobReferencesBuffer(_In_ const RKMPP_JOB *Job,
+                         _In_ WDFFILEOBJECT File,
+                         _In_ UINT64 Cookie)
+{
+    if (!Job || Job->Owner != File || Cookie == 0) return FALSE;
+
+    for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
+        if (Job->Writes[i].BufferHandle == Cookie) return TRUE;
+    }
+    for (UINT32 i = 0; i < Job->BufRefCount; i++) {
+        if (Job->BufRefs[i].BufferHandle == Cookie) return TRUE;
+    }
+    return FALSE;
+}
+
 /* -----------------------------------------------------------------------
  * Accessors for device context — implemented in device.c.
  * --------------------------------------------------------------------- */
@@ -1161,6 +1177,7 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
 
 NTSTATUS
 RkMppJobPeek(_In_ WDFDEVICE Device,
+             _In_ WDFFILEOBJECT File,
              _In_ UINT64 JobId,
              _Out_ RKMPP_PEEK_JOB_OUT *Out)
 {
@@ -1190,6 +1207,10 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
     }
 
     if (job) {
+        if (job->Owner != File) {
+            status = STATUS_NOT_FOUND;
+            goto done;
+        }
         Out->RegWriteCount = job->RegWriteCount;
         Out->Reserved      = 0;
         if (job->RegWriteCount > 0) {
@@ -1199,8 +1220,46 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
         status = STATUS_SUCCESS;
     }
 
+done:
     KeReleaseSpinLock(&q->Lock, oldIrql);
     return status;
+}
+
+BOOLEAN
+RkMppJobBufferInUse(_In_ WDFDEVICE Device,
+                    _In_ WDFFILEOBJECT File,
+                    _In_ UINT64 Cookie)
+{
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+    KIRQL oldIrql;
+    BOOLEAN inUse = FALSE;
+
+    KeAcquireSpinLock(&q->Lock, &oldIrql);
+
+    if (RkMppJobReferencesBuffer(q->InFlight, File, Cookie)) {
+        inUse = TRUE;
+        goto done;
+    }
+
+    for (PLIST_ENTRY e = q->Pending.Flink; e != &q->Pending; e = e->Flink) {
+        RKMPP_JOB *job = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+        if (RkMppJobReferencesBuffer(job, File, Cookie)) {
+            inUse = TRUE;
+            goto done;
+        }
+    }
+
+    for (PLIST_ENTRY e = q->Completed.Flink; e != &q->Completed; e = e->Flink) {
+        RKMPP_JOB *job = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+        if (RkMppJobReferencesBuffer(job, File, Cookie)) {
+            inUse = TRUE;
+            goto done;
+        }
+    }
+
+done:
+    KeReleaseSpinLock(&q->Lock, oldIrql);
+    return inUse;
 }
 
 /* -----------------------------------------------------------------------
@@ -1209,6 +1268,7 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
 
 NTSTATUS
 RkMppJobWait(_In_ WDFDEVICE Device,
+             _In_ WDFFILEOBJECT File,
              _In_ UINT64 JobId,
              _In_ UINT32 TimeoutMs,
              _Out_ RKMPP_WAIT_JOB_OUT *Out)
@@ -1258,6 +1318,10 @@ RkMppJobWait(_In_ WDFDEVICE Device,
         KeReleaseSpinLock(&q->Lock, oldIrql);
         return STATUS_NOT_FOUND;
     }
+    if (job->Owner != File) {
+        KeReleaseSpinLock(&q->Lock, oldIrql);
+        return STATUS_NOT_FOUND;
+    }
 
     if (!alreadyComplete) {
         /* Job still in progress — wait for it with the caller's timeout. */
@@ -1289,13 +1353,10 @@ RkMppJobWait(_In_ WDFDEVICE Device,
              *
              *   Pending  → remove + free (poller hasn't touched it yet).
              *   Completed → remove + free (poller is done with it).
-             *   InFlight → leak the job (poller still holds a pointer
-             *              and will dereference it; freeing here is a
-             *              use-after-free).  The next session reset
-             *              releases queue memory.  Set q->InFlight = NULL
-             *              so subsequent submits don't wedge waiting
-             *              for a "complete" signal that never comes. */
-            job->Result = STATUS_TIMEOUT;
+             *   InFlight → leave it attached.  The poller/hardware still
+             *              owns the kick; detaching InFlight here would
+             *              allow a later submit to start a second hardware
+             *              job while the first is still active. */
             Out->Status         = STATUS_TIMEOUT;
             Out->HardwareStatus = 0;
             Out->ElapsedQpc     = 0;
@@ -1323,12 +1384,9 @@ RkMppJobWait(_In_ WDFDEVICE Device,
                 RemoveEntryList(&job->Link);
                 safeToFree = TRUE;
             } else if (q->InFlight == job) {
-                /* Poller still owns it — leak.  Detach so subsequent
-                 * submits aren't gated on it. */
-                q->InFlight = NULL;
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                            "rkav1d: WAIT_JOB timeout on InFlight job %llu — "
-                           "leaking (poller still holds pointer)\n",
+                           "leaving attached for poller completion\n",
                            (unsigned long long)job->Id);
             }
             KeReleaseSpinLock(&q->Lock, oldIrql);

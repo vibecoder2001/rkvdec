@@ -235,7 +235,7 @@ STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
             *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
     } else if (engine_) {
         auto *eng = static_cast<DecodeEngine *>(engine_);
-        if (DecodeEngine_QueueDepth(eng) < 4)
+        if (DecodeEngine_QueueDepth(eng) < DecodeEngine_InputQueueCapacity(eng))
             *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
     } else {
         *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
@@ -764,9 +764,8 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
      * the next decode hits DPB_FULL → bad refs → codec wedge.  Cap the
      * queue at kQueueCap so EVR's source reader retries this AU later. */
     {
-        const size_t kQueueCap = 4;
         auto *eng = static_cast<DecodeEngine *>(engine_);
-        if (DecodeEngine_QueueDepth(eng) >= kQueueCap) {
+        if (DecodeEngine_QueueDepth(eng) >= DecodeEngine_InputQueueCapacity(eng)) {
             return MF_E_NOTACCEPTING;
         }
     }

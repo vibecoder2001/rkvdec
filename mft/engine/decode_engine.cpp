@@ -549,10 +549,10 @@ static int DecodeOne_H264(DecodeEngine *e,
      * fresh buffer; we reuse a fixed pool across frames within a session.
      * Per-kick zero of COLMV_CUR replicates the BSP guarantee.
      *
-     * The user-VA is `MmNonCached` (see driver/rkmpp/bufpool.c::RkMppBufAlloc
-     * MmMapLockedPagesSpecifyCache(MmNonCached)) so this memset writes
-     * straight to DRAM — no cache flush needed. ~150 KB per frame on
-     * 1280×720, negligible. */
+     * Windows maps user buffers cached, so rkvdec/job.c treats
+     * COLMV_CUR as both a pre-kick clean target (for this zero) and a
+     * post-kick invalidate target (for diagnostic dumps and later CPU
+     * reads). ~150 KB per frame on 1280×720, negligible. */
     if (e->pool_colmv[sel.current_slot].user_va) {
         std::memset(e->pool_colmv[sel.current_slot].user_va, 0,
                     e->pool_colmv[sel.current_slot].size);
@@ -602,6 +602,7 @@ static int DecodeOne_H264(DecodeEngine *e,
                                                   sel.current_slot, &list);
     if (rs != H264_REGBUILD_OK) {
         std::fprintf(stderr, "regbuilder status=%d\n", (int)rs);
+        Dpb_OnDecodeFailed(&e->dpb_h264);
         return Fail("regbuilder failed");
     }
 
@@ -654,6 +655,7 @@ static int DecodeOne_H264(DecodeEngine *e,
     bool have_output = (wout.HardwareStatus & kRdySta) != 0;
     if (wout.Status != 0 && !have_output) {
         std::fprintf(stderr, "decode reported non-success status (no output)\n");
+        Dpb_OnDecodeFailed(&e->dpb_h264);
         return 5;
     }
     if (wout.Status != 0 && DecodeDebugEnabled()) {
@@ -1153,24 +1155,6 @@ static uint32_t resolve_max_reorder(const DecodeEngine *e) {
         }
     } else {
         if (e->parsed_h264.has_sps) {
-            /* Why not the tighter VUI bitstream_restriction.
-             * max_num_reorder_frames?  It's parsed (see
-             * H264ParseResult::sps_vui_max_num_reorder_frames) and
-             * spec-wise is the correct display-reorder bound.  But
-             * dropping the engine's reorder_q below
-             * max_num_ref_frames removes a buffer that EVR was relying
-             * on for pacing — non-bframe streams (VUI says reorder=0
-             * but max_num_ref_frames=3) ended up with 0 entries in
-             * reorder_q and a fluctuating ready_q, causing visible
-             * wax/wane pacing as ready_q oscillates between 0 and the
-             * MFT cap.
-             *
-             * The actual correctness bug (multi-IDR pre-IDR tail
-             * frames lingering in reorder_q across POC resets) is
-             * addressed by the IDR-spill in DecodeEngine_OnDecodeComplete
-             * (commit 4c94bfa).  So we use max_num_ref_frames here as
-             * a "predictable buffer depth" rather than a strict
-             * display-reorder bound; the IDR-spill handles the rest. */
             return e->parsed_h264.sps.max_num_ref_frames;
         }
     }
@@ -1239,15 +1223,74 @@ void DecodeEngine_OnDecodeComplete(DecodeEngine *e,
     }
 }
 
+/* Scan an Annex-B AU for an IDR (H.264 nal_unit_type==5) or IRAP
+ * (H.265 NAL types 16..23: BLA_W_LP..RSV_IRAP_VCL23) slice.  Used by
+ * the post-flush wait-for-IDR gate: until the first IRAP arrives, the
+ * DPB is empty and any P/B slice would feed bad ref-list entries to
+ * the codec.  Returns true if an IRAP slice is present anywhere in the
+ * AU. */
+static bool au_has_irap(const uint8_t *au, size_t len, Codec codec)
+{
+    if (!au || len < 4) return false;
+    /* Walk start codes (00 00 00 01 or 00 00 01).  We only need to look
+     * at the NAL header byte(s) immediately after each prefix. */
+    size_t i = 0;
+    while (i + 3 < len) {
+        bool is_sc = false;
+        size_t sc_len = 0;
+        if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1) {
+            is_sc = true;
+            sc_len = 3;
+        } else if (i + 4 < len && au[i] == 0 && au[i + 1] == 0 &&
+                   au[i + 2] == 0 && au[i + 3] == 1) {
+            is_sc = true;
+            sc_len = 4;
+        }
+        if (!is_sc) { i++; continue; }
+        size_t hdr = i + sc_len;
+        if (hdr >= len) break;
+        if (codec == Codec::H265) {
+            uint8_t nut = (uint8_t)((au[hdr] >> 1) & 0x3f);
+            if (nut >= 16 && nut <= 23) return true;
+        } else {
+            uint8_t nut = (uint8_t)(au[hdr] & 0x1f);
+            if (nut == 5) return true;
+        }
+        i = hdr + 1;
+    }
+    return false;
+}
+
 int DecodeEngine_Submit(DecodeEngine *e,
                         const uint8_t *au, size_t au_len,
                         int64_t pts_hns,
                         uint32_t epoch)
 {
+    /* Post-flush IRAP gate: drop AUs until the first IDR/IRAP arrives.
+     * See DecodeEngine.wait_for_idr docstring. */
+    if (e->wait_for_idr) {
+        if (!au_has_irap(au, au_len, e->codec)) {
+            return 0;
+        }
+        e->wait_for_idr = false;
+    }
+
     DecodeEngine::ReorderEntry entry;
     entry.epoch = epoch;
     int rc = DecodeEngine_DecodeOne(e, au, au_len, &entry.yuv);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        /* Decode failed — codec wedge, parser hard-error, or DPB rejection.
+         * Re-arm the IRAP gate so subsequent AUs are dropped until the
+         * next IDR/IRAP arrives.  Without this, MFT keeps feeding P/B
+         * slices into a half-baked DPB while the kernel cycles through
+         * NeedsCoreReset on each kick, and every one of those kicks
+         * re-trips the same wedge — visible to the user as "playback
+         * stops a second or two after seek".  Skipping forward to the
+         * next IRAP lets the codec recover into a known-clean state
+         * (the IDR's DPB flush re-bases everything). */
+        e->wait_for_idr = true;
+        return rc;
+    }
 
     /* Take an external hold on the slot we just decoded into so that any
      * subsequent decode can't overwrite it while this entry sits in the
@@ -1351,6 +1394,16 @@ size_t DecodeEngine_QueueDepth(const DecodeEngine *e)
     return e->reorder_q.size() + e->ready_q.size();
 }
 
+size_t DecodeEngine_InputQueueCapacity(const DecodeEngine *e)
+{
+    if (!e) return 4;
+    size_t cap = (size_t)e->max_num_reorder_pics + 1u;
+    if (cap < 4u) cap = 4u;
+    const size_t max_safe = (size_t)DecodeEngine::kPoolSize - 1u;
+    if (cap > max_safe) cap = max_safe;
+    return cap;
+}
+
 void DecodeEngine_ReleaseFrame(DecodeEngine *e, DecodedFrame *f)
 {
     if (!e || !f) return;
@@ -1402,6 +1455,7 @@ int DecodeEngine_Flush(DecodeEngine *e)
     e->ready_q.clear();
     e->submit_count = 0;
     e->max_num_reorder_pics = 0;
+    e->wait_for_idr = true;
 
     /* Bump the DPB epoch and clear reference state on slots not held by
      * a live DecodedFrame.  Consumer-held slots keep their pre-flush

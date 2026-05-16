@@ -158,6 +158,11 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
  * ref is evicted (sliding window, H.264 8.2.5.3). */
 void Dpb_OnDecodeComplete(DpbCtx *ctx);
 
+/* Roll back the picture selected by the most recent Dpb_Select after a
+ * no-output decode failure.  Previously decoded references are preserved;
+ * only the current in-flight slot and deferred marking state are cleared. */
+void Dpb_OnDecodeFailed(DpbCtx *ctx);
+
 /* Slot-lifecycle hold API.  Lets a downstream consumer (MFT reorder_q /
  * ready_q entry, or live DecodedFrame) pin a pool slot's contents while
  * the codec picks new slots for subsequent decodes.

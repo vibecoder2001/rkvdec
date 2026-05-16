@@ -134,6 +134,22 @@ static VOID RkMppJobComplete(_In_ WDFDEVICE Device,
                              _In_ UINT32 HardwareStatus);
 static KSTART_ROUTINE RkMppPollerThread;
 
+static BOOLEAN
+RkMppJobReferencesBuffer(_In_ const RKMPP_JOB *Job,
+                         _In_ WDFFILEOBJECT File,
+                         _In_ UINT64 Cookie)
+{
+    if (!Job || Job->Owner != File || Cookie == 0) return FALSE;
+
+    for (UINT32 i = 0; i < Job->RegWriteCount; i++) {
+        if (Job->Writes[i].BufferHandle == Cookie) return TRUE;
+    }
+    for (UINT32 i = 0; i < Job->BufRefCount; i++) {
+        if (Job->BufRefs[i].BufferHandle == Cookie) return TRUE;
+    }
+    return FALSE;
+}
+
 /* -----------------------------------------------------------------------
  * Accessors for device context — implemented in device.c.
  * --------------------------------------------------------------------- */
@@ -474,11 +490,15 @@ have_status:
             }
         }
 
-        /* Ack pending status bits (write-1-to-clear). */
+        /* Ack pending status bits using the BSP rkvdec2 convention:
+         * Linux reads RKVDEC_REG_INT_EN, then clears it by writing 0.
+         * Keep this Linux-shaped while diagnosing the H.264 B-frame
+         * Windows-only divergence; writing hwStatus back is a driver
+         * asymmetry we do not need. */
         if (hwStatus) {
             WRITE_REGISTER_ULONG(
                 (volatile ULONG *)((PUCHAR)mmio + ops->IntStatusOffset),
-                hwStatus);
+                0);
         }
 
         /* Diagnostic dump only when the codec genuinely didn't finish —
@@ -578,10 +598,10 @@ RkMppEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
     if (mmioBase) {
         hwStatus = READ_REGISTER_ULONG(
             (volatile ULONG *)((PUCHAR)mmioBase + ops->IntStatusOffset));
-        /* Ack by writing back the status bits (write-1-to-clear). */
+        /* Match Linux BSP rkvdec2: read status, then clear with 0. */
         WRITE_REGISTER_ULONG(
             (volatile ULONG *)((PUCHAR)mmioBase + ops->IntStatusOffset),
-            hwStatus);
+            0);
     }
 
     if (hwStatus == 0) {
@@ -947,9 +967,16 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
      * write evicts them; mft_play's tight loop doesn't).
      *
      * OutputFrameMdl — pool_output NV12 (MmCached); fully committed before
-     *   the PERF_WORKING_CNT drain exits. */
+     *   the PERF_WORKING_CNT drain exits.
+     * ColmvCurMdl — pool_colmv for the current picture.  User-mode may
+     *   dump it after WAIT_JOB, and subsequent kicks feed it back as a
+     *   ref-colmv buffer, so drop stale CPU-side zero lines after DMA. */
     if (job->OutputFrameMdl) {
         KeFlushIoBuffers(job->OutputFrameMdl,
+                         /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
+    }
+    if (job->ColmvCurMdl) {
+        KeFlushIoBuffers(job->ColmvCurMdl,
                          /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
     }
     /* Move from InFlight to Completed. */
@@ -1072,13 +1099,14 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
          *   Inputs (CPU writes, codec reads this kick):
          *     reg128 / 0x200 — RLC base (bitstream)
          *     reg129 / 0x204 — RLCWRITE base (alias of bitstream)
+         *     reg131 / 0x20c — current colmv, zeroed by user-mode
          *     reg161 / 0x284 — packed PPS
          *     reg163 / 0x28C — packed RPS
          *     reg180 / 0x2D0 — packed scaling list
          *   Captured into CleanMdls[] for the pre-kick clean.
          *
-         *   Everything else (refs, ref_colmv, RCB, error_ref, CABAC init,
-         *   colmv_cur) is skipped — see RKMPP_JOB comment for why. */
+         *   Everything else (refs, ref_colmv, RCB, error_ref, CABAC init)
+         *   is skipped — see RKMPP_JOB comment for why. */
         PMDL mdl = NULL;
         if (!NT_SUCCESS(RkMppBufLookupMdl(File, src->BufferHandle, &mdl)) ||
             mdl == NULL) {
@@ -1088,10 +1116,21 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
          *   Output  — codec writes, CPU reads post-decode.  Invalidate after kick.
          *   Input   — CPU writes, codec reads.  Clean before kick.
          *
-         * rkvdec2 offsets: output reg130 = 0x208; inputs reg128/129/
-         * 161/163/180 = 0x200/0x204/0x284/0x28C/0x2D0. */
+         * rkvdec2 offsets: output reg130 = 0x208; current colmv reg131
+         * = 0x20c; inputs reg128/129/161/163/180 =
+         * 0x200/0x204/0x284/0x28C/0x2D0. */
         if (src->Offset == 0x208u) {      /* rkvdec2 output frame */
             if (job->OutputFrameMdl == NULL) job->OutputFrameMdl = mdl;
+        } else if (src->Offset == 0x20Cu) { /* rkvdec2 current colmv */
+            if (job->ColmvCurMdl == NULL) job->ColmvCurMdl = mdl;
+            BOOLEAN already = FALSE;
+            for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
+                if (job->CleanMdls[k] == mdl) { already = TRUE; break; }
+            }
+            if (!already &&
+                job->CleanMdlCount < RTL_NUMBER_OF(job->CleanMdls)) {
+                job->CleanMdls[job->CleanMdlCount++] = mdl;
+            }
         } else if (src->Offset == 0x200u || src->Offset == 0x204u ||
                    src->Offset == 0x284u || src->Offset == 0x28Cu ||
                    src->Offset == 0x2D0u) {
@@ -1180,6 +1219,7 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
 
 NTSTATUS
 RkMppJobPeek(_In_ WDFDEVICE Device,
+             _In_ WDFFILEOBJECT File,
              _In_ UINT64 JobId,
              _Out_ RKMPP_PEEK_JOB_OUT *Out)
 {
@@ -1209,6 +1249,10 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
     }
 
     if (job) {
+        if (job->Owner != File) {
+            status = STATUS_NOT_FOUND;
+            goto done;
+        }
         Out->RegWriteCount = job->RegWriteCount;
         Out->Reserved      = 0;
         if (job->RegWriteCount > 0) {
@@ -1218,8 +1262,46 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
         status = STATUS_SUCCESS;
     }
 
+done:
     KeReleaseSpinLock(&q->Lock, oldIrql);
     return status;
+}
+
+BOOLEAN
+RkMppJobBufferInUse(_In_ WDFDEVICE Device,
+                    _In_ WDFFILEOBJECT File,
+                    _In_ UINT64 Cookie)
+{
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+    KIRQL oldIrql;
+    BOOLEAN inUse = FALSE;
+
+    KeAcquireSpinLock(&q->Lock, &oldIrql);
+
+    if (RkMppJobReferencesBuffer(q->InFlight, File, Cookie)) {
+        inUse = TRUE;
+        goto done;
+    }
+
+    for (PLIST_ENTRY e = q->Pending.Flink; e != &q->Pending; e = e->Flink) {
+        RKMPP_JOB *job = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+        if (RkMppJobReferencesBuffer(job, File, Cookie)) {
+            inUse = TRUE;
+            goto done;
+        }
+    }
+
+    for (PLIST_ENTRY e = q->Completed.Flink; e != &q->Completed; e = e->Flink) {
+        RKMPP_JOB *job = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+        if (RkMppJobReferencesBuffer(job, File, Cookie)) {
+            inUse = TRUE;
+            goto done;
+        }
+    }
+
+done:
+    KeReleaseSpinLock(&q->Lock, oldIrql);
+    return inUse;
 }
 
 /* -----------------------------------------------------------------------
@@ -1228,6 +1310,7 @@ RkMppJobPeek(_In_ WDFDEVICE Device,
 
 NTSTATUS
 RkMppJobWait(_In_ WDFDEVICE Device,
+             _In_ WDFFILEOBJECT File,
              _In_ UINT64 JobId,
              _In_ UINT32 TimeoutMs,
              _Out_ RKMPP_WAIT_JOB_OUT *Out)
@@ -1277,6 +1360,10 @@ RkMppJobWait(_In_ WDFDEVICE Device,
         KeReleaseSpinLock(&q->Lock, oldIrql);
         return STATUS_NOT_FOUND;
     }
+    if (job->Owner != File) {
+        KeReleaseSpinLock(&q->Lock, oldIrql);
+        return STATUS_NOT_FOUND;
+    }
 
     if (!alreadyComplete) {
         /* Job still in progress — wait for it with the caller's timeout. */
@@ -1308,18 +1395,15 @@ RkMppJobWait(_In_ WDFDEVICE Device,
              *
              *   Pending  → remove + free (poller hasn't touched it yet).
              *   Completed → remove + free (poller is done with it).
-             *   InFlight → leak the job (poller still holds a pointer
-             *              and will dereference it; freeing here is a
-             *              use-after-free).  The next session reset
-             *              releases queue memory.  Set q->InFlight = NULL
-             *              so subsequent submits don't wedge waiting
-             *              for a "complete" signal that never comes.
+             *   InFlight → leave it attached.  The poller/hardware still
+             *              owns the kick; detaching InFlight here would
+             *              allow a later submit to start a second hardware
+             *              job while the first is still active.
              *
              * The previous "free unconditionally" implementation left
              * the LIST_ENTRY in q->Pending pointing into freed pool —
              * the next SubmitJob iterating Pending crashed at
              * `e->Flink` once the slot was reused. */
-            job->Result = STATUS_TIMEOUT;
             Out->Status         = STATUS_TIMEOUT;
             Out->HardwareStatus = 0;
             Out->ElapsedQpc     = 0;
@@ -1347,12 +1431,9 @@ RkMppJobWait(_In_ WDFDEVICE Device,
                 RemoveEntryList(&job->Link);
                 safeToFree = TRUE;
             } else if (q->InFlight == job) {
-                /* Poller still owns it — leak.  Detach so subsequent
-                 * submits aren't gated on it. */
-                q->InFlight = NULL;
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
                            "rkmpp: WAIT_JOB timeout on InFlight job %llu — "
-                           "leaking (poller still holds pointer)\n",
+                           "leaving attached for poller completion\n",
                            (unsigned long long)job->Id);
             }
             KeReleaseSpinLock(&q->Lock, oldIrql);

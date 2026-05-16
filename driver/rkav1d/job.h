@@ -139,6 +139,7 @@ NTSTATUS RkMppJobSubmit(_In_ WDFDEVICE Device,
 
 /* IOCTL_RKMPP_WAIT_JOB handler. */
 NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
+                      _In_ WDFFILEOBJECT File,
                       _In_ UINT64 JobId,
                       _In_ UINT32 TimeoutMs,
                       _Out_ RKMPP_WAIT_JOB_OUT *Out);
@@ -147,8 +148,17 @@ NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
  * list for a queued or completed job.  Used by tests to verify iova
  * substitution before the real hardware-kick path is in. */
 NTSTATUS RkMppJobPeek(_In_ WDFDEVICE Device,
+                      _In_ WDFFILEOBJECT File,
                       _In_ UINT64 JobId,
                       _Out_ RKMPP_PEEK_JOB_OUT *Out);
+
+/* Return TRUE when Cookie is referenced by any pending, in-flight, or
+ * completed-not-yet-waited job owned by File.  Used by explicit
+ * FREE_BUFFER to avoid tearing down IOVA mappings while a job can still
+ * DMA through, or while user-mode still needs to wait the completed job. */
+BOOLEAN RkMppJobBufferInUse(_In_ WDFDEVICE Device,
+                            _In_ WDFFILEOBJECT File,
+                            _In_ UINT64 Cookie);
 
 /* Drain all jobs owned by a closing file-object so the codec is no
  * longer DMA'ing to iovas backed by buffers we're about to free.

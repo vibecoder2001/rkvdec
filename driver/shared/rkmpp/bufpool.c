@@ -39,6 +39,84 @@ extern PRKIOMMU_INTERFACE RkMppGetIommuIfc(_In_ WDFDEVICE Device);
  * Cookie counter — one global, starts at 1, never wraps in practice
  * --------------------------------------------------------------------- */
 static volatile LONG64 g_nextCookie = 1;
+static volatile LONG64 g_totalAllocatedBytes = 0;
+
+static const ULONG  RKMPP_MAX_BUFFER_BYTES = 128u * 1024u * 1024u;
+static const UINT64 RKMPP_MAX_FILE_BYTES   = 2ull * 1024ull * 1024ull * 1024ull;
+static const LONG64 RKMPP_MAX_GLOBAL_BYTES = 4ll * 1024ll * 1024ll * 1024ll;
+static const UINT32 RKMPP_MAX_FILE_BUFFER_COUNT = 128u;
+
+static BOOLEAN
+RkMppBufUsageValid(_In_ UINT32 Usage)
+{
+    return Usage == RkMppBufferUsageBitstreamInput ||
+           Usage == RkMppBufferUsageReferenceFrame ||
+           Usage == RkMppBufferUsageOutputFrame ||
+           Usage == RkMppBufferUsageScratch;
+}
+
+static NTSTATUS
+RkMppBufRoundSize(_In_ UINT32 Size, _Out_ PULONG Rounded)
+{
+    if (Size == 0 || Size > RKMPP_MAX_BUFFER_BYTES)
+        return STATUS_INVALID_PARAMETER;
+    if (Size > MAXULONG - (PAGE_SIZE - 1))
+        return STATUS_INVALID_PARAMETER;
+
+    *Rounded = (Size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (*Rounded == 0 || *Rounded > RKMPP_MAX_BUFFER_BYTES)
+        return STATUS_INVALID_PARAMETER;
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+RkMppBufReserveQuota(_In_ PRKMPP_FILE_CTX Ctx, _In_ ULONG Size)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&Ctx->Lock, &oldIrql);
+
+    if (Ctx->BufferCount >= RKMPP_MAX_FILE_BUFFER_COUNT ||
+        Ctx->AllocatedBytes > RKMPP_MAX_FILE_BYTES - Size) {
+        KeReleaseSpinLock(&Ctx->Lock, oldIrql);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    Ctx->AllocatedBytes += Size;
+    Ctx->BufferCount++;
+    KeReleaseSpinLock(&Ctx->Lock, oldIrql);
+
+    LONG64 newTotal = InterlockedAdd64(&g_totalAllocatedBytes, Size);
+    if (newTotal > RKMPP_MAX_GLOBAL_BYTES) {
+        InterlockedAdd64(&g_totalAllocatedBytes, -(LONG64)Size);
+
+        KeAcquireSpinLock(&Ctx->Lock, &oldIrql);
+        Ctx->AllocatedBytes -= Size;
+        Ctx->BufferCount--;
+        KeReleaseSpinLock(&Ctx->Lock, oldIrql);
+        return STATUS_QUOTA_EXCEEDED;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static VOID
+RkMppBufReleaseQuota(_In_ PRKMPP_FILE_CTX Ctx, _In_ ULONG Size)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&Ctx->Lock, &oldIrql);
+
+    if (Ctx->AllocatedBytes >= Size)
+        Ctx->AllocatedBytes -= Size;
+    else
+        Ctx->AllocatedBytes = 0;
+
+    if (Ctx->BufferCount > 0)
+        Ctx->BufferCount--;
+
+    KeReleaseSpinLock(&Ctx->Lock, oldIrql);
+    InterlockedAdd64(&g_totalAllocatedBytes, -(LONG64)Size);
+}
 
 /* -----------------------------------------------------------------------
  * RkMppBufFileCtxInit
@@ -50,6 +128,8 @@ RkMppBufFileCtxInit(_In_ WDFFILEOBJECT File, _In_ WDFDEVICE Device)
     InitializeListHead(&ctx->Buffers);
     KeInitializeSpinLock(&ctx->Lock);
     ctx->Device = Device;
+    ctx->AllocatedBytes = 0;
+    ctx->BufferCount = 0;
     return STATUS_SUCCESS;
 }
 
@@ -170,11 +250,19 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
 {
     NTSTATUS status;
 
-    /* --- 1. Round size up to PAGE_SIZE -------------------------------- */
-    if (In->Size == 0)
+    /* --- 1. Validate usage and round size up to PAGE_SIZE ------------- */
+    if (!RkMppBufUsageValid(In->Usage))
         return STATUS_INVALID_PARAMETER;
 
-    ULONG sizeRounded = (In->Size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    ULONG sizeRounded = 0;
+    status = RkMppBufRoundSize(In->Size, &sizeRounded);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    PRKMPP_FILE_CTX fctx = RkMppFileGet(File);
+    status = RkMppBufReserveQuota(fctx, sizeRounded);
+    if (!NT_SUCCESS(status))
+        return status;
 
     /* --- 2. Allocate physically-contiguous memory < 4 GiB ------------ */
     PHYSICAL_ADDRESS lo = {0};
@@ -195,8 +283,10 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
         sizeRounded, lo, hi, boundary,
         PAGE_READWRITE,
         MM_ANY_NODE_OK);
-    if (!kernelVa)
+    if (!kernelVa) {
+        RkMppBufReleaseQuota(fctx, sizeRounded);
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     RtlZeroMemory(kernelVa, sizeRounded);
 
@@ -204,6 +294,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     PMDL mdl = IoAllocateMdl(kernelVa, sizeRounded, FALSE, FALSE, NULL);
     if (!mdl) {
         MmFreeContiguousMemory(kernelVa);
+        RkMppBufReleaseQuota(fctx, sizeRounded);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     MmBuildMdlForNonPagedPool(mdl);
@@ -223,6 +314,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     if (!iommu || !iommu->MapMdl) {
         IoFreeMdl(mdl);
         MmFreeContiguousMemory(kernelVa);
+        RkMppBufReleaseQuota(fctx, sizeRounded);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -236,6 +328,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     if (!NT_SUCCESS(status)) {
         IoFreeMdl(mdl);
         MmFreeContiguousMemory(kernelVa);
+        RkMppBufReleaseQuota(fctx, sizeRounded);
         return status;
     }
 
@@ -252,6 +345,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
         iommu->UnmapMdl(provCtx, iova);
         IoFreeMdl(mdl);
         MmFreeContiguousMemory(kernelVa);
+        RkMppBufReleaseQuota(fctx, sizeRounded);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -267,6 +361,7 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
         iommu->UnmapMdl(provCtx, iova);
         IoFreeMdl(mdl);
         MmFreeContiguousMemory(kernelVa);
+        RkMppBufReleaseQuota(fctx, sizeRounded);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(buf, sizeof(*buf));
@@ -283,7 +378,6 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     ObReferenceObject(buf->OwnerProcess);
 
     /* Insert under lock. */
-    PRKMPP_FILE_CTX fctx = RkMppFileGet(File);
     KIRQL oldIrql;
     KeAcquireSpinLock(&fctx->Lock, &oldIrql);
     InsertTailList(&fctx->Buffers, &buf->Link);
@@ -325,6 +419,7 @@ RkMppBufFree(_In_ WDFFILEOBJECT File, _In_ UINT64 Cookie)
     if (!found)
         return STATUS_NOT_FOUND;
 
+    RkMppBufReleaseQuota(fctx, found->Size);
     RkMppBufFreeOne(found, fctx->Device);
     return STATUS_SUCCESS;
 }
@@ -348,6 +443,7 @@ RkMppBufFreeAll(_In_ WDFFILEOBJECT File)
         KeReleaseSpinLock(&fctx->Lock, oldIrql);
 
         PRKMPP_BUFFER b = CONTAINING_RECORD(e, RKMPP_BUFFER, Link);
+        RkMppBufReleaseQuota(fctx, b->Size);
         RkMppBufFreeOne(b, fctx->Device);
     }
 }

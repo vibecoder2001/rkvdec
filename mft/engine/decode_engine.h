@@ -134,8 +134,9 @@ struct DecodeEngine {
      * max_num_reorder_pics is set on the first slice from SPS:
      *   HEVC: sps_max_num_reorder_pics[sps_max_sub_layers_minus1]
      *   H.264: max_num_ref_frames (VUI's max_num_reorder_frames isn't
-     *          parsed yet — fallback that's correct for B-pyramid
-     *          streams since reorder ≤ ref_frames).
+     *          used for the RK path — fallback that's correct for
+     *          B-pyramid streams since reorder <= ref_frames, and the
+     *          larger window preserves decode pacing).
      */
     struct ReorderEntry {
         int32_t                poc;
@@ -166,6 +167,15 @@ struct DecodeEngine {
     /* Synthetic timeline counter used when the caller passes pts=-1
      * (Annex-B harness mode); HNS units. */
     uint64_t                   submit_count = 0;
+
+    /* Set by DecodeEngine_Flush; cleared by DecodeEngine_Submit on the
+     * first AU containing an IDR/IRAP slice.  While set, Submit silently
+     * drops AUs without an IDR (H.264 nal_unit_type==5) / IRAP (H.265
+     * NAL types 16..23) slice — submitting a P/B slice into an empty
+     * DPB lets bad ref-list entries reach the codec, which on rkvdec2
+     * manifests as a hard timeout (DEC_TIMEOUT_STA bit 5) once it
+     * dereferences the stale colmv pointer. */
+    bool                       wait_for_idr = false;
 };
 
 /* Open the rkmpp device and the per-stream resources for a frame of
@@ -294,6 +304,12 @@ void DecodeEngine_ReleaseFrame(DecodeEngine *e, DecodedFrame *f);
  * doesn't get exhausted when the engine pumps faster than the consumer
  * (audio-locked EVR) drains.  Read only; does not lock. */
 size_t DecodeEngine_QueueDepth(const DecodeEngine *e);
+
+/* Maximum total queued frames (reorder_q + ready_q) that ProcessInput
+ * should allow before applying backpressure.  This must be greater than
+ * the active reorder threshold, otherwise streams with max reorder/ref
+ * depth equal to the old hard cap can deadlock before the first bump. */
+size_t DecodeEngine_InputQueueCapacity(const DecodeEngine *e);
 
 /* Post-decode reorder-queue management — factored out of Submit so it
  * can be exercised host-side without going through the kernel/IOCTL

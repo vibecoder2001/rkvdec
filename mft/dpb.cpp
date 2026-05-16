@@ -68,131 +68,6 @@ static int find_long_term_by_frame_idx(const DpbCtx *ctx, uint32_t lt_idx) {
     return -1;
 }
 
-/* Apply ref_pic_list_modification (spec 8.2.4.3) to one of our
- * already-derived per-slice lists.  Inputs:
- *   list[]          : v4l2_h264_reference array, sized 32 (existing slot)
- *   rplm_ops[]      : parsed (op, value) pairs from slice header
- *   n_rplm          : count of ops
- *   compact_fn[]    : map compact slot idx -> short-term ref frame_num
- *   compact_lt[]    : map compact slot idx -> 1 if long-term, 0 if short
- *   compact_lt_idx[]: long_term_frame_idx (only valid when compact_lt[i]=1)
- *   n_compact       : number of compact entries
- *   curr_pic_num    : current picture's PicNum (frame coding: == frame_num)
- *   max_pic_num     : MaxFrameNum (PicNum modulus)
- *   active_count    : num_ref_idx_lX_active_minus1+1; truncate list to this
- *
- * The algorithm: for each op {0,1,2}, locate the target ref's compact
- * idx, then do shift-insert at refIdxLX (= number of ops processed so
- * far), removing any later duplicate so the list still contains each
- * ref at most once. */
-static void apply_rplm(struct v4l2_h264_reference *list,
-                       const H264ParseResult       *parsed,
-                       int                          which,    /* 0 = L0, 1 = L1 */
-                       const uint16_t              *compact_fn,
-                       const uint8_t               *compact_lt,
-                       const uint16_t              *compact_lt_idx,
-                       uint32_t                     n_compact,
-                       uint16_t                     curr_pic_num,
-                       uint32_t                     max_pic_num,
-                       uint32_t                     active_count)
-{
-    uint8_t  fl    = (which == 0) ? parsed->ref_pic_list_modification_flag_l0
-                                  : parsed->ref_pic_list_modification_flag_l1;
-    if (!fl) return;
-    uint8_t  n_ops = (which == 0) ? parsed->n_rplm_l0 : parsed->n_rplm_l1;
-    const H264RplmOp *ops = (which == 0) ? parsed->rplm_l0 : parsed->rplm_l1;
-    if (n_ops == 0) return;
-
-    /* picNumLXPred starts at CurrPicNum (spec 8.2.4.3.1). */
-    int32_t  pic_num_pred = (int32_t)curr_pic_num;
-    uint32_t ref_idx_lx   = 0;
-
-    for (uint32_t k = 0; k < n_ops; k++) {
-        uint8_t  op  = ops[k].op;
-        uint32_t val = ops[k].value;
-        int32_t  target_compact_idx = -1;
-
-        if (op == 0 || op == 1) {
-            int32_t pic_num_no_wrap;
-            if (op == 0) {
-                pic_num_no_wrap = pic_num_pred - (int32_t)(val + 1);
-                if (pic_num_no_wrap < 0) pic_num_no_wrap += (int32_t)max_pic_num;
-            } else {
-                pic_num_no_wrap = pic_num_pred + (int32_t)(val + 1);
-                if (pic_num_no_wrap >= (int32_t)max_pic_num)
-                    pic_num_no_wrap -= (int32_t)max_pic_num;
-            }
-            pic_num_pred = pic_num_no_wrap;
-            int32_t pic_num_lx = pic_num_no_wrap;
-            if (pic_num_lx > (int32_t)curr_pic_num)
-                pic_num_lx -= (int32_t)max_pic_num;
-            /* Find compact idx of short-term ref with PicNum == pic_num_lx.
-             * For frame coding PicNum = FrameNumWrap; matching by raw
-             * frame_num works whether the value wrapped or not since the
-             * spec arithmetic above already produced a candidate that
-             * collapses to the same wrap class. */
-            int32_t target_fn = pic_num_lx;
-            if (target_fn < 0) target_fn += (int32_t)max_pic_num;
-            for (uint32_t i = 0; i < n_compact; i++) {
-                if (compact_lt[i]) continue;
-                if ((int32_t)compact_fn[i] == target_fn) {
-                    target_compact_idx = (int32_t)i;
-                    break;
-                }
-            }
-        } else if (op == 2) {
-            /* Long-term modification: val == long_term_pic_num. */
-            for (uint32_t i = 0; i < n_compact; i++) {
-                if (!compact_lt[i]) continue;
-                if ((uint32_t)compact_lt_idx[i] == val) {
-                    target_compact_idx = (int32_t)i;
-                    break;
-                }
-            }
-        } else {
-            /* op 3 = end (already filtered by parser) — break defensively. */
-            break;
-        }
-
-        if (target_compact_idx < 0) {
-            /* Modification points at a ref we don't have.  Best we can do
-             * is leave the list alone and continue — applying nothing
-             * matches the codec's would-be reference fallback. */
-            continue;
-        }
-
-        /* Shift list[ref_idx_lx .. active_count-1] right by 1, then place
-         * the target at list[ref_idx_lx].  Then walk the rest of the
-         * (now-32-deep) list and remove the first later duplicate so each
-         * ref appears at most once. */
-        if (ref_idx_lx < 32) {
-            for (int32_t j = 31; j > (int32_t)ref_idx_lx; j--) {
-                list[j] = list[j - 1];
-            }
-            list[ref_idx_lx].index  = (uint8_t)target_compact_idx;
-            list[ref_idx_lx].fields = V4L2_H264_FRAME_REF;
-            for (uint32_t j = ref_idx_lx + 1; j < 32; j++) {
-                if ((list[j].fields & V4L2_H264_FRAME_REF) &&
-                    list[j].index == (uint8_t)target_compact_idx) {
-                    /* collapse */
-                    for (uint32_t m = j; m + 1 < 32; m++) list[m] = list[m + 1];
-                    list[31].fields = 0;
-                    list[31].index  = 0;
-                    break;
-                }
-            }
-        }
-        ref_idx_lx++;
-        if (ref_idx_lx >= active_count) break;
-    }
-
-    /* Truncate beyond active_count — rest stays valid 0-init or prior. */
-    for (uint32_t i = active_count; i < 32; i++) {
-        list[i].fields = 0;
-        list[i].index  = 0;
-    }
-}
-
 /* Apply the captured MMCO list (spec 8.2.5.4) to ctx after the current
  * picture has been decoded.  `cur` is the slot holding the current pic. */
 static void apply_mmco_ops(DpbCtx *ctx, int cur) {
@@ -591,11 +466,17 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
         if (compact[i].long_term)
             e.flags |= V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM;
         e.fields    = compact[i].fields;
-        e.frame_num = compact[i].frame_num;
-        /* For LT refs, pic_num conveys LongTermPicNum (frame coding:
-         * == LongTermFrameIdx).  ST refs use raw frame_num — the codec
-         * keys ref selection off POC (top_field_order_cnt) anyway, and
-         * empirically rejects FrameNumWrap-encoded pic_num. */
+        /* V4L2 semantics: for LT refs, dpb[i].frame_num carries
+         * long_term_frame_idx (not the original short-term frame_num).
+         * H264PackFrameRps consumes e.frame_num to emit the wrap value
+         * the codec uses to match LT refs at slice time; emitting the
+         * original frame_num leaves LT slots unmatchable, causing
+         * ref-list dereferences into junk slots once an LT-marked ref
+         * is actually used. */
+        e.frame_num = compact[i].long_term ? compact[i].long_term_frame_idx
+                                           : compact[i].frame_num;
+        /* pic_num mirrors frame_num here — for LT this is LongTermPicNum
+         * (frame coding: == LongTermFrameIdx). */
         e.pic_num   = compact[i].long_term ? compact[i].long_term_frame_idx
                                            : compact[i].frame_num;
         e.top_field_order_cnt    = compact[i].top_poc;
@@ -752,52 +633,12 @@ DpbStatus Dpb_Select(DpbCtx *ctx, const H264ParseResult *parsed,
             }
         }
 
-        /* ref_pic_list_modification (spec 8.2.4.3) — applied AFTER the
-         * default lists are built.  For P slices (and SP), modifies
-         * ref_lists[0] (= listP).  For B slices, modifies ref_lists[1]
-         * (B's L0) and ref_lists[2] (B's L1).  Without applying these,
-         * the codec uses our default POC/frame_num-sorted lists which
-         * disagree with what the slice header asks for → wrong inter
-         * prediction → cascading garbage from the first RPLM-using AU. */
-        if (parsed->ref_pic_list_modification_flag_l0 ||
-            parsed->ref_pic_list_modification_flag_l1) {
-            uint16_t compact_fn_arr [DPB_MAX_SLOTS];
-            uint8_t  compact_lt_arr [DPB_MAX_SLOTS];
-            uint16_t compact_lti_arr[DPB_MAX_SLOTS];
-            for (uint32_t i = 0; i < n_compact; i++) {
-                compact_fn_arr [i] = compact[i].frame_num;
-                compact_lt_arr [i] = compact[i].long_term;
-                compact_lti_arr[i] = compact[i].long_term_frame_idx;
-            }
-            uint32_t max_pic_num = ctx->max_frame_num
-                                   ? ctx->max_frame_num : 16u;
-            uint16_t curr_pic_num = (uint16_t)parsed->decode.frame_num;
-            const uint8_t st_local = parsed->slice.slice_type;
-
-            uint32_t l0_active = (uint32_t)parsed->slice.num_ref_idx_l0_active_minus1 + 1u;
-            uint32_t l1_active = (uint32_t)parsed->slice.num_ref_idx_l1_active_minus1 + 1u;
-            if (l0_active > 32) l0_active = 32;
-            if (l1_active > 32) l1_active = 32;
-
-            if (st_local == V4L2_H264_SLICE_TYPE_P ||
-                st_local == V4L2_H264_SLICE_TYPE_SP) {
-                /* P slice: modify listP (= ref_lists[0]). */
-                apply_rplm(out->ref_lists[0], parsed, /*which=*/0,
-                           compact_fn_arr, compact_lt_arr, compact_lti_arr,
-                           n_compact, curr_pic_num, max_pic_num,
-                           l0_active);
-            } else if (st_local == V4L2_H264_SLICE_TYPE_B) {
-                /* B slice: modify both B-list halves. */
-                apply_rplm(out->ref_lists[1], parsed, /*which=*/0,
-                           compact_fn_arr, compact_lt_arr, compact_lti_arr,
-                           n_compact, curr_pic_num, max_pic_num,
-                           l0_active);
-                apply_rplm(out->ref_lists[2], parsed, /*which=*/1,
-                           compact_fn_arr, compact_lt_arr, compact_lti_arr,
-                           n_compact, curr_pic_num, max_pic_num,
-                           l1_active);
-            }
-        }
+        /* ref_pic_list_modification is HW-applied: rkvdec2 re-parses the
+         * slice header and modifies the reflists internally.  Pre-applying
+         * RPLM here causes a double-apply on B slices and produces
+         * indices into slots without backing refs → post-seek H.264
+         * timeouts.  See [[h264_v4l2_semantics]] and upstream
+         * rkvdec-vdpu381-h264.c for the V4L2 reference. */
     }
     return DPB_OK;
 }
@@ -836,6 +677,22 @@ void Dpb_OnDecodeComplete(DpbCtx *ctx)
             if (cnt <= max_refs) break;
             evict_oldest_short_term(ctx);
         }
+    }
+
+    ctx->pending_adaptive = 0;
+    ctx->pending_n_mmco   = 0;
+}
+
+extern "C"
+void Dpb_OnDecodeFailed(DpbCtx *ctx)
+{
+    if (!ctx) return;
+    ctx->last_bumped_poc = INT32_MIN;
+
+    if (ctx->current_idx >= 0) {
+        int cur = ctx->current_idx;
+        ctx->current_idx = -1;
+        slot_clear(ctx, cur);
     }
 
     ctx->pending_adaptive = 0;

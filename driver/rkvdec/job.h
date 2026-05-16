@@ -45,13 +45,16 @@ typedef struct _RKMPP_JOB {
      *   user-mode reads from the cached mapping see codec's fresh
      *   data, not stale CPU cache lines.
      *
+     * ColmvCurMdl — the current picture's colmv buffer.  User-mode zeros
+     *   it before the kick, so it needs a pre-kick clean; the codec then
+     *   writes colmv data, so diagnostics that dump it need a post-kick
+     *   invalidate just like output frames.
+     *
      * Buffers NOT tracked here (no per-kick maintenance needed):
      *   - Reference frames: codec reads them, CPU doesn't dirty them,
      *     and they were already invalidated when they were the output
      *     of their original kick.
      *   - Per-ref colmv: codec read-only this kick.
-     *   - colmv_cur: codec writes it but CPU doesn't read it (only the
-     *     codec consumes colmv as ref input on subsequent kicks).
      *   - RCB scratch / error_ref: codec-internal use only.
      *   - CABAC init table: filled once at engine init; CPU doesn't
      *     dirty it after, so no per-kick clean needed.
@@ -61,6 +64,7 @@ typedef struct _RKMPP_JOB {
     UINT32          CleanMdlCount;
     PMDL            CleanMdls[8];
     PMDL            OutputFrameMdl;
+    PMDL            ColmvCurMdl;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------
@@ -118,6 +122,7 @@ NTSTATUS RkMppJobSubmit(_In_ WDFDEVICE Device,
 
 /* IOCTL_RKMPP_WAIT_JOB handler. */
 NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
+                      _In_ WDFFILEOBJECT File,
                       _In_ UINT64 JobId,
                       _In_ UINT32 TimeoutMs,
                       _Out_ RKMPP_WAIT_JOB_OUT *Out);
@@ -126,8 +131,17 @@ NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
  * list for a queued or completed job.  Used by tests to verify iova
  * substitution before the real hardware-kick path is in. */
 NTSTATUS RkMppJobPeek(_In_ WDFDEVICE Device,
+                      _In_ WDFFILEOBJECT File,
                       _In_ UINT64 JobId,
                       _Out_ RKMPP_PEEK_JOB_OUT *Out);
+
+/* Return TRUE when Cookie is referenced by any pending, in-flight, or
+ * completed-not-yet-waited job owned by File.  Used by explicit
+ * FREE_BUFFER to avoid tearing down IOVA mappings while a job can still
+ * DMA through, or while user-mode still needs to wait the completed job. */
+BOOLEAN RkMppJobBufferInUse(_In_ WDFDEVICE Device,
+                            _In_ WDFFILEOBJECT File,
+                            _In_ UINT64 Cookie);
 
 /* Drain all jobs owned by a closing file-object so the codec is no
  * longer DMA'ing to iovas backed by buffers we're about to free.

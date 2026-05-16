@@ -243,6 +243,42 @@ int test_h265_path_no_spill()
     return 0;
 }
 
+/* ============================================================
+ * Test 5 — input capacity must exceed reorder threshold.
+ * ============================================================
+ * ow-rickroll_1080p.mp4 advertises max_num_ref_frames=4.  The MFT
+ * used to hard-cap H.264 input at queue depth 4.  That deadlocked:
+ * four decoded frames sat in reorder_q, ready_q was empty, and the
+ * fifth input (the one that would bump the first output) was refused.
+ */
+int test_input_capacity_allows_reorder_bump()
+{
+    DecodeEngine eng{};
+    eng.codec = Codec::H264;
+
+    constexpr uint32_t kMaxReorder = 4;
+    for (int i = 0; i < 4; i++) {
+        DecodeEngine_OnDecodeComplete(
+            &eng, MakeEntry(i * 2, i * 333333LL),
+            kMaxReorder, i == 0);
+    }
+
+    EXPECT(eng.reorder_q.size() == 4, "expected 4 frames waiting in reorder_q");
+    EXPECT(eng.ready_q.empty(), "expected no ready frame before fifth input");
+    EXPECT(DecodeEngine_QueueDepth(&eng) == 4, "expected total queue depth 4");
+
+    const size_t cap = DecodeEngine_InputQueueCapacity(&eng);
+    EXPECT(cap > DecodeEngine_QueueDepth(&eng),
+           "capacity=%zu must allow fifth input at depth=%zu",
+           cap, DecodeEngine_QueueDepth(&eng));
+
+    DecodeEngine_OnDecodeComplete(
+        &eng, MakeEntry(8, 4 * 333333LL),
+        kMaxReorder, false);
+    EXPECT(!eng.ready_q.empty(), "fifth input should bump one output ready");
+    return 0;
+}
+
 }  /* anon ns */
 
 int main()
@@ -253,6 +289,8 @@ int main()
         {"multi_idr",           test_multi_idr},
         {"no_spill_without_idr",test_no_spill_without_idr},
         {"h265_path_no_spill",  test_h265_path_no_spill},
+        {"input_capacity_allows_reorder_bump",
+                                test_input_capacity_allows_reorder_bump},
     };
     for (auto &t : tests) {
         std::printf("=== %s ===\n", t.name);

@@ -110,6 +110,11 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
             break;
         }
 
+        if (RkMppJobBufferInUse(device, file, in->BufferHandle)) {
+            status = STATUS_DEVICE_BUSY;
+            break;
+        }
+
         status = RkMppBufFree(file, in->BufferHandle);
         break;
     }
@@ -152,9 +157,14 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                                (PVOID*)&in, NULL);
         if (!NT_SUCCESS(status)) break;
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
-                                                (PVOID*)&out, NULL);
+                                                 (PVOID*)&out, NULL);
         if (!NT_SUCCESS(status)) break;
-        status = RkMppJobPeek(WdfIoQueueGetDevice(Queue), in->JobId, out);
+        WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+        if (!file) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = RkMppJobPeek(WdfIoQueueGetDevice(Queue), file, in->JobId, out);
         if (NT_SUCCESS(status)) info = sizeof(*out);
         break;
     }
@@ -172,10 +182,15 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                                (PVOID*)&in, NULL);
         if (!NT_SUCCESS(status)) break;
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out),
-                                                (PVOID*)&out, NULL);
+                                                 (PVOID*)&out, NULL);
         if (!NT_SUCCESS(status)) break;
+        WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
+        if (!file) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
         status = RkMppJobWait(WdfIoQueueGetDevice(Queue),
-                              in->JobId, in->TimeoutMs, out);
+                              file, in->JobId, in->TimeoutMs, out);
         if (NT_SUCCESS(status)) info = sizeof(*out);
         break;
     }

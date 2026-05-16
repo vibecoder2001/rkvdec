@@ -34,6 +34,7 @@
 #include <unknwn.h>
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>

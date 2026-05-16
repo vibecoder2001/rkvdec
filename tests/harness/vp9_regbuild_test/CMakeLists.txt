@@ -1,0 +1,3 @@
+add_executable(vp9_regbuild_test main.cpp)
+target_link_libraries(vp9_regbuild_test PRIVATE rkmpp_mft)
+add_test(NAME vp9_regbuild_test COMMAND vp9_regbuild_test)

@@ -78,14 +78,20 @@ void MppSvc_FreeBuf(MppSvcBuf *b) {
     b->size   = 0;
 }
 
-int MppSvc_SendCodecInfo(int svc_fd, uint32_t width, uint32_t height) {
+int MppSvc_SendCodecInfoFmt(int svc_fd, uint32_t width, uint32_t height,
+                            uint64_t fmt_tag)
+{
     /* Each element: { __u32 type, __u32 flag, __u64 data } = 16 bytes */
     struct CodecInfoElem {
         uint32_t type;
         uint32_t flag;
         uint64_t data;
     };
-    struct CodecInfoElem elems[3];
+    /* DEC_INFO_BITDEPTH = 5 (per linux-rockchip rk_vcodec headers).
+     * Without it the kernel computes task->pixels using bitdepth=0,
+     * which selects the slowest clock mode and the codec times out
+     * before the wait threshold on real streams. */
+    struct CodecInfoElem elems[4];
     elems[0].type = 1;  /* DEC_INFO_WIDTH */
     elems[0].flag = 1;  /* CODEC_INFO_FLAG_NUMBER */
     elems[0].data = width;
@@ -94,7 +100,10 @@ int MppSvc_SendCodecInfo(int svc_fd, uint32_t width, uint32_t height) {
     elems[1].data = height;
     elems[2].type = 3;  /* DEC_INFO_FORMAT */
     elems[2].flag = 2;  /* CODEC_INFO_FLAG_STRING */
-    elems[2].data = 0x34363268ULL; /* "h264\0..." stored as little-endian u64 */
+    elems[2].data = fmt_tag;
+    elems[3].type = 4;  /* DEC_INFO_BITDEPTH (enum value 4 per linux mpp_common.h) */
+    elems[3].flag = 1;
+    elems[3].data = 8;
 
     struct MppReqV1 req = {
         .cmd      = MPP_CMD_SEND_CODEC_INFO,
@@ -104,10 +113,15 @@ int MppSvc_SendCodecInfo(int svc_fd, uint32_t width, uint32_t height) {
         .data_ptr = (uint64_t)(uintptr_t)elems,
     };
     if (ioctl(svc_fd, MPP_IOC_CFG_V1, &req) < 0) {
-        perror("MppSvc_SendCodecInfo");
+        perror("MppSvc_SendCodecInfoFmt");
         return -1;
     }
     return 0;
+}
+
+int MppSvc_SendCodecInfo(int svc_fd, uint32_t width, uint32_t height) {
+    /* "h264\0\0\0\0" little-endian. */
+    return MppSvc_SendCodecInfoFmt(svc_fd, width, height, 0x34363268ULL);
 }
 
 int MppSvc_ImportFds(int svc_fd, const int *fds, int n) {
@@ -198,10 +212,10 @@ static void dump_reglist(const H264RegWriteList *rl,
 int MppSvc_Submit(int svc_fd, const H264RegWriteList *rl,
                   const MppSvcBufMap *buf_map, int n_bufs,
                   uint32_t *irq_readback,
-                  uint32_t width, uint32_t height)
+                  uint32_t width, uint32_t height,
+                  MppSvcCodec codec)
 {
     struct MppReqV1 reqs[N_BANKS + 1];  /* +1 for SET_RCB_INFO */
-    (void)height;
     uint32_t bank_words[N_BANKS][BANK_MAX_WORDS];
     uint32_t i, b;
     int n_reqs = 0;
@@ -272,6 +286,15 @@ int MppSvc_Submit(int svc_fd, const H264RegWriteList *rl,
             }
         }
 
+        /* Skip empty banks — BSP HAL omits banks whose trans_tbl entries
+         * are all-zero for the current codec, and the codec on RK3588
+         * is sensitive to zero-writes of e.g. r200..r204 (bank 4) for
+         * VP9: writing them wedges with hw=0x23. */
+        int all_zero = 1;
+        for (uint32_t w = 0; w < n_words; w++) {
+            if (bank_words[b][w]) { all_zero = 0; break; }
+        }
+        if (all_zero) continue;
         reqs[n_reqs++] = (struct MppReqV1){
             .cmd      = MPP_CMD_SET_REG_WRITE,
             .flag     = MPP_FLAGS_MULTI_MSG,
@@ -309,39 +332,55 @@ int MppSvc_Submit(int svc_fd, const H264RegWriteList *rl,
      * doesn't use at this resolution and the watchdog fires (irq=0x23).
      */
     struct RcbElem { uint32_t index; uint32_t size; };
-    struct RcbElem rcb_elems[8];
+    struct RcbElem rcb_elems[10];
     int n_rcb = 0;
 
-    const uint32_t bit_depth = 8;
-    const uint32_t mbaff = 0;
-    const uint32_t w_aligned = (width + 15u) & ~15u;
     #define RCB_BYTES(bits) ((((bits) + 7u) / 8u + 63u) & ~63u)
+    #define RCB_LEN(coeff,len) ((((coeff) * (len)) + 63u) & ~63u)
 
-    /* Priority order: DBLK, INTRA, SAO, INTER, FBC, TRANSD_ROW, STRMD,
-     * INTER_COL, FILT_COL, TRANSD_COL.  INTER_ROW is skipped. */
-    /* DBLK_ROW (SW139) */
-    {
-        uint32_t bits = w_aligned * (2u + (mbaff ? 12u : 6u) * bit_depth);
-        if (bits) { rcb_elems[n_rcb++] = (struct RcbElem){139, RCB_BYTES(bits)}; }
+    if (codec == MPP_SVC_CODEC_VP9) {
+        /* VP9 — BSP `vp9d_refine_rcb_size` (hal_vp9d_vdpu34x.c) zeros
+         * most RCB entries for typical streams, and SET_BY_PRIORITY then
+         * skips zero-size and INTER_ROW.  Result: BSP submits only 3
+         * entries (DBLK_ROW, INTRA_ROW, FILT_COL) for 8-bit non-FBC
+         * streams up to 4Kp.  Submitting the others lights the codec
+         * watchdog with irq=0x23 (SRAM conflict for unused regions).
+         *
+         * Sizes use BSP's bit-accurate formulas, rounded up to bytes
+         * and 64-aligned (MPP_RCB_BYTES). */
+        const uint32_t w64 = (width  + 63u) & ~63u;
+        const uint32_t h64 = (height + 63u) & ~63u;
+        const uint32_t bd  = 8;
+        #define RCB_BITS(bits) ((((bits) + 7u) / 8u + 63u) & ~63u)
+
+        /* DBLK_ROW: width * (1 + 16 * bit_depth) bits */
+        rcb_elems[n_rcb++] = (struct RcbElem){ 139u, RCB_BITS(w64 * (1u + 16u * bd)) };
+        /* INTRA_ROW: width * 48 bits */
+        rcb_elems[n_rcb++] = (struct RcbElem){ 133u, RCB_BITS(w64 * 48u) };
+        /* FILT_COL: height * (4 + 16 * bit_depth) bits (fbc_e=0 path) */
+        rcb_elems[n_rcb++] = (struct RcbElem){ 142u, RCB_BITS(h64 * (4u + 16u * bd)) };
+        #undef RCB_BITS
+    } else {
+        /* H.264 — original sizing kept for the H.264 path. */
+        const uint32_t bit_depth = 8;
+        const uint32_t mbaff = 0;
+        const uint32_t w_aligned = (width + 15u) & ~15u;
+
+        {
+            uint32_t bits = w_aligned * (2u + (mbaff ? 12u : 6u) * bit_depth);
+            if (bits) { rcb_elems[n_rcb++] = (struct RcbElem){139, RCB_BYTES(bits)}; }
+        }
+        {
+            uint32_t bits = w_aligned * 44u;
+            if (bits) { rcb_elems[n_rcb++] = (struct RcbElem){133, RCB_BYTES(bits)}; }
+        }
+        if (w_aligned > 4096u) {
+            uint32_t bits = ((w_aligned + 15u) / 16u) * 154u * (mbaff ? 2u : 1u);
+            rcb_elems[n_rcb++] = (struct RcbElem){136, RCB_BYTES(bits)};
+        }
     }
-    /* INTRA_ROW (SW133) */
-    {
-        uint32_t bits = w_aligned * 44u;
-        if (bits) { rcb_elems[n_rcb++] = (struct RcbElem){133, RCB_BYTES(bits)}; }
-    }
-    /* SAO_ROW (SW140) — h264 sets to 0 */
-    /* INTER_ROW (SW137) — skipped by priority mode */
-    /* FBC_ROW (SW141) — only when fbc_e and chroma>1, h264 we don't enable */
-    /* TRANSD_ROW (SW134) — only when width > 8192 */
-    /* STRMD_ROW (SW136) — only when width > 4096 */
-    if (w_aligned > 4096u) {
-        uint32_t bits = ((w_aligned + 15u) / 16u) * 154u * (mbaff ? 2u : 1u);
-        rcb_elems[n_rcb++] = (struct RcbElem){136, RCB_BYTES(bits)};
-    }
-    /* INTER_COL (SW138) — h264 sets to 0 */
-    /* FILT_COL (SW142) — h264 sets to 0 */
-    /* TRANSD_COL (SW135) — only when height > 8192 */
     #undef RCB_BYTES
+    #undef RCB_LEN
 
     reqs[n_reqs++] = (struct MppReqV1){
         .cmd      = MPP_CMD_SET_RCB_INFO,

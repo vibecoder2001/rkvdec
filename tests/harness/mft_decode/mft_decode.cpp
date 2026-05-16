@@ -48,7 +48,7 @@
 
 typedef HRESULT (__stdcall *PFN_DllGetClassObject)(REFCLSID, REFIID, void **);
 
-enum class CodecCli { H264, H265, AV1 };
+enum class CodecCli { H264, H265, AV1, VP9 };
 
 /* -------- Annex-B AU walker — H.264/H.265 share mft/au_iter. ----------- */
 
@@ -71,7 +71,8 @@ static bool au_next_av1(const uint8_t *b, size_t l, size_t *pos,
 
 static bool au_next(CodecCli c, const uint8_t *b, size_t l, size_t *pos,
                     size_t *off, size_t *len) {
-    if (c == CodecCli::AV1)  return au_next_av1(b, l, pos, off, len);
+    if (c == CodecCli::AV1 || c == CodecCli::VP9)
+        return au_next_av1(b, l, pos, off, len);
     AuIter it = { b, l, *pos };
     int ok = (c == CodecCli::H265)
                 ? H265AuNext(&it, off, len, nullptr)
@@ -170,15 +171,16 @@ int wmain(int argc, wchar_t **argv) {
             else if (!wcscmp(c, L"h265") || !wcscmp(c, L"H265") ||
                      !wcscmp(c, L"hevc") || !wcscmp(c, L"HEVC")) codec = CodecCli::H265;
             else if (!wcscmp(c, L"av1")  || !wcscmp(c, L"AV1"))  codec = CodecCli::AV1;
+            else if (!wcscmp(c, L"vp9")  || !wcscmp(c, L"VP9"))  codec = CodecCli::VP9;
             else {
                 std::printf("unknown codec: %ls\n", c);
                 return 1;
             }
         } else {
-            std::printf("usage: mft_decode --codec h264|h265|av1 --in <file> "
+            std::printf("usage: mft_decode --codec h264|h265|av1|vp9 --in <file> "
                         "--out <yuv> [--width W --height H] [--frames N]\n"
                         "  h264/h265: input is Annex-B bitstream\n"
-                        "  av1:       input is an IVF file (DKIF header + OBU TUs)\n"
+                        "  av1/vp9:   input is an IVF file (DKIF header + frames)\n"
                         "  --frames N: stop after N decoded output frames "
                         "(default: unlimited)\n");
             return 1;
@@ -201,7 +203,8 @@ int wmain(int argc, wchar_t **argv) {
     std::vector<uint8_t> bs(fsize);
     std::fread(bs.data(), 1, fsize, f);
     std::fclose(f);
-    const char *codec_str = (codec == CodecCli::AV1)  ? "av1"
+    const char *codec_str = (codec == CodecCli::VP9)  ? "vp9"
+                          : (codec == CodecCli::AV1)  ? "av1"
                           : (codec == CodecCli::H265) ? "h265"
                                                       : "h264";
     std::printf("input: %ls (%ld bytes) codec=%s %ux%u\n", in_path, fsize,
@@ -223,10 +226,12 @@ int wmain(int argc, wchar_t **argv) {
         return 3;
     }
 
-    REFCLSID clsid = (codec == CodecCli::AV1)  ? CLSID_RkmppAv1Decoder
+    REFCLSID clsid = (codec == CodecCli::VP9)  ? CLSID_RkmppVp9Decoder
+                   : (codec == CodecCli::AV1)  ? CLSID_RkmppAv1Decoder
                    : (codec == CodecCli::H265) ? CLSID_RkmppHevcDecoder
                                                : CLSID_RkmppH264Decoder;
-    GUID input_subtype = (codec == CodecCli::AV1)  ? MFVideoFormat_AV1
+    GUID input_subtype = (codec == CodecCli::VP9)  ? MFVideoFormat_VP90
+                       : (codec == CodecCli::AV1)  ? MFVideoFormat_AV1
                        : (codec == CodecCli::H265) ? MFVideoFormat_HEVC
                                                    : MFVideoFormat_H264;
 
@@ -266,7 +271,7 @@ int wmain(int argc, wchar_t **argv) {
      * picture dimensions from the IVF header so the MFT's output type
      * matches the bitstream regardless of --width/--height defaults. */
     size_t pos = 0;
-    if (codec == CodecCli::AV1) {
+    if (codec == CodecCli::AV1 || codec == CodecCli::VP9) {
         if (bs.size() < 32 || std::memcmp(bs.data(), "DKIF", 4) != 0) {
             std::printf("FAIL: not an IVF file (missing DKIF header)\n");
             return 7;

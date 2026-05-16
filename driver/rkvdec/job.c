@@ -1230,6 +1230,17 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
      * per-kick cache maintenance — reg130 = output, reg131 = current
      * colmv, reg128/129/161/163/180 = inputs the CPU just wrote and
      * the codec is about to DMA. */
+    /* VP9-specific: reg162 (last_prob_base) is dual-mode — it points
+     * at prob_default on keyframe/cold-context (CPU-written; needs
+     * pre-kick clean) but at prob_loop[fcx] on inter (HW writeback
+     * target — cleaning it would push stale CPU lines over HW's
+     * adapted CDFs).  reg172 (update_prob_wr_base) is always the
+     * writeback target.  If reg162's buffer differs from reg172's,
+     * reg162 is prob_default and must be flushed; if equal, leave
+     * the cache alone.  Capture handles here and post-process below. */
+    UINT64 reg162Handle = 0;
+    UINT64 reg172Handle = 0;
+
     job->DenseIovaSlotCount = In->IovaSlotCount;
     for (UINT32 i = 0; i < In->IovaSlotCount; i++) {
         const RKMPP_DENSE_IOVA_SLOT *src = &In->IovaSlots[i];
@@ -1286,6 +1297,16 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
             continue;
         }
         const UINT32 byteOff = src->RegIdx * 4u;
+        if (byteOff == 0x288u) {
+            /* reg162 — defer cache decision until we know reg172's
+             * handle (see comment above and post-loop block below). */
+            reg162Handle = src->BufferHandle;
+            continue;
+        }
+        if (byteOff == 0x2B0u) {                /* reg172 = HW writeback */
+            reg172Handle = src->BufferHandle;
+            continue;
+        }
         if (byteOff == 0x208u) {                /* output frame */
             if (job->OutputFrameMdl == NULL) job->OutputFrameMdl = mdl;
         } else if (byteOff == 0x20Cu) {         /* current colmv */
@@ -1299,8 +1320,28 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
                 job->CleanMdls[job->CleanMdlCount++] = mdl;
             }
         } else if (byteOff == 0x200u || byteOff == 0x204u ||
+                   byteOff == 0x280u ||
                    byteOff == 0x284u || byteOff == 0x28Cu ||
-                   byteOff == 0x2D0u) {         /* RLC + PPS + RPS + scanlist */
+                   byteOff == 0x2D0u) {
+            /* CPU-written buffers the codec DMAs as input:
+             *   0x200 = reg128  RLC bitstream                  (per-kick)
+             *   0x204 = reg129  RLC write                      (per-kick)
+             *   0x280 = reg160  VP9 delta_prob_base — FillProbs output,
+             *                   CPU rewrites every kick.
+             *   0x284 = reg161  H.265 PPS / VP9 scratch
+             *   0x28C = reg163  H.265 RPS / VP9 scratch
+             *   0x2D0 = reg180  H.265 scanlist
+             *
+             * Deliberately NOT in this list (VP9):
+             *   0x288 = reg162  last_prob_base.  CPU writes default
+             *                   probs once at session init; thereafter
+             *                   HW alternates write/read via reg172/162.
+             *                   Pre-kick cleaning would push CPU's stale
+             *                   defaults over HW's writeback on every
+             *                   inter frame; the codec then reads back
+             *                   defaults instead of the adapted CDFs.
+             *   0x2A0 = reg168  segid_last_base — same hazard for seg
+             *                   streams; revisit if seg paths land. */
             BOOLEAN already = FALSE;
             for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
                 if (job->CleanMdls[k] == mdl) { already = TRUE; break; }
@@ -1308,6 +1349,28 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
             if (!already &&
                 job->CleanMdlCount < RTL_NUMBER_OF(job->CleanMdls)) {
                 job->CleanMdls[job->CleanMdlCount++] = mdl;
+            }
+        }
+    }
+
+
+    /* VP9 reg162 disambiguation: clean only when it points at a
+     * different buffer than reg172.  Equal handles ⇒ prob_loop[fcx]
+     * (HW writeback target, leave cache alone — clean would push
+     * stale CPU lines over HW's adapted CDFs).  Different ⇒
+     * prob_default (CPU-written; flush so codec's first read returns
+     * the memcpy'd defaults instead of whatever cache last held). */
+    if (reg162Handle != 0 && reg162Handle != reg172Handle) {
+        PMDL reg162Mdl = NULL;
+        if (NT_SUCCESS(RkMppBufLookupMdl(File, reg162Handle, &reg162Mdl)) &&
+            reg162Mdl != NULL) {
+            BOOLEAN already = FALSE;
+            for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
+                if (job->CleanMdls[k] == reg162Mdl) { already = TRUE; break; }
+            }
+            if (!already &&
+                job->CleanMdlCount < RTL_NUMBER_OF(job->CleanMdls)) {
+                job->CleanMdls[job->CleanMdlCount++] = reg162Mdl;
             }
         }
     }

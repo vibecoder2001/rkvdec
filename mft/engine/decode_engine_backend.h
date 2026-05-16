@@ -57,6 +57,7 @@ typedef enum DecodeEngineBufUsage {
 typedef enum DecodeEngineCodec {
     DE_CODEC_H264 = 0,
     DE_CODEC_H265 = 1,
+    DE_CODEC_VP9  = 2,
 } DecodeEngineCodec;
 
 typedef struct DecodeEngineBackend {

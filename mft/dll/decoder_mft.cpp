@@ -22,7 +22,9 @@
  * mapping: rkmpp::CodecKind <-> ::Codec (separate enums, same intent). */
 #include "decode_engine.h"
 #include "decode_engine_av1.h"
+#include "decode_engine_vp9.h"
 #include "../av1_parser.h"
+#include "../vp9_parser.h"
 
 namespace rkmpp {
 
@@ -65,6 +67,7 @@ const wchar_t *DecoderFriendlyName(CodecKind k) {
     case CodecKind::H264: return L"Rockchip RK3588 H.264 Decoder";
     case CodecKind::HEVC: return L"Rockchip RK3588 HEVC Decoder";
     case CodecKind::AV1:  return L"Rockchip RK3588 AV1 Decoder";
+    case CodecKind::VP9:  return L"Rockchip RK3588 VP9 Decoder";
     }
     return L"Rockchip RK3588 Decoder";
 }
@@ -73,6 +76,7 @@ const GUID &DecoderClsid(CodecKind k) {
     case CodecKind::H264: return CLSID_RkmppH264Decoder;
     case CodecKind::HEVC: return CLSID_RkmppHevcDecoder;
     case CodecKind::AV1:  return CLSID_RkmppAv1Decoder;
+    case CodecKind::VP9:  return CLSID_RkmppVp9Decoder;
     }
     return CLSID_RkmppH264Decoder;
 }
@@ -81,6 +85,7 @@ const GUID &DecoderInputSubtype(CodecKind k) {
     case CodecKind::H264: return MFVideoFormat_H264;
     case CodecKind::HEVC: return MFVideoFormat_HEVC;
     case CodecKind::AV1:  return MFVideoFormat_AV1;
+    case CodecKind::VP9:  return MFVideoFormat_VP90;
     }
     return MFVideoFormat_H264;
 }
@@ -106,6 +111,12 @@ DecoderMFT::~DecoderMFT() {
         Av1DecodeEngine_Shutdown(eng);
         delete eng;
         engine_av1_ = nullptr;
+    }
+    if (engine_vp9_) {
+        auto *eng = static_cast<Vp9DecodeEngine *>(engine_vp9_);
+        Vp9DecodeEngine_Shutdown(eng);
+        delete eng;
+        engine_vp9_ = nullptr;
     }
     ReleaseD3DManager();
     if (attributes_) { attributes_->Release(); attributes_ = nullptr; }
@@ -859,6 +870,46 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
             streaming_ = true;
             return S_OK;
         }
+        if (kind_ == CodecKind::VP9) {
+            if (!engine_vp9_) {
+                auto *eng = new Vp9DecodeEngine();
+                int rc = Vp9DecodeEngine_Init(eng, width_, height_);
+                std::fprintf(stderr,
+                    "rkmpp MFT(vp9): Init(%ux%u) rc=%d\n",
+                    width_, height_, rc);
+                if (rc != 0) {
+                    Vp9DecodeEngine_Shutdown(eng);
+                    delete eng;
+                    engine_vp9_         = nullptr;
+                    engine_init_failed_ = true;
+                } else {
+                    /* Diagnostic: bring-up still needs the BSP-captured
+                     * probe blob to produce a correct keyframe.  Plumb
+                     * via env var so mft_decode can drive testing. */
+                    char pbuf[260] = {};
+                    if (GetEnvironmentVariableA("RKMPP_VP9_PROBE_BLOB",
+                                                pbuf, sizeof(pbuf)) > 0) {
+                        static std::string s_path = pbuf;
+                        eng->probe_blob_path = s_path.c_str();
+                        std::fprintf(stderr,
+                            "rkmpp MFT(vp9): probe blob = %s\n", pbuf);
+                    }
+                    char dbuf[260] = {};
+                    if (GetEnvironmentVariableA("RKMPP_VP9_DUMP_BANK",
+                                                dbuf, sizeof(dbuf)) > 0) {
+                        static std::string s_dump = dbuf;
+                        eng->dump_prefix = s_dump.c_str();
+                        std::fprintf(stderr,
+                            "rkmpp MFT(vp9): bank dump prefix = %s\n", dbuf);
+                    }
+                    engine_vp9_         = eng;
+                    engine_init_failed_ = false;
+                }
+                std::fflush(stderr);
+            }
+            streaming_ = true;
+            return S_OK;
+        }
         if (!engine_) {
             auto *eng = new DecodeEngine();
             int rc = DecodeEngine_Init(eng, ToEngineCodec(kind_),
@@ -911,6 +962,13 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
             delete eng;
             engine_av1_ = nullptr;
         }
+        if (engine_vp9_) {
+            auto *eng = static_cast<Vp9DecodeEngine *>(engine_vp9_);
+            Vp9DecodeEngine_Shutdown(eng);
+            delete eng;
+            engine_vp9_ = nullptr;
+        }
+        vp9_out_queue_.clear();
         engine_init_failed_ = false;
         streaming_ = false;
         input_queue_.clear();
@@ -933,6 +991,7 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
             auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
             (void)Av1DecodeEngine_Flush(eng);
         }
+        vp9_out_queue_.clear();
         return S_OK;
     case MFT_MESSAGE_NOTIFY_START_OF_STREAM:
     case MFT_MESSAGE_NOTIFY_END_OF_STREAM:
@@ -1012,6 +1071,103 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
             eng->cached_seq_hdr.hbd && bit_depth_ != 10) {
             bit_depth_ = 10;
         }
+        return S_OK;
+    }
+
+    /* VP9 path: synchronous DecodeOne per superframe-subframe; produced
+     * NV12 frames buffered in vp9_out_queue_ for ProcessOutput to emit. */
+    if (kind_ == CodecKind::VP9) {
+        if (!engine_vp9_ || engine_init_failed_) return MF_E_NOTACCEPTING;
+        const size_t kVp9QueueCap = 8;
+        if (vp9_out_queue_.size() >= kVp9QueueCap) return MF_E_NOTACCEPTING;
+        LONGLONG pts = 0;
+        if (FAILED(sample->GetSampleTime(&pts))) {
+            pts = (LONGLONG)((samples_received_ * 10'000'000ULL * fps_den_)
+                             / (fps_num_ ? fps_num_ : 30));
+        }
+        DWORD buf_count = 0;
+        HRESULT hr = sample->GetBufferCount(&buf_count);
+        if (FAILED(hr)) return hr;
+        std::vector<uint8_t> au;
+        for (DWORD i = 0; i < buf_count; ++i) {
+            IMFMediaBuffer *mfb = nullptr;
+            hr = sample->GetBufferByIndex(i, &mfb);
+            if (FAILED(hr)) return hr;
+            BYTE *p = nullptr; DWORD cur = 0, max = 0;
+            hr = mfb->Lock(&p, &max, &cur);
+            if (SUCCEEDED(hr)) {
+                au.insert(au.end(), p, p + cur);
+                mfb->Unlock();
+            }
+            mfb->Release();
+            if (FAILED(hr)) return hr;
+        }
+        samples_received_++;
+        const uint8_t *frames[8] = {};
+        size_t         fsizes[8] = {};
+        int nf = vp9::Vp9Parser_SuperframeSplit(au.data(), au.size(),
+                                                frames, fsizes, 8);
+        std::fprintf(stderr,
+            "rkmpp MFT(vp9): PI au_bytes=%zu nf=%d\n", au.size(), nf);
+        if (nf <= 0) { decode_errors_++; std::fflush(stderr); return S_OK; }
+        /* Eager profile peek — drives BuildOutputType's NV12-vs-P010
+         * choice before the first ProcessOutput.  WebM/MKV containers
+         * don't surface a VPCC-style extradata via MF, so the only way
+         * to know we're 10-bit before SetOutputType locks in NV12 is to
+         * read profile out of the first frame's uncompressed header.
+         * VP9 uncompressed header (spec §6.2, MSB-first):
+         *   frame_marker  f(2)   : byte0[7:6] = 0b10
+         *   profile_low   f(1)   : byte0[5]
+         *   profile_high  f(1)   : byte0[4]
+         *   profile = profile_low | (profile_high << 1)
+         * If the negotiated output_type_ is already locked to NV12 and
+         * we now know we're 10-bit, ProcessOutput emits STREAM_CHANGE so
+         * the client (mpv, EVR, ...) re-queries and lands on P010. */
+        /* Only profile 2 (4:2:0 10-bit) is wired through repack_yuv;
+         * profile 3 (4:4:4) and 12-bit are rejected by the parser, so
+         * don't pre-commit to P010 for them — let DecodeOne fail with
+         * the actual error instead of pinning the output type. */
+        if (fsizes[0] >= 1 && frames[0]) {
+            uint8_t b0 = frames[0][0];
+            if (((b0 >> 6) & 0x3u) == 2u) {
+                uint8_t profile = ((b0 >> 5) & 0x1u)
+                                | (((b0 >> 4) & 0x1u) << 1);
+                if (profile == 2u && bit_depth_ != 10) {
+                    bit_depth_ = 10;
+                    std::fprintf(stderr,
+                        "rkmpp MFT(vp9): eager profile=2 → bit_depth=10\n");
+                }
+            }
+        }
+        auto *eng = static_cast<Vp9DecodeEngine *>(engine_vp9_);
+        for (int i = 0; i < nf; ++i) {
+            Vp9DecodedFrame df;
+            int rc = Vp9DecodeEngine_DecodeOne(eng, frames[i], fsizes[i],
+                                               (int64_t)pts, &df);
+            std::fprintf(stderr,
+                "rkmpp MFT(vp9): DecodeOne[%d] sz=%zu rc=%d show=%d yuv=%zu\n",
+                i, fsizes[i], rc, (int)df.show, df.yuv.size());
+            if (rc != 0) { decode_errors_++; continue; }
+            /* Refresh bit_depth_ from the first 10-bit frame the engine
+             * parses — VP9 has no avcC-style extradata, so Profile 2 is
+             * only knowable after the first uncompressed header.  Drives
+             * BuildOutputType's NV12-vs-P010 choice; ProcessOutput below
+             * also self-corrects per-frame from df.bit_depth. */
+            if (rc == 0 && df.bit_depth == 10 && bit_depth_ != 10) {
+                bit_depth_ = 10;
+            }
+            if (df.show && !df.yuv.empty()) {
+                Vp9OutFrame o;
+                o.yuv       = std::move(df.yuv);
+                o.pts_hns   = df.pts_hns;
+                o.width     = df.width;
+                o.height    = df.height;
+                o.bit_depth = df.bit_depth;
+                vp9_out_queue_.push_back(std::move(o));
+            }
+            Vp9DecodeEngine_ReleaseFrame(eng, &df);
+        }
+        std::fflush(stderr);
         return S_OK;
     }
 
@@ -1354,6 +1510,190 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
                          (long long)mft_copy_us);
             std::fflush(stderr);
         }
+        return S_OK;
+    }
+
+    /* VP9 path: pop a decoded frame from vp9_out_queue_ and emit. */
+    if (kind_ == CodecKind::VP9) {
+        /* Signal STREAM_CHANGE if the head frame's bit-depth or coded
+         * dimensions no longer match the negotiated output type.  VP9
+         * permits in-band resolution change (spec §8.6.1) and the
+         * profile peek in ProcessInput may discover Profile 2 after
+         * SetOutputType has already locked NV12.  Drop output_type_ and
+         * advertise the new size/format via BuildOutputType — the
+         * client (mpv) re-queries and the queued frame emits next pass.
+         *
+         * Uses the head frame's dims rather than width_/height_ so the
+         * upload below doesn't read past frame.yuv when a stream's
+         * coded size shrinks mid-decode. */
+        bool need_change = false;
+        bool need_p010 = (bit_depth_ == 10);
+        if (output_type_ && !vp9_out_queue_.empty()) {
+            const Vp9OutFrame &head = vp9_out_queue_.front();
+            need_p010 = (head.bit_depth == 10);
+            GUID sub = {};
+            output_type_->GetGUID(MF_MT_SUBTYPE, &sub);
+            const bool have_p010 = (sub == MFVideoFormat_P010);
+            if (need_p010 != have_p010
+                || head.width  != width_
+                || head.height != height_) {
+                std::fprintf(stderr,
+                    "rkmpp MFT(vp9): STREAM_CHANGE %ux%u/%s → %ux%u/%s\n",
+                    (unsigned)width_, (unsigned)height_,
+                    have_p010 ? "P010" : "NV12",
+                    (unsigned)head.width, (unsigned)head.height,
+                    need_p010 ? "P010" : "NV12");
+                std::fflush(stderr);
+                width_      = head.width;
+                height_     = head.height;
+                bit_depth_  = head.bit_depth;
+                need_change = true;
+            }
+        }
+        if (need_change) {
+            output_type_->Release();
+            output_type_ = nullptr;
+            buf[0].pSample  = nullptr;
+            buf[0].dwStatus = MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+            if (status) *status = MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+            return MF_E_TRANSFORM_STREAM_CHANGE;
+        }
+        /* Bit-depth-only case (queue empty but eager peek changed
+         * bit_depth_): handle outside the head-frame guard above. */
+        if (output_type_ && vp9_out_queue_.empty()) {
+            GUID sub = {};
+            output_type_->GetGUID(MF_MT_SUBTYPE, &sub);
+            const bool have_p010 = (sub == MFVideoFormat_P010);
+            if (need_p010 != have_p010) {
+                std::fprintf(stderr,
+                    "rkmpp MFT(vp9): STREAM_CHANGE (depth-only) need_p010=%d have_p010=%d\n",
+                    (int)need_p010, (int)have_p010);
+                std::fflush(stderr);
+                output_type_->Release();
+                output_type_ = nullptr;
+                buf[0].pSample  = nullptr;
+                buf[0].dwStatus = MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+                if (status) *status = MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+                return MF_E_TRANSFORM_STREAM_CHANGE;
+            }
+        }
+        if (vp9_out_queue_.empty()) {
+            buf[0].pSample = nullptr;
+            return MF_E_TRANSFORM_NEED_MORE_INPUT;
+        }
+        Vp9OutFrame frame = std::move(vp9_out_queue_.front());
+        vp9_out_queue_.pop_front();
+
+        /* 8-bit → NV12 (1 byte/sample); 10-bit → P010 (2 bytes/sample,
+         * 10 valid bits in upper 10 — repack done in the engine via
+         * RepackCodecOutputToNV12orP010).  All offsets keyed off the
+         * head frame's dims; the STREAM_CHANGE block above guarantees
+         * frame.{width,height} == width_/height_ here, but use the
+         * frame fields for clarity so the upload bytes match what was
+         * actually written into frame.yuv. */
+        const bool   is_p010    = (frame.bit_depth == 10);
+        const DWORD  bpp        = is_p010 ? 2u : 1u;
+        const UINT32 fw         = frame.width;
+        const UINT32 fh         = frame.height;
+        const DWORD  row_bytes  = (DWORD)fw * bpp;
+        const DWORD  y_bytes    = row_bytes * fh;
+        const DWORD  plane_bytes = (DWORD)frame.yuv.size();
+        IMFMediaBuffer  *mbuf    = nullptr;
+        ID3D11Texture2D *texture = nullptr;
+        HRESULT hr = S_OK;
+        ID3D11Device *use_d3d = d3d_device_;
+
+        if (use_d3d && fw && fh) {
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = fw; td.Height = fh;
+            td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = is_p010 ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+            hr = d3d_device_->CreateTexture2D(&td, nullptr, &texture);
+            if (FAILED(hr)) {
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                hr = d3d_device_->CreateTexture2D(&td, nullptr, &texture);
+                if (FAILED(hr)) return hr;
+            }
+            const UINT row_pitch = row_bytes;
+            d3d_context_->UpdateSubresource(texture, 0, nullptr,
+                                            frame.yuv.data(),
+                                            row_pitch, row_pitch * fh);
+            d3d_context_->UpdateSubresource(texture, 1, nullptr,
+                                            frame.yuv.data() + (size_t)row_pitch * fh,
+                                            row_pitch, row_pitch * (fh / 2));
+            hr = MFCreateDXGISurfaceBuffer(IID_ID3D11Texture2D, texture,
+                                           0, FALSE, &mbuf);
+            if (FAILED(hr)) { texture->Release(); return hr; }
+            mbuf->SetCurrentLength(plane_bytes);
+        } else if (dxgi_manager_) {
+            const DWORD fourcc = is_p010 ? MAKEFOURCC('P','0','1','0')
+                                         : MAKEFOURCC('N','V','1','2');
+            hr = MFCreate2DMediaBuffer(fw, fh, fourcc,
+                                       FALSE, &mbuf);
+            if (FAILED(hr)) return hr;
+            IMF2DBuffer *buf2d = nullptr;
+            hr = mbuf->QueryInterface(IID_PPV_ARGS(&buf2d));
+            if (FAILED(hr) || !buf2d) {
+                mbuf->Release();
+                return FAILED(hr) ? hr : E_NOINTERFACE;
+            }
+            BYTE *dst = nullptr; LONG pitch = 0;
+            hr = buf2d->Lock2D(&dst, &pitch);
+            if (FAILED(hr)) { buf2d->Release(); mbuf->Release(); return hr; }
+            const uint8_t *src_y  = frame.yuv.data();
+            const uint8_t *src_uv = src_y + (size_t)y_bytes;
+            for (UINT32 r = 0; r < fh; r++)
+                std::memcpy(dst + (size_t)r * pitch,
+                            src_y + (size_t)r * row_bytes, row_bytes);
+            BYTE *dst_uv = dst + (size_t)pitch * fh;
+            for (UINT32 r = 0; r < fh / 2; r++)
+                std::memcpy(dst_uv + (size_t)r * pitch,
+                            src_uv + (size_t)r * row_bytes, row_bytes);
+            buf2d->Unlock2D();
+            buf2d->Release();
+            mbuf->SetCurrentLength(plane_bytes);
+        } else {
+            hr = MFCreateMemoryBuffer(plane_bytes, &mbuf);
+            if (FAILED(hr)) return hr;
+            BYTE *dst = nullptr; DWORD cap = 0, cur = 0;
+            hr = mbuf->Lock(&dst, &cap, &cur);
+            if (FAILED(hr)) { mbuf->Release(); return hr; }
+            std::memcpy(dst, frame.yuv.data(), plane_bytes);
+            mbuf->Unlock();
+            mbuf->SetCurrentLength(plane_bytes);
+        }
+
+        IMFSample *out_sample = nullptr;
+        hr = MFCreateSample(&out_sample);
+        if (FAILED(hr)) {
+            mbuf->Release();
+            if (texture) texture->Release();
+            return hr;
+        }
+        out_sample->AddBuffer(mbuf);
+        mbuf->Release();
+        if (texture) texture->Release();
+
+        const uint32_t fpsn = fps_num_ ? fps_num_ : 30;
+        const uint32_t fpsd = fps_den_ ? fps_den_ : 1;
+        const LONGLONG dur = (LONGLONG)((10'000'000ULL * fpsd) / fpsn);
+        const LONGLONG pts = (frame.pts_hns >= 0)
+                           ? (LONGLONG)frame.pts_hns
+                           : (LONGLONG)((uint64_t)frames_emitted_
+                                        * 10'000'000ULL * fpsd / fpsn);
+        out_sample->SetSampleTime(pts);
+        out_sample->SetSampleDuration(dur);
+        out_sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+
+        buf[0].pSample  = out_sample;
+        buf[0].dwStatus = 0;
+        if (status) *status = 0;
+        frames_emitted_++;
+        MaybeLogFrameStats();
+        (void)mft_t0; (void)mft_copy_us;
         return S_OK;
     }
 

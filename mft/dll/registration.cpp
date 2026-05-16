@@ -107,12 +107,18 @@ HRESULT RegisterServer(HMODULE self) {
                             DecoderFriendlyName(CodecKind::AV1),
                             dll_path);
     if (FAILED(hr)) return hr;
+    hr = WriteClsidRegistry(CLSID_RkmppVp9Decoder,
+                            DecoderFriendlyName(CodecKind::VP9),
+                            dll_path);
+    if (FAILED(hr)) return hr;
 
     hr = RegisterOne(CodecKind::H264);
     if (FAILED(hr)) return hr;
     hr = RegisterOne(CodecKind::HEVC);
     if (FAILED(hr)) return hr;
     hr = RegisterOne(CodecKind::AV1);
+    if (FAILED(hr)) return hr;
+    hr = RegisterOne(CodecKind::VP9);
     return hr;
 }
 
@@ -120,9 +126,11 @@ HRESULT UnregisterServer() {
     MFTUnregister(CLSID_RkmppH264Decoder);
     MFTUnregister(CLSID_RkmppHevcDecoder);
     MFTUnregister(CLSID_RkmppAv1Decoder);
+    MFTUnregister(CLSID_RkmppVp9Decoder);
     DeleteClsidRegistry(CLSID_RkmppH264Decoder);
     DeleteClsidRegistry(CLSID_RkmppHevcDecoder);
     DeleteClsidRegistry(CLSID_RkmppAv1Decoder);
+    DeleteClsidRegistry(CLSID_RkmppVp9Decoder);
     return S_OK;
 }
 

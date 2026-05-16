@@ -269,11 +269,21 @@ __inline int RkMppDenseIsAddressReg(UINT32 reg_idx)
 {
     if (reg_idx >= RKMPP_DENSE_CADDR_FIRST && reg_idx <= RKMPP_DENSE_CADDR_LAST)
         return 1;
+    /* HEVC codec-addr registers */
     if (reg_idx == 161u || reg_idx == 163u) return 1;        /* PPS, RPS */
     if (reg_idx >= 164u && reg_idx <= 179u)  return 1;       /* ref bases */
     if (reg_idx == 180u)                     return 1;       /* scanlist */
     if (reg_idx >= 181u && reg_idx <= 196u)  return 1;       /* colmv refs */
     if (reg_idx == 197u)                     return 1;       /* cabac init */
+    /* VP9 codec-addr registers (Vdpu34xVp9dAddr, reg160..179) */
+    if (reg_idx == 160u)                     return 1;       /* delta_prob_base */
+    if (reg_idx == 162u)                     return 1;       /* last_prob_base */
+    if (reg_idx == 167u)                     return 1;       /* count_prob_base */
+    if (reg_idx == 168u)                     return 1;       /* segid_last_base */
+    if (reg_idx == 169u)                     return 1;       /* segid_cur_base */
+    if (reg_idx == 170u)                     return 1;       /* ref_colmv_base (last ref) */
+    if (reg_idx >= 171u && reg_idx <= 178u)  return 1;       /* ref_frame_map[0..7] */
+    if (reg_idx == 179u)                     return 1;       /* cur_colmv_base */
     return 0;
 }
 

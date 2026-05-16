@@ -24,6 +24,7 @@
 struct IMFDXGIDeviceManager;
 
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -35,6 +36,7 @@ enum class CodecKind {
     H264,
     HEVC,
     AV1,
+    VP9,
 };
 
 /* DLL-wide lock count for DllCanUnloadNow. */
@@ -208,6 +210,21 @@ private:
      * (dav1d-decoded NV12 output) until the rkmpp.sys AV1 personality
      * lands; then Hardware mode kicks the codec. */
     void       *engine_av1_ = nullptr;
+
+    /* Vp9DecodeEngine* for kind_ == VP9. */
+    void       *engine_vp9_ = nullptr;
+
+    /* Decoded VP9 NV12 frames awaiting emit.  VP9 engine is synchronous
+     * (DecodeOne in/out per superframe subframe); ProcessInput pushes,
+     * ProcessOutput pops. */
+    struct Vp9OutFrame {
+        std::vector<uint8_t> yuv;
+        int64_t  pts_hns   = 0;
+        uint32_t width     = 0;
+        uint32_t height    = 0;
+        uint8_t  bit_depth = 8;     /* 8 → NV12, 10 → P010 */
+    };
+    std::deque<Vp9OutFrame> vp9_out_queue_;
 
     /* D3D11 output state.  Populated by MFT_MESSAGE_SET_D3D_MANAGER.
      * When d3d_device_ is non-null, ProcessOutput emits NV12 textures

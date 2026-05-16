@@ -88,6 +88,13 @@ void MppSvc_Close(int svc_fd);
  */
 int  MppSvc_SendCodecInfo(int svc_fd, uint32_t width, uint32_t height);
 
+/* Same as above but with the format-string codec hint as the 4th arg
+ * (little-endian-packed first 4 bytes of the codec name, e.g.
+ *   "h264" → 0x34363268, "vp9\0" → 0x00397076).  The 3-arg form above
+ * forwards to this with the "h264" tag. */
+int  MppSvc_SendCodecInfoFmt(int svc_fd, uint32_t width, uint32_t height,
+                             uint64_t fmt_tag);
+
 /*
  * Import DMA-buf fds into the session's IOMMU DMA tracker so that
  * mpp_translate_reg_address can translate (IovaOffset<<10)|fd register words.
@@ -116,10 +123,21 @@ void MppSvc_FreeBuf(MppSvcBuf *b);
  *
  * Returns 0 on success, -1 on error.
  */
+/* Codec selector for MppSvc_Submit — picks the per-codec RCB sizing
+ * (mpp_svc.c hardcodes per-codec rcb_elem tables since the kernel uses
+ * the sizes we send via MPP_CMD_SET_RCB_INFO to lay out the packed RCB
+ * buffer; the wrong table makes the codec walk off into stale scratch
+ * and time out with INT_STATUS=0x23). */
+typedef enum MppSvcCodec {
+    MPP_SVC_CODEC_H264 = 0,
+    MPP_SVC_CODEC_VP9  = 1,
+} MppSvcCodec;
+
 int  MppSvc_Submit(int svc_fd, const H264RegWriteList *rl,
                    const MppSvcBufMap *buf_map, int n_bufs,
                    uint32_t *irq_readback,
-                   uint32_t width, uint32_t height);
+                   uint32_t width, uint32_t height,
+                   MppSvcCodec codec);
 
 /*
  * Wait for hardware completion via MPP_IOC_CFG_V1 + MPP_CMD_POLL_HW_FINISH.

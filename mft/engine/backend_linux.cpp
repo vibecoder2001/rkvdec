@@ -33,6 +33,7 @@ struct LinuxBackendCtx {
     int      svc_fd;
     uint32_t width;
     uint32_t height;
+    MppSvcCodec codec;
 
     /* dma-fd registry — ImportFds replays the full set whenever new
      * buffers were added since the last submit (kernel re-imports are
@@ -70,14 +71,17 @@ static void unregister_fd(LinuxBackendCtx *ctx, int fd) {
 
 static int LinuxBe_Open(void *vctx, DecodeEngineCodec codec) {
     LinuxBackendCtx *ctx = (LinuxBackendCtx *)vctx;
-    if (codec != DE_CODEC_H264) {
-        fprintf(stderr, "backend_linux: only H.264 supported (got codec=%d)\n",
-                (int)codec);
+    uint64_t fmt_tag = 0;
+    switch (codec) {
+    case DE_CODEC_H264: fmt_tag = 0x34363268ULL; ctx->codec = MPP_SVC_CODEC_H264; break;
+    case DE_CODEC_VP9:  fmt_tag = 0x00397076ULL; ctx->codec = MPP_SVC_CODEC_VP9;  break;
+    default:
+        fprintf(stderr, "backend_linux: unsupported codec=%d\n", (int)codec);
         return 1;
     }
     ctx->svc_fd = MppSvc_Open();
     if (ctx->svc_fd < 0) return 1;
-    if (MppSvc_SendCodecInfo(ctx->svc_fd, ctx->width, ctx->height) < 0) {
+    if (MppSvc_SendCodecInfoFmt(ctx->svc_fd, ctx->width, ctx->height, fmt_tag) < 0) {
         MppSvc_Close(ctx->svc_fd);
         ctx->svc_fd = -1;
         return 1;
@@ -214,7 +218,8 @@ static int LinuxBe_SubmitDense(void *vctx, const H26xDenseOutput *in,
 
     memset(ctx->irq_readback, 0, sizeof(ctx->irq_readback));
     if (MppSvc_Submit(ctx->svc_fd, &list, buf_map, ctx->n_fds,
-                      ctx->irq_readback, ctx->width, ctx->height) < 0)
+                      ctx->irq_readback, ctx->width, ctx->height,
+                      ctx->codec) < 0)
         return 1;
 
     int rc = MppSvc_Poll(ctx->svc_fd, timeout_ms, ctx->irq_readback);
@@ -239,12 +244,12 @@ extern "C" DecodeEngineBackend *LinuxBackend_New(uint32_t width, uint32_t height
         (DecodeEngineBackend *)calloc(1, sizeof(*be));
     if (!be) { free(ctx); return NULL; }
 
-    be->ctx        = ctx;
-    be->Open       = LinuxBe_Open;
-    be->Close      = LinuxBe_Close;
-    be->AllocBuf   = LinuxBe_AllocBuf;
-    be->FreeBuf    = LinuxBe_FreeBuf;
-    be->SubmitH264 = LinuxBe_SubmitH264;
+    be->ctx         = ctx;
+    be->Open        = LinuxBe_Open;
+    be->Close       = LinuxBe_Close;
+    be->AllocBuf    = LinuxBe_AllocBuf;
+    be->FreeBuf     = LinuxBe_FreeBuf;
+    be->SubmitDense = LinuxBe_SubmitDense;
     return be;
 }
 

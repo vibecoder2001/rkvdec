@@ -21,6 +21,7 @@
  */
 #include "parser_glue.h"
 #include "parser_glue_h265.h"
+#include "vp9_parser.h"
 #include "dpb.h"
 #include <cstdio>
 #include <cstdlib>
@@ -292,7 +293,7 @@ int main(int argc, char **argv)
     }
 
     if (!input_path) {
-        std::fprintf(stderr, "usage: %s [--trace] <file.{h264,h265,265,264}>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--trace] <file.{h264,h265,265,264,ivf}>\n", argv[0]);
         return 2;
     }
 
@@ -305,6 +306,59 @@ int main(int argc, char **argv)
     std::string path = input_path;
     bool h265 = EndsWith(path, ".h265") || EndsWith(path, ".265") ||
                 EndsWith(path, ".hevc");
+    bool ivf  = EndsWith(path, ".ivf");
+
+    if (ivf) {
+        // Minimal IVF demux: 32-byte file header, then per-frame 12-byte
+        // header (4B size, 8B pts) + payload.  VP9 only.
+        if (buf.size() < 32) {
+            std::fprintf(stderr, "ivf: file too small\n");
+            return 2;
+        }
+        std::printf("# input=%s codec=vp9 bytes=%zu\n", input_path, buf.size());
+        vp9::ParserState st{};
+        size_t pos = 32;
+        int au = 0;
+        while (pos + 12 <= buf.size()) {
+            uint32_t sz;
+            std::memcpy(&sz, buf.data() + pos, 4);
+            pos += 12;
+            if (pos + sz > buf.size()) {
+                std::fprintf(stderr, "ivf: truncated frame at au=%d\n", au);
+                return 1;
+            }
+            vp9::PicParams pp{};
+            vp9::ProbUpdates pu{};
+            auto r = vp9::Vp9Parser_Parse(buf.data() + pos, sz, st, pp, pu);
+            if (r != vp9::ParseResult::Ok) {
+                std::fprintf(stderr, "vp9: parse error au=%d\n", au);
+                return 1;
+            }
+            std::printf("au=%d ft=%u show=%u sef=%u intra=%u prof=%u bd=%u "
+                        "w=%u h=%u rff=0x%02x fcx=%u txm=%u ifilt=%u "
+                        "refs=[%u,%u,%u] hdr=%u/%u\n",
+                        au, pp.frame_type, pp.show_frame, pp.show_existing_frame,
+                        pp.intra_only, pp.profile, pp.bit_depth,
+                        pp.width, pp.height, pp.refresh_frame_flags,
+                        pp.frame_context_idx, pp.txmode, pp.interp_filter,
+                        pp.frame_refs[0].index, pp.frame_refs[1].index,
+                        pp.frame_refs[2].index,
+                        pp.uncompressed_header_size, pp.header_size);
+            if (trace_mode) {
+                std::printf("  pu: tx=%u skip=%u im=%u ii=%u rm=%u(mode=%u) "
+                            "yi=%u part=%u mv=%u\n",
+                            pu.tx_mode_present, pu.skip_present,
+                            pu.inter_mode_present, pu.is_inter_present,
+                            pu.ref_mode_present, pu.reference_mode,
+                            pu.y_mode_present, pu.partition_present,
+                            pu.mv_present);
+            }
+            vp9::Vp9Parser_ApplyDpbUpdate(st, pp);
+            pos += sz;
+            ++au;
+        }
+        return 0;
+    }
 
     auto aus = SliceAus(buf.data(), buf.size(), h265);
 

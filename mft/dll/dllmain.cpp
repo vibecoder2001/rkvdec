@@ -32,6 +32,7 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void **ppv) {
     if (rclsid == CLSID_RkmppH264Decoder)      kind = rkmpp::CodecKind::H264;
     else if (rclsid == CLSID_RkmppHevcDecoder) kind = rkmpp::CodecKind::HEVC;
     else if (rclsid == CLSID_RkmppAv1Decoder)  kind = rkmpp::CodecKind::AV1;
+    else if (rclsid == CLSID_RkmppVp9Decoder)  kind = rkmpp::CodecKind::VP9;
     else return CLASS_E_CLASSNOTAVAILABLE;
 
     rkmpp::ClassFactory *cf = new (std::nothrow) rkmpp::ClassFactory(kind);

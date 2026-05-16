@@ -14,6 +14,11 @@ add_library(rkmpp_mft STATIC
     h264_packed_tables.cpp
     h265_packed_tables.cpp
     dpb.cpp
+    vp9_bool_decoder.cpp
+    vp9_parser.cpp
+    vp9_dpb.cpp
+    vp9_kf_probs.cpp
+    regbuilder_vp9.cpp
 )
 
 target_include_directories(rkmpp_mft PUBLIC

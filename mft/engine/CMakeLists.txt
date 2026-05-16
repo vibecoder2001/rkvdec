@@ -8,6 +8,7 @@
 add_library(rkmpp_decode_engine STATIC
     decode_engine.cpp
     decode_engine_av1.cpp
+    decode_engine_vp9.cpp
     backend_windows.cpp)
 
 target_link_libraries(rkmpp_decode_engine PUBLIC rkmpp_mft)

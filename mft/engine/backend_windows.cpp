@@ -42,9 +42,9 @@ static int OpenDevice(HANDLE *out, DecodeEngineCodec codec) {
                                         DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
     if (set == INVALID_HANDLE_VALUE) return Fail("SetupDiGetClassDevsW", GetLastError());
 
-    const uint32_t want_codec = (codec == DE_CODEC_H265)
-                                    ? RKMPP_CODEC_HEVC
-                                    : RKMPP_CODEC_H264;
+    const uint32_t want_codec = (codec == DE_CODEC_H265) ? RKMPP_CODEC_HEVC
+                              : (codec == DE_CODEC_VP9)  ? RKMPP_CODEC_VP9
+                              :                            RKMPP_CODEC_H264;
 
     SP_DEVICE_INTERFACE_DATA ifd{ sizeof(ifd) };
     DWORD idx = 0;
@@ -153,8 +153,21 @@ static int WinBe_SubmitDense(void *ctx, const H26xDenseOutput *in,
 
     DWORD got = 0;
     if (!DeviceIoControl(dev, IOCTL_RKMPP_SUBMIT_DENSE_JOB, &sin, sizeof(sin),
-                         &sout, sizeof(sout), &got, nullptr))
-        return Fail("SUBMIT_DENSE_JOB", GetLastError());
+                         &sout, sizeof(sout), &got, nullptr)) {
+        DWORD ec = GetLastError();
+        std::fprintf(stderr,
+            "backend_windows: SUBMIT_DENSE rejected (ec=%lu) kick=0x%08x slots=%u\n",
+            ec, in->KickValue, in->IovaSlotCount);
+        for (uint32_t i = 0; i < in->IovaSlotCount; i++) {
+            const RKMPP_DENSE_IOVA_SLOT *s = &in->IovaSlots[i];
+            std::fprintf(stderr,
+                "  slot[%2u] reg=%3u  handle=0x%016llx  off=0x%08x\n",
+                i, s->RegIdx,
+                (unsigned long long)s->BufferHandle, s->IovaOffset);
+        }
+        std::fflush(stderr);
+        return Fail("SUBMIT_DENSE_JOB", ec);
+    }
 
     if (DecodeDebugEnabled()) {
         RKMPP_PEEK_JOB_IN        pin{ sout.JobId };

@@ -157,6 +157,18 @@ typedef struct _RKIOMMU_DOMAIN {
      * Bit 0 is reserved (NULL guard).  Non-paged pool.  */
     ULONG_PTR       *IovaBitmap;    /* 128 KiB bitmap, non-paged pool */
 
+    /* IOVA allocation-start bitmap (128 KiB).  Set at the first page of
+     * every range returned by RkIommuAllocIova plus the static reservations
+     * placed at domain-create (page 0, RCB-SRAM at 0xFFF00000).  Cleared
+     * by RkIommuFreeIova.  Read by UnmapMdl to bound the page-count
+     * recovery walk: scanning forward in IovaBitmap stops at the next set
+     * start-bit (the boundary of the adjacent allocation) or the first
+     * clear interior bit (the end of the contiguous run).  Without this
+     * boundary, an UnmapMdl walks past its own range into a peer File's
+     * adjacent allocation and over-unmaps PTEs the peer's HW is still
+     * DMA'ing through → IOMMU page fault on the peer session. */
+    ULONG_PTR       *IovaStartBitmap; /* 128 KiB bitmap, non-paged pool */
+
     KSPIN_LOCK       Lock;          /* serializes PT writes + bitmap alloc */
 
     /* Iova page 0 scratch — phantom-read sink for the codec's speculative

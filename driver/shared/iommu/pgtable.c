@@ -82,10 +82,22 @@ NTSTATUS RkIommuDomainCreateVdec(PRKIOMMU_DOMAIN *Domain)
         ExFreePoolWithTag(d, 'mDkR');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    d->IovaStartBitmap = (ULONG_PTR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, bitmapBytes, 'sIkR');
+    if (!d->IovaStartBitmap) {
+        ExFreePoolWithTag(d->IovaBitmap, 'bIkR');
+        FreePageBelow4G(d->Pd);
+        ExFreePoolWithTag(d, 'mDkR');
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(d->IovaBitmap, bitmapBytes);
-    d->IovaBitmap[0] |= (ULONG_PTR)1;  /* reserve iova page 0 */
+    RtlZeroMemory(d->IovaStartBitmap, bitmapBytes);
+    d->IovaBitmap[0] |= (ULONG_PTR)1;       /* reserve iova page 0 */
+    d->IovaStartBitmap[0] |= (ULONG_PTR)1;  /* mark page 0 as a boundary */
 
-    /* Reserve BSP-prescribed RCB-SRAM IOVA range 0xFFF00000..0xFFFFFFFF. */
+    /* Reserve BSP-prescribed RCB-SRAM IOVA range 0xFFF00000..0xFFFFFFFF.
+     * Marked as a single allocation in the start-bitmap so any UnmapMdl
+     * scanning up from a normal allocation placed just below this range
+     * stops at the reservation boundary instead of over-unmapping into it. */
     {
         const ULONG kRcbPage  = 0xFFF00000u / RK_IOMMU_PAGE_SIZE;
         const ULONG kRcbCount = 0x00100000u / RK_IOMMU_PAGE_SIZE;
@@ -93,6 +105,8 @@ NTSTATUS RkIommuDomainCreateVdec(PRKIOMMU_DOMAIN *Domain)
         for (ULONG p = kRcbPage; p < kRcbPage + kRcbCount &&
                                  p < RK_IOMMU_IOVA_PAGES; p++)
             d->IovaBitmap[p / kBpw] |= (ULONG_PTR)1 << (p % kBpw);
+        if (kRcbPage < RK_IOMMU_IOVA_PAGES)
+            d->IovaStartBitmap[kRcbPage / kBpw] |= (ULONG_PTR)1 << (kRcbPage % kBpw);
     }
 
     *Domain = d;
@@ -133,8 +147,18 @@ NTSTATUS RkIommuDomainCreateAv1d(PRKIOMMU_DOMAIN *Domain)
         ExFreePoolWithTag(d, 'mDkR');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    d->IovaStartBitmap = (ULONG_PTR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, bitmapBytes, 'sIkR');
+    if (!d->IovaStartBitmap) {
+        ExFreePoolWithTag(d->IovaBitmap, 'bIkR');
+        FreePageBelow4G((volatile ULONG *)d->Pta);
+        FreePageBelow4G(d->Pd);
+        ExFreePoolWithTag(d, 'mDkR');
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(d->IovaBitmap, bitmapBytes);
+    RtlZeroMemory(d->IovaStartBitmap, bitmapBytes);
     d->IovaBitmap[0] |= (ULONG_PTR)1;
+    d->IovaStartBitmap[0] |= (ULONG_PTR)1;
 
     *Domain = d;
     return STATUS_SUCCESS;
@@ -178,6 +202,11 @@ VOID RkIommuDomainDestroy(PRKIOMMU_DOMAIN Domain)
     if (Domain->IovaBitmap) {
         ExFreePoolWithTag(Domain->IovaBitmap, 'bIkR');
         Domain->IovaBitmap = NULL;
+    }
+
+    if (Domain->IovaStartBitmap) {
+        ExFreePoolWithTag(Domain->IovaStartBitmap, 'sIkR');
+        Domain->IovaStartBitmap = NULL;
     }
 
     ExFreePoolWithTag(Domain, 'mDkR');
@@ -226,6 +255,12 @@ NTSTATUS RkIommuAllocIova(PRKIOMMU_DOMAIN Domain, ULONG PageCount,
                         ULONG kb = k % bitsPerWord;
                         Domain->IovaBitmap[kw] |= (ULONG_PTR)1 << kb;
                     }
+                    /* Mark this range's first page as an allocation
+                     * boundary so UnmapMdl's page-count recovery walk
+                     * stops here and can't over-unmap into us from a
+                     * neighbour that was placed immediately below. */
+                    Domain->IovaStartBitmap[base / bitsPerWord]
+                        |= (ULONG_PTR)1 << (base % bitsPerWord);
                     *OutIova = (ULONG64)base * RK_IOMMU_PAGE_SIZE;
                     return STATUS_SUCCESS;
                 }
@@ -253,6 +288,11 @@ VOID RkIommuFreeIova(PRKIOMMU_DOMAIN Domain, ULONG64 Iova, ULONG PageCount)
         ULONG b    = page % bitsPerWord;
         Domain->IovaBitmap[w] &= ~((ULONG_PTR)1 << b);
     }
+    /* Clear the start marker so a future allocation at this base can set
+     * a fresh one (and so UnmapMdl can't be tricked into bounding at a
+     * stale boundary if the bits get reused). */
+    Domain->IovaStartBitmap[startPage / bitsPerWord]
+        &= ~((ULONG_PTR)1 << (startPage % bitsPerWord));
 }
 
 /* ---------------------------------------------------------------------------

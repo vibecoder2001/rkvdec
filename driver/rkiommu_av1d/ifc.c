@@ -137,17 +137,28 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
 
+    /* See rkiommu_vdec/ifc.c for the bounded-walk rationale.  AV1D
+     * domain has the same shared-bitmap-over-Domain shape and the same
+     * peer-over-unmap hazard if two AV1 sessions Shutdown adjacent. */
     ULONG startPage = (ULONG)(Iova >> 12);
     const ULONG bitsPerWord = (ULONG)(sizeof(ULONG_PTR) * 8);
     ULONG pageCount = 0;
 
     KeAcquireSpinLock(&dev->Domain->Lock, &irql);
 
-    /* Count consecutive allocated bits to determine the mapping size */
+    if (!(dev->Domain->IovaStartBitmap[startPage / bitsPerWord] &
+          ((ULONG_PTR)1 << (startPage % bitsPerWord)))) {
+        KeReleaseSpinLock(&dev->Domain->Lock, irql);
+        return STATUS_INVALID_PARAMETER;
+    }
+
     for (ULONG pg = startPage; pg < RK_IOMMU_IOVA_PAGES; pg++) {
         ULONG w = pg / bitsPerWord;
         ULONG b = pg % bitsPerWord;
         if (!(dev->Domain->IovaBitmap[w] & ((ULONG_PTR)1 << b))) break;
+        if (pg != startPage &&
+            (dev->Domain->IovaStartBitmap[w] & ((ULONG_PTR)1 << b)))
+            break;
         pageCount++;
     }
 

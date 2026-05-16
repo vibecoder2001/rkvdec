@@ -183,20 +183,35 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
 
-    /* Determine how many pages are mapped at this IOVA.
-     * We stored the page count in the IOVA allocator bitmap; we reconstruct
-     * it by counting consecutive set bits starting at the IOVA page index. */
+    /* Determine how many pages are mapped at this IOVA.  We reconstruct
+     * the original allocation size by counting consecutive set bits in
+     * IovaBitmap, bounded by the next set bit in IovaStartBitmap.  The
+     * latter is critical for multi-File concurrency: without it the walk
+     * extends past our range into a peer File's adjacent allocation,
+     * RkIommuUnmapAt zeroes the peer's PTEs, and the peer's next DMA
+     * faults.  See [[iommu_unmap_overunmaps_peer]] for the failure mode. */
     ULONG startPage = (ULONG)(Iova >> 12);
     const ULONG bitsPerWord = (ULONG)(sizeof(ULONG_PTR) * 8);
     ULONG pageCount = 0;
 
     KeAcquireSpinLock(&dev->Domain->Lock, &irql);
 
-    /* Count consecutive allocated bits to determine the mapping size */
+    /* Verify the caller's iova actually starts an allocation we issued.
+     * Catches double-unmap and stray pointers before any state mutation. */
+    if (!(dev->Domain->IovaStartBitmap[startPage / bitsPerWord] &
+          ((ULONG_PTR)1 << (startPage % bitsPerWord)))) {
+        KeReleaseSpinLock(&dev->Domain->Lock, irql);
+        return STATUS_INVALID_PARAMETER;
+    }
+
     for (ULONG pg = startPage; pg < RK_IOMMU_IOVA_PAGES; pg++) {
         ULONG w = pg / bitsPerWord;
         ULONG b = pg % bitsPerWord;
         if (!(dev->Domain->IovaBitmap[w] & ((ULONG_PTR)1 << b))) break;
+        /* Stop at the next allocation's start — don't extend into a peer. */
+        if (pg != startPage &&
+            (dev->Domain->IovaStartBitmap[w] & ((ULONG_PTR)1 << b)))
+            break;
         pageCount++;
     }
 

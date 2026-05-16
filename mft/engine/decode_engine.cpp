@@ -756,16 +756,22 @@ static int DecodeOne_H265(DecodeEngine *e,
     if (params_changed) {
         if (H265PackPPS(vps, sps, pps,
                         static_cast<uint8_t *>(e->pps_table.user_va),
-                        e->pps_table.size) < 0)
+                        e->pps_table.size) < 0) {
+            H265Dpb_OnDecodeFailed(&e->dpb_h265);
             return Fail("H265PackPPS");
+        }
         if (H265PackRPS(&parsed,
                         static_cast<uint8_t *>(e->rps_table.user_va),
-                        e->rps_table.size) < 0)
+                        e->rps_table.size) < 0) {
+            H265Dpb_OnDecodeFailed(&e->dpb_h265);
             return Fail("H265PackRPS");
+        }
         if (H265PackScalingList(sps, pps,
                                 static_cast<uint8_t *>(e->scaling_list.user_va),
-                                e->scaling_list.size) < 0)
+                                e->scaling_list.size) < 0) {
+            H265Dpb_OnDecodeFailed(&e->dpb_h265);
             return Fail("H265PackScalingList");
+        }
         e->last_h265_sps_id = parsed.active_sps_id;
         e->last_h265_pps_id = parsed.active_pps_id;
     }
@@ -827,6 +833,7 @@ static int DecodeOne_H265(DecodeEngine *e,
                                                sel.current_slot, &dense);
     if (rs != H265_REGBUILD_OK) {
         std::fprintf(stderr, "h265 regbuilder status=%d\n", (int)rs);
+        H265Dpb_OnDecodeFailed(&e->dpb_h265);
         return Fail("h265 regbuilder failed");
     }
 
@@ -848,8 +855,10 @@ static int DecodeOne_H265(DecodeEngine *e,
 
     DWORD got = 0;
     if (!DeviceIoControl(e->device, IOCTL_RKMPP_SUBMIT_DENSE_JOB, &sin, sizeof(sin),
-                         &sout, sizeof(sout), &got, nullptr))
+                         &sout, sizeof(sout), &got, nullptr)) {
+        H265Dpb_OnDecodeFailed(&e->dpb_h265);
         return Fail("SUBMIT_DENSE_JOB", GetLastError());
+    }
 
     if (TimingEnabled()) { int64_t t = QpcNow(); timing.submit_us = QpcUs(t0, t); t0 = t; }
 
@@ -887,8 +896,10 @@ static int DecodeOne_H265(DecodeEngine *e,
     RKMPP_WAIT_JOB_IN  win{ sout.JobId, 1000, 0 };
     RKMPP_WAIT_JOB_OUT wout{};
     if (!DeviceIoControl(e->device, IOCTL_RKMPP_WAIT_JOB, &win, sizeof(win),
-                         &wout, sizeof(wout), &got, nullptr))
+                         &wout, sizeof(wout), &got, nullptr)) {
+        H265Dpb_OnDecodeFailed(&e->dpb_h265);
         return Fail("WAIT_JOB", GetLastError());
+    }
 
     if (TimingEnabled()) { int64_t t = QpcNow(); timing.wait_us = QpcUs(t0, t); t0 = t; }
     if (DecodeDebugEnabled())
@@ -899,6 +910,7 @@ static int DecodeOne_H265(DecodeEngine *e,
     bool have_output = (wout.HardwareStatus & kRdySta) != 0;
     if (wout.Status != 0 && !have_output) {
         std::fprintf(stderr, "h265 decode reported non-success status (no output)\n");
+        H265Dpb_OnDecodeFailed(&e->dpb_h265);
         return 5;
     }
     if (wout.Status != 0 && DecodeDebugEnabled()) {

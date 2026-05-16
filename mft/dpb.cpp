@@ -981,3 +981,14 @@ void H265Dpb_OnDecodeComplete(H265DpbCtx *ctx)
         h265_slot_clear(ctx, cur);
     }
 }
+
+extern "C"
+void H265Dpb_OnDecodeFailed(H265DpbCtx *ctx)
+{
+    if (!ctx) return;
+    if (ctx->current_idx >= 0) {
+        int cur = ctx->current_idx;
+        ctx->current_idx = -1;
+        h265_slot_clear(ctx, cur);
+    }
+}

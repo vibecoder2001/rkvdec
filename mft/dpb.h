@@ -292,6 +292,12 @@ void H265Dpb_Flush        (H265DpbCtx *ctx);
  * picture wasn't a reference, mirroring the H.264 non-ref path). */
 void H265Dpb_OnDecodeComplete(H265DpbCtx *ctx);
 
+/* Cascade firebreak — call when the HW kick or regbuilder failed.
+ * Clears current_idx and zeroes the would-be output slot so a partially-
+ * written picture can't be picked up as a future ref.  Counterpart to
+ * Dpb_OnDecodeFailed for the H.264 path. */
+void H265Dpb_OnDecodeFailed(H265DpbCtx *ctx);
+
 #ifdef __cplusplus
 }
 #endif

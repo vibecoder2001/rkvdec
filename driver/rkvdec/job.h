@@ -115,6 +115,18 @@ typedef struct _RKMPP_JOB_QUEUE {
     UINT32          LastDecMode;    /* low 5 bits of swreg9 */
     BOOLEAN         LastValid;      /* FALSE on first kick after PnP */
 
+    /* Per-Owner last-kick table for round-robin promotion in
+     * RkMppJobComplete.  At promotion the next Pending job is the one
+     * whose Owner has the oldest LastKickId (NULL = never kicked, treat
+     * as oldest).  Capacity 4 covers the realistic concurrent-session
+     * count (per-File pending cap is 4; >4 decode sessions on one core
+     * is already over-subscribed).  Evict LRU on overflow.  Read+written
+     * only under Queue->Lock. */
+    struct {
+        WDFFILEOBJECT File;
+        UINT64        LastKickId;
+    } OwnerLru[4];
+
     /* Polling-completion thread.  WdfInterruptCreate currently fails for
      * rkmpp instances (STATUS_WDF_INVALID_INTERRUPT_CONFIG), so we run a
      * per-device kernel thread that polls INT_STATUS after each kick.

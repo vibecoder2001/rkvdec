@@ -188,6 +188,7 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     Queue->LastOwner   = NULL;
     Queue->LastDecMode = 0;
     Queue->LastValid   = FALSE;
+    RtlZeroMemory(Queue->OwnerLru, sizeof(Queue->OwnerLru));
 
     /* Auto-reset kick: each Set wakes the poller exactly once. */
     KeInitializeEvent(&Queue->KickEvent, SynchronizationEvent, FALSE);
@@ -821,6 +822,21 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         q->LastOwner   = Job->Owner;
         q->LastDecMode = dec_mode;
         q->LastValid   = TRUE;
+
+        /* Upsert (Owner, Id) into the per-Owner LRU table used by
+         * RkMppJobComplete's promotion path.  Find an existing slot
+         * for this Owner, else the slot with the smallest LastKickId
+         * (or an empty slot — File==NULL counts as 0). */
+        const ULONG K = ARRAYSIZE(q->OwnerLru);
+        ULONG hit   = K;
+        ULONG evict = 0;
+        for (ULONG i = 0; i < K; ++i) {
+            if (q->OwnerLru[i].File == Job->Owner) { hit = i; break; }
+            if (q->OwnerLru[i].LastKickId < q->OwnerLru[evict].LastKickId) evict = i;
+        }
+        ULONG slot = (hit < K) ? hit : evict;
+        q->OwnerLru[slot].File       = Job->Owner;
+        q->OwnerLru[slot].LastKickId = Job->Id;
     }
 
     /* Conditional core reset.  BSP only resets after error/timeout — see
@@ -1213,11 +1229,46 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     /* Signal the waiter before we potentially start the next job. */
     KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
 
-    /* If another job is pending, promote it now. */
+    /* Promote the next pending job with per-Owner LRU fairness.
+     *
+     * Strict FIFO promotion would let a File submitting a burst of N
+     * jobs kick all N before a peer File's first job runs.  Under
+     * sustained multi-stream load that starves the peer past the
+     * codec's reg32 watchdog (78 ms @ 4K) — see
+     * `rkmpp_cross_file_starvation` + the Linux baseline showing BSP
+     * multiplexes the same workload on one core with zero resets via
+     * global per-task fair-share.
+     *
+     * LRU rule: for each Pending candidate, score = the Owner's
+     * LastKickId from q->OwnerLru (0 = never kicked = oldest).  Pick
+     * the minimum.  Stable tiebreak via list order (first encountered
+     * wins) so within an Owner we still drain in submit order.  Two
+     * streams → strict alternation (peer's LastKickId is always older).
+     * Three+ streams → cycles fairly through all Owners regardless of
+     * how bursty any one is. */
     RKMPP_JOB *next = NULL;
     if (!IsListEmpty(&q->Pending)) {
-        PLIST_ENTRY entry = RemoveHeadList(&q->Pending);
-        next = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
+        PLIST_ENTRY chosen = q->Pending.Flink;
+        UINT64 bestScore = (UINT64)-1;
+        for (PLIST_ENTRY e = q->Pending.Flink;
+             e != &q->Pending;
+             e = e->Flink) {
+            RKMPP_JOB *cand = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+            UINT64 score = 0;
+            for (ULONG i = 0; i < ARRAYSIZE(q->OwnerLru); ++i) {
+                if (q->OwnerLru[i].File == cand->Owner) {
+                    score = q->OwnerLru[i].LastKickId;
+                    break;
+                }
+            }
+            if (score < bestScore) {
+                bestScore = score;
+                chosen = e;
+                if (score == 0) break; /* never-kicked Owner — can't beat */
+            }
+        }
+        RemoveEntryList(chosen);
+        next = CONTAINING_RECORD(chosen, RKMPP_JOB, Link);
         q->InFlight = next;
     }
 

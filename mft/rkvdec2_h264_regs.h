@@ -70,6 +70,7 @@
  *   bit 26  right_auto_rst_disable
  * Earlier copy used bit 6 for h26x_streamd_error_mode — wrong field. */
 #define RKVDEC2_TIMEOUT_MODE                (1u <<  0)  /* in REG_ERROR_MODE */
+#define RKVDEC2_REQ_TIMEOUT_RST_SEL         (1u <<  1)
 #define RKVDEC2_H26X_STREAMD_ERROR_MODE     (1u <<  9)
 #define RKVDEC2_COLMV_ERROR_MODE            (1u << 15)
 #define RKVDEC2_H26X_ERROR_MODE             (1u << 18)

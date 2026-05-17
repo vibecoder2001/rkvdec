@@ -142,12 +142,16 @@ H264RegBuildStatus H264BuildDenseRegs(const H264ParseResult *parsed,
         secondary |= RKVDEC2_COLMV_COMPRESS_EN;
     EMIT_P(RKVDEC2_REG_SECONDARY_EN, secondary);
 
-    /* reg013 — BSP shim capture for the bframe.h264 stream:
-     *   IDR     : 0x01048201  (bit 24 = cur_pic_is_idr SET)
-     *   non-IDR : 0x00048201  (cur_pic_is_idr CLEAR)
-     * The previously-cargo-culted "bit 1 SET on IDR" came from a kernel-
-     * side dmesg trace where the kernel rewrote the value before MMIO;
-     * the user-mode wire value never sets bit 1. */
+    /* reg013 — error-mode config (SWREG13_EN_MODE_SET).
+     *
+     * REQ_TIMEOUT_RST_SEL (bit 1) is intentionally NOT set: neither
+     * rockchip-mpp userspace nor upstream/BSP Linux rkvdec2 programs
+     * this bit, and CRU dumps captured at codec TIMEOUT_STA show the
+     * leaf clocks (CLKGATE_CON40 bits 7,8,9) gated when the bit is on
+     * — consistent with the codec driving a hardware gate-request out
+     * to the CRU as part of its internal timeout-reset.  Setting it
+     * was an empirical Windows-path bandaid that turned out to mask
+     * (and possibly trigger) the underlying wedge rather than fix it. */
     uint32_t error_mode = RKVDEC2_TIMEOUT_MODE |
                           RKVDEC2_H26X_STREAMD_ERROR_MODE |
                           RKVDEC2_COLMV_ERROR_MODE |
@@ -219,11 +223,26 @@ H264RegBuildStatus H264BuildDenseRegs(const H264ParseResult *parsed,
      * is reverted.  Match the user-mode wire value. */
     (void)current_pic_index;
     EMIT_P(RKVDEC2_REG_FILM_IDX, 0u);
-    /* reg032 (timeout_thresh) — BSP shim capture writes 0x0003ffff for
-     * H.264, matching the HEVC HAL.  Earlier "kernel writes 0xefffff"
-     * note was about a kernel-side override not visible at the IOCTL
-     * boundary; the user-mode wire value is 0x3ffff. */
-    EMIT_P(RKVDEC2_REG_TIMEOUT_THRESH, 0x0003ffffu);
+    /* reg032 (timeout_thresh) — resolution-scaled to match upstream
+     * rkvdec-vdpu381-regs.h:
+     *   1080p  0x00EFFFFF  (~16M cycles ≈ 26 ms @ 600 MHz)
+     *   4K     0x02CFFFFF  (~47M cycles ≈ 78 ms)
+     *   8K     0x04FFFFFF  (~83M cycles)
+     * The 1080p value previously read 0x000EFFFF (one F short) — that's
+     * only ~983k cycles ≈ 1.6 ms, well below a real 1080p decode time
+     * under any concurrent-decode AXI contention.  Codec hit its own
+     * TIMEOUT_STA on ordinary frames despite a clean MMU and complete
+     * register programming.  Caught by Codex review of the concurrent
+     * H.264+VP9 timeout trace.  The original `0x3FFFF` value (before
+     * resolution scaling) was a misread of the BSP shim capture. */
+    {
+        const uint32_t pixels = width_px * height_px;
+        uint32_t timeout;
+        if (pixels <= 1920u * 1088u)        timeout = 0x00EFFFFFu;
+        else if (pixels <= 3840u * 2176u)   timeout = 0x02CFFFFFu;
+        else                                timeout = 0x04FFFFFFu;
+        EMIT_P(RKVDEC2_REG_TIMEOUT_THRESH, timeout);
+    }
 
     /* ---- AXI perf-and-QoS statistic bank ----------------------- *
      * BSP `vdpu34x_setup_statistic` (vdpu34x_com.c) — required.

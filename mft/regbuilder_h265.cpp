@@ -164,7 +164,12 @@ H265RegBuildStatus H265BuildDenseRegs(const H265ParseResult *parsed,
 
     /* reg013 — gen_regs:944..946,1138..1141: timeout_mode=1,
      * h26x_streamd_error_mode=1, colmv_error_mode=1, h26x_error_mode=1,
-     * cur_pic_is_idr derived from NAL unit type. */
+     * cur_pic_is_idr derived from NAL unit type.
+     *
+     * REQ_TIMEOUT_RST_SEL (bit 1) intentionally NOT set — neither
+     * rockchip-mpp nor upstream/BSP Linux programs it, and on the
+     * Windows path it correlates with the codec self-gating its leaf
+     * clocks at TIMEOUT_STA.  See regbuilder_h264.cpp reg13 comment. */
     {
         uint32_t reg013 = RKVDEC2_TIMEOUT_MODE |
                           RKVDEC2_H26X_STREAMD_ERROR_MODE |
@@ -241,10 +246,25 @@ H265RegBuildStatus H265BuildDenseRegs(const H265ParseResult *parsed,
      * register handler does NOT replicate per the BSP capture. */
     /* (intentionally not emitted — memset-zero default) */
 
-    /* reg032 — gen_regs:1045: timeout_threshold = 0x3ffff.  Note this
-     * differs from the H.264 path's BSP-empirical 0x00efffff value;
-     * the HEVC hal explicitly writes 0x3ffff and capture confirms. */
-    EMIT_P(RKVDEC2_REG_TIMEOUT_THRESH, 0x0003FFFFu);
+    /* reg032 — resolution-scaled timeout matching upstream
+     * rkvdec-vdpu381-regs.h:
+     *   1080p  0x00EFFFFF  (~16M cycles ≈ 26 ms @ 600 MHz)
+     *   4K     0x02CFFFFF  (~47M cycles ≈ 78 ms)
+     *   8K     0x04FFFFFF  (~83M cycles)
+     * The 1080p value previously read 0x000EFFFF (one F short) —
+     * only ~983k cycles ≈ 1.6 ms.  Codec hit its own TIMEOUT_STA on
+     * normal-sized H.264 frames under concurrent-decode AXI
+     * contention despite clean MMU.  Caught by Codex review of the
+     * 2026-05-16 concurrent-decode timeout trace; see regbuilder_h264.cpp
+     * matching fix and parser_dump_harness memory. */
+    {
+        const uint32_t pixels = width_px * height_px;
+        uint32_t timeout;
+        if (pixels <= 1920u * 1088u)        timeout = 0x00EFFFFFu;
+        else if (pixels <= 3840u * 2176u)   timeout = 0x02CFFFFFu;
+        else                                timeout = 0x04FFFFFFu;
+        EMIT_P(RKVDEC2_REG_TIMEOUT_THRESH, timeout);
+    }
 
     /* ---- HEVC codec params bank (idx 64..112) --------------------- */
 

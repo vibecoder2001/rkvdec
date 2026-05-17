@@ -80,16 +80,18 @@ extern LONG RkMppExchangeLastJobFailed(_In_ WDFDEVICE Device, LONG NewValue);
     (RKVDEC2_INT_DEC_RDY_STA | RKVDEC2_INT_DEC_ERROR_STA | \
      RKVDEC2_INT_DEC_TIMEOUT_STA | RKVDEC2_INT_DEC_BUS_STA | \
      RKVDEC2_INT_BUF_EMPTY_STA | RKVDEC2_INT_COLMV_REF_ERROR)
-/* Conservative superset: BSP's `RKVDEC_INT_ERROR_MASK` is bits 4|5|6|7
- * (ERROR | TIMEOUT | BUF_EMPTY | COLMV_REF_ERR).  We include BUS_STA
- * (bit 3) too — empirically a status of bit 3 alone (without DEC_RDY)
- * has paired with stale codec FSM state that produces all-zero output
- * unless we trip NeedsCoreReset.  Slightly over-classifies vs BSP but
- * preserves the reset cadence the codec actually depends on. */
+/* Matches BSP `RKVDEC_INT_ERROR_MASK` exactly (mpp_rkvdec2.h:76-79,
+ * also mpp_rkvdec2.c:432-435 and mpp_rkvdec2_link.c:989): bits 4|5|6|7
+ * (ERROR | TIMEOUT | BUF_EMPTY | COLMV_REF_ERR).  BUS_STA (bit 3) is
+ * intentionally NOT included — earlier "bit 3 alone → stale FSM" was a
+ * bring-up-era observation; the `!dec_rdy → FullCoreReset` escalation
+ * (now dropped, see RkMppJobComplete) was the actual recovery path for
+ * those genuine wedges.  Treating bit 3 as fatal triggered narrow
+ * CoreReset on every kick where the codec also pulsed BUS_STA along
+ * with DEC_RDY (clean done), which BSP considers success. */
 #define RKVDEC2_INT_ERROR_MASK \
     (RKVDEC2_INT_DEC_ERROR_STA | RKVDEC2_INT_DEC_TIMEOUT_STA | \
-     RKVDEC2_INT_DEC_BUS_STA | RKVDEC2_INT_BUF_EMPTY_STA | \
-     RKVDEC2_INT_COLMV_REF_ERROR)
+     RKVDEC2_INT_BUF_EMPTY_STA | RKVDEC2_INT_COLMV_REF_ERROR)
 
 /* dec_e=1 lives at byte offset 0x28 (idx 10).  A job that includes this
  * write is a real decode kick; jobs without it (smoke tests, register-
@@ -183,6 +185,9 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     Queue->NextId   = 0;
     Queue->Device   = Device;
     Queue->Interrupt = NULL;
+    Queue->LastOwner   = NULL;
+    Queue->LastDecMode = 0;
+    Queue->LastValid   = FALSE;
 
     /* Auto-reset kick: each Set wakes the poller exactly once. */
     KeInitializeEvent(&Queue->KickEvent, SynchronizationEvent, FALSE);
@@ -567,6 +572,36 @@ have_status:
          * The dump format is rkvdec2-specific (bank layout differs on
          * AV1) — gate it accordingly. */
         if ((hwStatus & RKVDEC2_INT_DEC_RDY_STA) == 0) {
+            /* Snapshot the in-flight job's switch state stamped by
+             * RkMppJobStart so the dump can report dec_mode + switch
+             * flags without inferring from log-line ordering.  Read
+             * under the queue lock since RkMppJobComplete can null
+             * InFlight concurrently; we still hold the kick event so
+             * the job hasn't been freed yet, but the pointer load
+             * needs to be ordered. */
+            UINT64        kickJobId        = 0;
+            WDFFILEOBJECT kickOwner        = NULL;
+            UINT32        kickDecMode      = 0;
+            UINT32        kickPrevDecMode  = 0;
+            WDFFILEOBJECT kickPrevOwner    = NULL;
+            BOOLEAN       kickSwitchOwner  = FALSE;
+            BOOLEAN       kickSwitchMode   = FALSE;
+            BOOLEAN       kickPrevValid    = FALSE;
+            {
+                KIRQL kIrql;
+                KeAcquireSpinLock(&q->Lock, &kIrql);
+                if (q->InFlight) {
+                    kickJobId        = q->InFlight->Id;
+                    kickOwner        = q->InFlight->Owner;
+                    kickDecMode      = q->InFlight->KickDecMode;
+                    kickPrevDecMode  = q->InFlight->KickPrevDecMode;
+                    kickPrevOwner    = q->InFlight->KickPrevOwner;
+                    kickSwitchOwner  = q->InFlight->KickSwitchOwner;
+                    kickSwitchMode   = q->InFlight->KickSwitchMode;
+                    kickPrevValid    = q->InFlight->KickPrevValid;
+                }
+                KeReleaseSpinLock(&q->Lock, kIrql);
+            }
             ULONG bank[14] = {0};
             for (int i = 0; i < 14; i++) {
                 bank[i] = READ_REGISTER_ULONG(
@@ -591,6 +626,8 @@ have_status:
 #undef RB
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                        "rkmpp: poller INT=0x%08x result=0x%08x\n"
+                       "  job=%llu owner=%p mode=%u prev_owner=%p prev_mode=%u "
+                       "switch_owner=%d switch_mode=%d prev_valid=%d\n"
                        "  ctrl readback mode=0x%08x dec_e=0x%08x imp=0x%08x "
                        "sec=0x%08x err=0x%08x strlen=0x%08x rlc=0x%08x\n"
                        "  addr readback decout=0x%08x pps=0x%08x rps=0x%08x "
@@ -599,6 +636,11 @@ have_status:
                        "  irqbank[224..231]: %08x %08x %08x %08x %08x %08x %08x %08x\n"
                        "  irqbank[232..237]: %08x %08x %08x %08x %08x %08x\n",
                        hwStatus, result,
+                       (unsigned long long)kickJobId, kickOwner, kickDecMode,
+                       kickPrevOwner, kickPrevDecMode,
+                       kickSwitchOwner ? 1 : 0,
+                       kickSwitchMode  ? 1 : 0,
+                       kickPrevValid   ? 1 : 0,
                        rb_mode, rb_dec_e, rb_imp, rb_sec, rb_err, rb_strln, rb_rlc,
                        rb_decout, rb_pps, rb_rps, rb_cab, rb_scan,
                        rb_pochi0, rb_pochi1, rb_pochi4,
@@ -742,6 +784,43 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                    (unsigned long long)Job->Id);
         RkMppJobComplete(Device, STATUS_DEVICE_NOT_READY, 0);
         return;
+    }
+
+    /* Cross-kick scheduling probe.  Extract dec_mode from the kick's
+     * dense bank (swreg9 = Common[1], low 5 bits) and compare to the
+     * previous kick.  Stamp the result onto the job so the poller's
+     * timeout dump can surface it directly (no inference from nearby
+     * `kick-switch` log lines).  Log ONLY on transitions to keep noise
+     * bounded (a clean playback emits roughly one line per ~thousand
+     * kicks at steady state). */
+    {
+        UINT32 dec_mode = Job->DenseBank.Common[1] & 0x1Fu;
+        BOOLEAN owner_switch = q->LastValid && (q->LastOwner != Job->Owner);
+        BOOLEAN mode_switch  = q->LastValid && (q->LastDecMode != dec_mode);
+
+        Job->KickDecMode     = dec_mode;
+        Job->KickPrevDecMode = q->LastValid ? q->LastDecMode : 0;
+        Job->KickPrevOwner   = q->LastValid ? q->LastOwner   : NULL;
+        Job->KickSwitchOwner = owner_switch;
+        Job->KickSwitchMode  = mode_switch;
+        Job->KickPrevValid   = q->LastValid;
+
+        if (!q->LastValid || owner_switch || mode_switch) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "rkmpp: kick-switch job=%llu owner=%p mode=%u (prev owner=%p mode=%u) "
+                       "switch_owner=%d switch_mode=%d first=%d\n",
+                       (unsigned long long)Job->Id,
+                       Job->Owner,
+                       dec_mode,
+                       Job->KickPrevOwner,
+                       Job->KickPrevDecMode,
+                       owner_switch ? 1 : 0,
+                       mode_switch  ? 1 : 0,
+                       q->LastValid ? 0 : 1);
+        }
+        q->LastOwner   = Job->Owner;
+        q->LastDecMode = dec_mode;
+        q->LastValid   = TRUE;
     }
 
     /* Conditional core reset.  BSP only resets after error/timeout — see
@@ -1060,27 +1139,24 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
      * = bits 4,5,6,7.  Plus we treat NTSTATUS failure as an error. */
     BOOLEAN failed = (!NT_SUCCESS(Result) || (HardwareStatus & 0xF0u));
     if (failed) {
-        /* 2-tier escalation:
+        /* 2-tier escalation, BSP-aligned:
          *
-         *   - Stuck-FSM signal → wide FullCoreReset immediately.  This
-         *     covers TIMEOUT_STA (codec hit its own watchdog mid-decode)
-         *     and the "poller never saw an IRQ" case (DEC_RDY_STA never
-         *     latched) — both leave the codec in a state that the
-         *     narrow CON40 bits-6..9 toggle can't unwedge.  Each
-         *     playback session typically only has one failure before
-         *     mpv tears down + re-attaches, so a "wait for two
-         *     consecutive failures" gate would never trip within a
-         *     session.
-         *   - Plain DEC_ERROR_STA + DEC_RDY_STA (codec finished with
-         *     a soft error) → narrow CoreReset.  Cheap, preserves
-         *     codec init state, sufficient for transient CABAC
-         *     desync.  If the soft-error pattern recurs the next
-         *     failure also satisfies the stuck-FSM rule above.
-         */
-        BOOLEAN dec_rdy = (HardwareStatus & RKVDEC2_INT_DEC_RDY_STA) != 0;
+         *   - True wedge (DEC_TIMEOUT_STA from the codec's own watchdog,
+         *     or our poll timeout because no INT_STATUS bit ever latched)
+         *     → wide FullCoreReset.  Narrow CON40 toggle can't unwedge a
+         *     stuck FSM.
+         *   - Any other err_mask hit (ERROR / BUF_EMPTY / COLMV_REF_ERR,
+         *     with or without DEC_RDY) → narrow CoreReset.  BSP would
+         *     issue a soft IOMMU force-reset here — we can't (see
+         *     [[rkmpp_force_reset_unsafe]]) so narrow CoreReset is our
+         *     equivalent.  Earlier code escalated to FullCoreReset on
+         *     every `!dec_rdy` status, which wide-reset the codec on
+         *     ordinary soft errors (recoverable BUF_EMPTY at GOP
+         *     boundaries, transient COLMV_REF_ERR on flaky streams) and
+         *     disrupted peer decode sessions for no recovery benefit. */
         BOOLEAN dec_to  = (HardwareStatus & RKVDEC2_INT_DEC_TIMEOUT_STA) != 0;
         BOOLEAN poll_to = (Result == (NTSTATUS)0xC0000507L /* STATUS_IO_TIMEOUT */);
-        BOOLEAN stuck   = dec_to || poll_to || !dec_rdy;
+        BOOLEAN stuck   = dec_to || poll_to;
         if (stuck) {
             RkMppSetNeedsFullReset(Device);
         } else {

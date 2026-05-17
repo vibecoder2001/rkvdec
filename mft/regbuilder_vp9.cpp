@@ -105,15 +105,18 @@ RegBuildStatus Vp9Regbuilder_Fill(const RegbuildInputs &in,
     rc |= emit_plain(out, RKVDEC2_REG_SECONDARY_EN,
                      RKVDEC2_COLMV_COMPRESS_EN | RKVDEC2_WAIT_RESET_EN);
 
-    /* reg13 ERROR_MODE: BSP capture
-     *   keyframe = 0x01000003 (TIMEOUT_MODE | req_timeout_rst_sel | CUR_PIC_IS_IDR)
-     *   inter    = 0x00000003 (TIMEOUT_MODE | req_timeout_rst_sel)
-     * Bit 1 (req_timeout_rst_sel) enables auto-reset on timeout — BSP
-     * sets it on every kick and the codec apparently needs it for
-     * inter to complete without wedging on Windows. */
+    /* reg13 ERROR_MODE: TIMEOUT_MODE (+CUR_PIC_IS_IDR on keyframes).
+     *
+     * REQ_TIMEOUT_RST_SEL (bit 1) intentionally NOT set, matching
+     * rockchip-mpp userspace and upstream/BSP Linux rkvdec2 — neither
+     * programs the bit.  A BSP shim capture once showed bit 1 set on
+     * VP9 inter kicks and we cargo-culted it; CRU dumps captured at
+     * H.264 TIMEOUT_STA later showed the codec self-gating its leaf
+     * clocks when the bit is on, so it almost certainly wires the
+     * codec's internal timeout into a CRU clock-gate request rather
+     * than doing anything useful from software's perspective. */
     rc |= emit_plain(out, RKVDEC2_REG_ERROR_MODE,
                      RKVDEC2_TIMEOUT_MODE |
-                     (1u << 1) |
                      (is_intra_pre ? RKVDEC2_CUR_PIC_IS_IDR : 0u));
 
     rc |= emit_plain(out, RKVDEC2_REG_STREAM_MODE, 0u);  /* rlc_mode = 0 */
@@ -138,13 +141,24 @@ RegBuildStatus Vp9Regbuilder_Fill(const RegbuildInputs &in,
     rc |= emit_plain(out, RKVDEC2_REG_BLOCK_GATING,
                      RKVDEC2_BLOCK_GATING_RK3588 | RKVDEC2_REG_CFG_GATING_EN);
 
-    /* reg32 TIMEOUT_THRESH: BSP capture = 0x00EFFFFF (~16M cycles ≈
-     * 26 ms @ 600 MHz).  An earlier reading of 0x0003FFFF was off by
-     * three nibbles — that's ~0.4 ms, just enough for a kf but far
-     * short of an inter frame at 4K; the codec hit its internal
-     * watchdog mid-decode and returned hw=0x23 (timeout) on every
-     * inter kick. */
-    rc |= emit_plain(out, RKVDEC2_REG_TIMEOUT_THRESH, 0x00EFFFFFu);
+    /* reg32 TIMEOUT_THRESH: scaled by resolution, matching upstream
+     * Linux rkvdec-vdpu381-regs.h:
+     *   1080p  0x00EFFFFF  (~16M cycles ≈ 26 ms @ 600 MHz)
+     *   4K     0x02CFFFFF  (~47M cycles ≈ 78 ms)
+     *   8K     0x04FFFFFF  (~83M cycles)
+     * The 1080p value previously read 0x000EFFFF (one F short) —
+     * ~983k cycles ≈ 1.6 ms, well below a real 1080p decode time
+     * under any concurrent-decode AXI contention.  Caught by Codex
+     * review of the 2026-05-16 concurrent-decode timeout trace.
+     * See regbuilder_h264.cpp matching fix. */
+    {
+        const uint32_t pixels = pp.width * pp.height;
+        uint32_t timeout;
+        if (pixels <= 1920u * 1088u)        timeout = 0x00EFFFFFu;
+        else if (pixels <= 3840u * 2176u)   timeout = 0x02CFFFFFu;
+        else                                timeout = 0x04FFFFFFu;
+        rc |= emit_plain(out, RKVDEC2_REG_TIMEOUT_THRESH, timeout);
+    }
 
     /* reg28: prob-idx tracking.  Per BSP `Vdpu34xRegCommon.reg028`:
      *   bits 0..2  swreg_vp9_wr_prob_idx = frame_ctx_id + 1 (always)

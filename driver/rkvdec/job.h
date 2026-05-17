@@ -77,6 +77,18 @@ typedef struct _RKMPP_JOB {
     UINT32                DenseIovaSlotCount;
     RKMPP_DENSE_BANK      DenseBank;
     RKMPP_DENSE_IOVA_SLOT DenseIovaSlots[RKMPP_MAX_DENSE_IOVA_SLOTS];
+
+    /* Stamped by RkMppJobStart from JobQueue.LastOwner/LastDecMode so
+     * the poller's timeout dump can report whether THIS kick crossed
+     * an owner / codec-mode boundary, without inferring from nearby
+     * `kick-switch` log lines.  All zero / FALSE on the first kick of
+     * a PnP cycle (KickPrevValid=FALSE). */
+    UINT32          KickDecMode;
+    UINT32          KickPrevDecMode;
+    WDFFILEOBJECT   KickPrevOwner;
+    BOOLEAN         KickSwitchOwner;
+    BOOLEAN         KickSwitchMode;
+    BOOLEAN         KickPrevValid;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------
@@ -91,6 +103,17 @@ typedef struct _RKMPP_JOB_QUEUE {
     volatile LONG64 NextId;         /* next job ID to assign */
     WDFDEVICE       Device;         /* back-pointer for poller context */
     WDFINTERRUPT    Interrupt;      /* WDFINTERRUPT for ISR/DPC */
+
+    /* Cross-kick scheduling probe — updated in RkMppJobStart so the
+     * next kick can log whether the codec just switched Owner (File)
+     * or dec_mode (H.264=1 / H.265=0 / VP9=2 / etc.).  Used to
+     * investigate cross-stream timeouts where the codec self-times-
+     * out across mode boundaries.  Read+written under Queue->Lock or
+     * from the poller's single-threaded JobStart caller — no
+     * additional sync needed. */
+    WDFFILEOBJECT   LastOwner;
+    UINT32          LastDecMode;    /* low 5 bits of swreg9 */
+    BOOLEAN         LastValid;      /* FALSE on first kick after PnP */
 
     /* Polling-completion thread.  WdfInterruptCreate currently fails for
      * rkmpp instances (STATUS_WDF_INVALID_INTERRUPT_CONFIG), so we run a

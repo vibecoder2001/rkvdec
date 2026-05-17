@@ -98,6 +98,7 @@
  * BSP h265d sets timeout_mode + h26x_error_mode + h26x_streamd_error_mode
  * + colmv_error_mode for HEVC (hal_h265d_vdpu34x.c:944-946). */
 #define RKVDEC2_TIMEOUT_MODE                (1u <<  0)  /* in REG_ERROR_MODE */
+#define RKVDEC2_REQ_TIMEOUT_RST_SEL         (1u <<  1)
 #define RKVDEC2_H26X_STREAMD_ERROR_MODE     (1u <<  9)
 #define RKVDEC2_COLMV_ERROR_MODE            (1u << 15)
 #define RKVDEC2_H26X_ERROR_MODE             (1u << 18)

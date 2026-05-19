@@ -59,9 +59,11 @@
     <ClCompile Include="device.c" />
     <ClCompile Include="job.c" />
     <ClCompile Include="ioctl.c" />
+    <ClCompile Include="peer_worker.c" />
     <ClCompile Include="profile.c" />
     <ClCompile Include="..\shared\rkmpp\bufpool.c" />
     <ClCompile Include="..\shared\rkmpp\ifc_client.c" />
+    <ClCompile Include="..\shared\rkmpp\peer_attach.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
     <Inf Include="rkvdec.inx" />
   </ItemGroup>

@@ -12,6 +12,7 @@
 #include <wdf.h>
 
 #include "../../shared/rkmpp_ioctl.h"
+#include "../../shared/rkmpp_peer_worker_ifc.h"  /* define GUID_DEVINTERFACE_RKMPP_PEER_WORKER */
 #include "../shared/rkmpp_log.h"
 #include "profile.h"
 #include "devpub.h"

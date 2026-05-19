@@ -325,6 +325,19 @@ RkIommuUnmaskIrq(_In_ PVOID ProviderContext)
     return STATUS_SUCCESS;
 }
 
+/* IsPtAttached — AV1D is always the sole master instance (single-instance
+ * topology); its page tables are allocated at PrepareHardware time.
+ * Returns TRUE once Domain is allocated (i.e. hardware is ready).
+ * AV1D has no slave/master split so Domain!=NULL is the definitive
+ * readiness signal. */
+static BOOLEAN
+RkIommuAv1dIfcIsPtAttached(_In_ PVOID ProviderContext)
+{
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev) return FALSE;
+    return (dev->Domain != NULL) ? TRUE : FALSE;
+}
+
 /* ---------------------------------------------------------------------------
  * RkIommuRegisterIfc — called from device.c after WdfDeviceCreate
  * --------------------------------------------------------------------------- */
@@ -358,6 +371,7 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.Disable                  = RkIommuDisable;
     ifc.MaskIrq                  = RkIommuMaskIrq;
     ifc.UnmaskIrq                = RkIommuUnmaskIrq;
+    ifc.IsPtAttached             = RkIommuAv1dIfcIsPtAttached;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

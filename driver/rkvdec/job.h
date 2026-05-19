@@ -9,6 +9,8 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include "../../shared/rkmpp_ioctl.h"
+#include "../../shared/rkmpp_peer_worker_ifc.h"
+#include "../shared/rkmpp/peer_attach.h"
 
 /* -----------------------------------------------------------------------
  * Job descriptor — heap-allocated per submitted job.
@@ -88,6 +90,14 @@ typedef struct _RKMPP_JOB {
     BOOLEAN         KickSwitchOwner;
     BOOLEAN         KickSwitchMode;
     BOOLEAN         KickPrevValid;
+
+    /* Phase 3 (Task 3.3): which core executes this job.  Set by
+     * PromoteUntilFull at promote time; read by KickPromotions to
+     * decide local-kick vs peer-dispatch, and by RkMppJobComplete /
+     * RkMppPeerCompletion to identify which CorePending counter to
+     * decrement.  0 = local (RVD0), 1 = peer (RVD1).  Phase 1
+     * default value 0 keeps single-core semantics. */
+    UINT32          TargetCore;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------
@@ -98,7 +108,6 @@ typedef struct _RKMPP_JOB_QUEUE {
     KSPIN_LOCK      Lock;
     LIST_ENTRY      Pending;        /* submitted, not yet started */
     LIST_ENTRY      Completed;      /* finished, not yet WaitJob'd */
-    RKMPP_JOB      *InFlight;       /* currently executing (at most one) */
     volatile LONG64 NextId;         /* next job ID to assign */
     WDFDEVICE       Device;         /* back-pointer for poller context */
     WDFINTERRUPT    Interrupt;      /* WDFINTERRUPT for ISR/DPC */
@@ -139,6 +148,40 @@ typedef struct _RKMPP_JOB_QUEUE {
         UINT64        LastKickId;
     } OwnerLru[4];
 
+    /* Multi-core dispatch state (RVD0 only — RVD1 leaves these zero).
+     * Filled by peer-watch callbacks; read by the promotion loop in
+     * RkMppJobComplete.  All fields read+written under Lock.
+     *
+     * CoreCount: 1 (single-core / pre-attach) or 2 (RVD1 attached).
+     * CoreIdle bit i = core i has no in-flight job.  Init = (1<<CoreCount)-1.
+     * CorePending: BSP task_index analog used as a tiebreak when both
+     *   cores are idle (lowest count wins).  Phase 3 reads these.
+     * InFlightPerCore[]: replaces the old single InFlight field.
+     *   Index 0 = local (RVD0 itself); index 1 = peer (RVD1).
+     *   In Phase 1 only [0] is ever written (single-core path); Phase 3
+     *   adds [1] writes.  RVD1's queue (UID==1) also uses [0] for its
+     *   own local jobs handled via foreign-kick infrastructure.
+     */
+    ULONG                       CoreCount;
+    ULONG                       CoreIdle;
+    ULONG                       CorePending[2];
+    RKMPP_JOB                  *InFlightPerCore[2];
+    /* Tiebreak hint for PickTargetCore: index of the core last
+     * dispatched to (0 or 1), or -1 before any dispatch.  When both
+     * cores tie on CorePending, prefer the one that ISN'T this — so a
+     * serial submitter alternates instead of pinning to core 0. */
+    LONG                        LastKickCore;
+
+    /* Peer worker client state.  PeerOpen=TRUE once we've successfully
+     * QueryInterface'd RVD1's provider; FALSE during single-core mode
+     * (peer driver absent or being unloaded).  Lifecycle: opened in the
+     * peer-arrival callback, closed in the peer query-remove callback
+     * (Phase 4) or in RVD0's ReleaseHardware. */
+    BOOLEAN                     PeerOpen;
+    RKMPP_PEER_WORKER_INTERFACE Peer;
+    PFILE_OBJECT                PeerFileObj;
+    RKMPP_PEER_WATCH            PeerWatch;
+
     /* Polling-completion thread.  WdfInterruptCreate currently fails for
      * rkmpp instances (STATUS_WDF_INVALID_INTERRUPT_CONFIG), so we run a
      * per-device kernel thread that polls INT_STATUS after each kick.
@@ -166,6 +209,31 @@ NTSTATUS RkMppJobWait(_In_ WDFDEVICE Device,
                       _In_ UINT64 JobId,
                       _In_ UINT32 TimeoutMs,
                       _Out_ RKMPP_WAIT_JOB_OUT *Out);
+
+/* Phase 3 (Task 3.2): runs a single dense kick from a pre-resolved
+ * (bank, iova-slots) tuple supplied by RVD1's PEER_WORKER provider —
+ * bypassing per-File handle resolution and per-Owner LRU updates.
+ * Foreign jobs have Owner == NULL.  Caller (peer_worker's
+ * PeerKickWorker) runs at PASSIVE on a system worker thread; this
+ * function blocks until Job->Done is signalled by the ISR-DPC chain,
+ * then invokes Cb(CbCtx, CompletionCookie, Result, HardwareStatus)
+ * and returns.  Cb runs on the worker thread before this returns —
+ * synchronous from the worker's perspective. */
+typedef VOID (*RKMPP_FOREIGN_COMPLETION_CB)(
+    _In_ PVOID    CbCtx,
+    _In_ UINT64   CompletionCookie,
+    _In_ NTSTATUS Result,
+    _In_ UINT32   HardwareStatus);
+
+NTSTATUS RkMppJobRunForeign(_In_ WDFDEVICE Device,
+                            _In_ const VOID  *Bank,         /* RKMPP_DENSE_BANK */
+                            _In_ UINT32       BankBytes,
+                            _In_ UINT32       KickValue,
+                            _In_ const VOID  *IovaSlots,    /* RKMPP_DENSE_IOVA_SLOT[] */
+                            _In_ UINT32       IovaSlotCount,
+                            _In_ UINT64       CompletionCookie,
+                            _In_ RKMPP_FOREIGN_COMPLETION_CB Cb,
+                            _In_ PVOID        CbCtx);
 
 /* IOCTL_RKMPP_SUBMIT_DENSE_JOB handler.  The caller supplies a fully
  * zero-init'd RKMPP_DENSE_BANK plus a list of address-bank slots whose
@@ -221,6 +289,15 @@ NTSTATUS RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
  * from under another File. */
 BOOLEAN RkMppJobQueueHasOtherOwner(_In_ WDFDEVICE Device,
                                    _In_ WDFFILEOBJECT File);
+
+/* Phase 3 (Task 3.4): peer completion entry point.  RVD1's
+ * PEER_WORKER provider invokes this via the consumer callback
+ * registered at peer attach.  Identifies the completing job by
+ * CompletionCookie (matches job->Id stamped in KickPromotions). */
+VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
+                         _In_ UINT64   CompletionCookie,
+                         _In_ NTSTATUS JobStatus,
+                         _In_ UINT32   HardwareStatus);
 
 /* ISR — declared here so device.c can pass it to WdfInterruptCreate. */
 EVT_WDF_INTERRUPT_ISR  RkMppEvtIsr;

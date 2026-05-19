@@ -60,6 +60,8 @@
     <ClCompile Include="ifc.c" />
     <ClCompile Include="topology.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
+    <ClCompile Include="..\shared\rkmpp\ifc_client.c" />
+    <ClCompile Include="..\shared\rkmpp\peer_attach.c" />
     <ClCompile Include="..\shared\iommu\pgtable.c" />
     <ClCompile Include="fault.c" />
     <Inf Include="rkiommu_vdec.inx" />

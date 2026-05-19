@@ -67,7 +67,13 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKIOMMU,
  * cross-session walk-cache flush; it intentionally does NOT expose the
  * intermediate state needed to interleave clock-gate writes, so
  * D0Entry/D0Exit need the new split methods. */
-#define RKIOMMU_IFC_VERSION 6u
+/* v7: add IsPtAttached for slave page-table readiness query.  Slave
+ * rkiommu instances (Task 2.2) leave page tables NULL until the
+ * MASTER instance arrives and they re-program their DTE_ADDR with
+ * the master's PdPhys.  Codec drivers paired with the slave (RVD1)
+ * must wait on this before issuing any IOCTL that hits the iommu.
+ * Master always returns TRUE; slave returns its PtAttached field. */
+#define RKIOMMU_IFC_VERSION 7u
 
 typedef NTSTATUS (*RKIOMMU_QUERY_VERSION)(_Out_ PUINT32);
 
@@ -141,6 +147,8 @@ typedef NTSTATUS (*RKIOMMU_DISABLE)(_In_ PVOID ProviderContext);
 typedef NTSTATUS (*RKIOMMU_MASK_IRQ)(_In_ PVOID ProviderContext);
 typedef NTSTATUS (*RKIOMMU_UNMASK_IRQ)(_In_ PVOID ProviderContext);
 
+typedef BOOLEAN (*RKIOMMU_IS_PT_ATTACHED)(_In_ PVOID ProviderContext);
+
 typedef struct _RKIOMMU_INTERFACE {
     INTERFACE                Header;
     UINT32                   Hid;     /* e.g. 0x3570 / 0x3571 */
@@ -157,4 +165,5 @@ typedef struct _RKIOMMU_INTERFACE {
     RKIOMMU_DISABLE          Disable;
     RKIOMMU_MASK_IRQ         MaskIrq;
     RKIOMMU_UNMASK_IRQ       UnmaskIrq;
+    RKIOMMU_IS_PT_ATTACHED   IsPtAttached;    /* v7 */
 } RKIOMMU_INTERFACE, *PRKIOMMU_INTERFACE;

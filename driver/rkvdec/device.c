@@ -19,6 +19,7 @@
 #include "../shared/rkmpp/bufpool.h"
 #include "../shared/acpi_uid.h"
 #include "job.h"
+#include "../../shared/rkiommu_master_ifc.h"
 
 /* Per-codec memory window count.  rkvdec2 declares 1 or 2 contiguous
  * regions (we merge to one MmioBase).  AV1 declares 3 separate windows
@@ -70,9 +71,32 @@ typedef struct _RKMPP_DEVICE {
     /* Tracks whether the most recent JobComplete reported failure, so we
      * can detect "two failures in a row" and escalate. */
     volatile LONG          LastJobFailed;
+
+    /* Phase 4 (Task 4.2): TRUE when our paired rkiommu is operational
+     * (master rkiommu has PT-attached us).  Flipped FALSE by
+     * RkMppOnMasterIommuQueryRemove when master is being uninstalled.
+     * IOCTLs that require IOMMU return STATUS_DEVICE_NOT_READY when
+     * this is FALSE — forces MFT to re-open from scratch when master
+     * comes back. */
+    BOOLEAN                  IommuAttached;
+    /* Master rkiommu interface (only opened when our paired rkiommu
+     * is master, i.e. RVD0's iommu UID 9 on RK3588).  Used to receive
+     * cascade query-remove notifications. */
+    RKIOMMU_MASTER_INTERFACE MasterIommuIfc;
+    PFILE_OBJECT             MasterIommuFileObj;
+    BOOLEAN                  MasterIommuOpen;
 } RKMPP_DEVICE, *PRKMPP_DEVICE;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RKMPP_DEVICE, RkMppDeviceGet);
+
+/* Phase 4 (Task 4.2): thin accessor so ioctl.c can read IommuAttached
+ * without needing to see the full RKMPP_DEVICE definition. */
+BOOLEAN
+RkMppIsIommuAttached(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    return ctx->IommuAttached;
+}
 
 LONG
 RkMppQueryAndClearNeedsCoreReset(_In_ WDFDEVICE Device)
@@ -115,6 +139,7 @@ RkMppExchangeLastJobFailed(_In_ WDFDEVICE Device, LONG NewValue)
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE     RkMppEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE     RkMppEvtReleaseHardware;
+EVT_WDF_DEVICE_QUERY_REMOVE         RkMppEvtDeviceQueryRemove;  /* Task 4.1 */
 EVT_WDF_OBJECT_CONTEXT_CLEANUP      RkMppEvtDeviceContextCleanup;
 EVT_WDF_FILE_CLEANUP                RkMppEvtFileCleanup;
 EVT_WDF_FILE_CLOSE                  RkMppEvtFileClose;
@@ -123,6 +148,25 @@ EVT_WDF_FILE_CLOSE                  RkMppEvtFileClose;
 static VOID RkMppOnIommuFault(_In_ PVOID  ClientCookie,
                                _In_ ULONG64 FaultIova,
                                _In_ ULONG   StatusReg);
+
+/* Phase 4 (Task 4.2): cascade-detach callback invoked by master rkiommu
+ * EvtDeviceQueryRemove when the master is being uninstalled. */
+static VOID RkMppOnMasterIommuQueryRemove(_In_ PVOID ConsumerContext);
+
+/* Phase 1 (Task 1.6): peer-watch callbacks for RVD0 watching RVD1. */
+static VOID RkMppPeerArrival(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymbolicLink);
+static VOID RkMppPeerRemoval(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymbolicLink);
+
+/* Phase 3 (Task 3.4): peer completion callback — defined in job.c.
+ * RVD1's provider invokes this when a foreign-dispatched job finishes. */
+extern VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
+                                _In_ UINT64   CompletionCookie,
+                                _In_ NTSTATUS JobStatus,
+                                _In_ UINT32   HardwareStatus);
+
+/* Forward decl: RkMppGetJobQueue is defined later in this file (used by
+ * the peer callbacks above and by PrepareHardware/ReleaseHardware). */
+PRKMPP_JOB_QUEUE RkMppGetJobQueue(_In_ WDFDEVICE Device);
 
 /* ISR and DPC live in job.c but are declared via EVT_WDF_INTERRUPT_* here
  * so we can pass them to WdfInterruptCreate in RkMppDeviceCreate. */
@@ -141,6 +185,7 @@ RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDevicePrepareHardware = RkMppEvtPrepareHardware;
     pnp.EvtDeviceReleaseHardware = RkMppEvtReleaseHardware;
+    pnp.EvtDeviceQueryRemove     = RkMppEvtDeviceQueryRemove;  /* Task 4.1 */
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
 
     /* Configure per-file-object context so bufpool.c can track allocations
@@ -165,8 +210,11 @@ RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     NTSTATUS status = WdfDeviceCreate(&DeviceInit, &attr, &device);
     if (!NT_SUCCESS(status)) return status;
 
-    status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_RKMPP, NULL);
-    if (!NT_SUCCESS(status)) return status;
+    /* GUID_DEVINTERFACE_RKMPP (the user-mode device interface) is NOT
+     * registered here — UID isn't known until PrepareHardware reads
+     * ACPI _UID, and we only want RVD0 (UID==0) reachable to user-mode.
+     * RVD1 publishes only the in-kernel PEER_WORKER ifc for RVD0 to
+     * dispatch through.  Registration moved to PrepareHardware. */
 
     /* Initialise the job queue (spin lock, lists, DPC) before any IOCTL
      * can arrive.  Must be called before RkMppQueueInit so the IOCTL
@@ -206,6 +254,140 @@ RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     return RkMppQueueInit(device);
 }
 
+/* Phase 4 (Task 4.1): runtime peer detach.  Called from the peer's
+ * RKMPP_PEER_QUERY_REMOVE_CB at PASSIVE when RVD1 is about to be
+ * uninstalled.  Snapshots peer ifc state under queue lock, transitions
+ * RVD0 back to single-core, drains any peer-targeted job briefly,
+ * then dereferences the peer interface + releases the file-object.
+ *
+ * Also called from RkMppEvtReleaseHardware (the rkvdec.sys PnP-stop
+ * path) to share the same teardown logic with a cleaner ordering. */
+static VOID
+RkMppDetachPeer(_In_ WDFDEVICE Device)
+{
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+    BOOLEAN wasOpen = q->PeerOpen;
+    RKMPP_PEER_WORKER_INTERFACE peerIfc = q->Peer;
+    PFILE_OBJECT peerFo = q->PeerFileObj;
+    RKMPP_JOB *peerJob = q->InFlightPerCore[1];
+    q->PeerOpen = FALSE;
+    q->CoreCount = 1;
+    q->CoreIdle &= 1u;   /* clear peer idle bit */
+    q->CorePending[1] = 0;
+    q->PeerFileObj = NULL;
+    RtlZeroMemory(&q->Peer, sizeof(q->Peer));
+    KeReleaseSpinLock(&q->Lock, irql);
+
+    if (!wasOpen) return;
+
+    /* If a peer-targeted job was in flight at the moment of detach, the
+     * "all jobs stopped" precondition was violated.  Best effort: wait
+     * briefly for its Done event.  Spec acknowledges surprise-remove is
+     * non-graceful; the codec watchdog + reset escalation will eventually
+     * fire if hardware truly hung. */
+    if (peerJob) {
+        LARGE_INTEGER to; to.QuadPart = -((LONGLONG)500 * 10000);
+        KeWaitForSingleObject(&peerJob->Done, Executive,
+                              KernelMode, FALSE, &to);
+    }
+
+    /* Order: Dereference the interface (provider's Dereference callback
+     * runs while its binary is still pinned by the file-object ref),
+     * then release the file-object.  See [[wdf_query_interface.md]] —
+     * inverting this order races with provider unload and BSODs 0xCE. */
+    if (peerIfc.Header.InterfaceDereference)
+        peerIfc.Header.InterfaceDereference(peerIfc.Header.Context);
+    if (peerFo) ObDereferenceObject(peerFo);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkvdec: peer detached, single-core mode\n");
+}
+
+/* Phase 4 (Task 4.1): consumer-side callback invoked by RVD1's
+ * PEER_WORKER provider from RVD1's EvtDeviceQueryRemove.  Runs at
+ * PASSIVE on RVD1's thread.  Returning from this callback grants
+ * RVD1 permission to proceed with query-remove. */
+static VOID
+RkMppPeerOnQueryRemove(_In_ PVOID ConsumerContext)
+{
+    WDFDEVICE Device = (WDFDEVICE)ConsumerContext;
+    RkMppDetachPeer(Device);
+}
+
+static VOID
+RkMppPeerArrival(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymbolicLink)
+{
+    WDFDEVICE Device = (WDFDEVICE)Ctx;
+    PRKMPP_DEVICE devCtx = RkMppDeviceGet(Device);
+    if (devCtx->Uid != 0) return;   /* only RVD0 consumes peer */
+
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+
+    RKMPP_PEER_WORKER_INTERFACE ifc;
+    PFILE_OBJECT fo = NULL;
+    NTSTATUS s = RkMppQueryPeerWorkerBySymlink(SymbolicLink, &ifc, &fo);
+    if (!NT_SUCCESS(s)) return;
+
+    /* Topology filter: only RVD1 (Hid 0x3550, Uid 1) is our peer. */
+    if (ifc.Hid != 0x3550 || ifc.Uid != 1) {
+        if (ifc.Header.InterfaceDereference)
+            ifc.Header.InterfaceDereference(ifc.Header.Context);
+        ObDereferenceObject(fo);
+        return;
+    }
+
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+    if (q->PeerOpen) {
+        /* Already attached — duplicate arrival, drop the second ref. */
+        KeReleaseSpinLock(&q->Lock, irql);
+        if (ifc.Header.InterfaceDereference)
+            ifc.Header.InterfaceDereference(ifc.Header.Context);
+        ObDereferenceObject(fo);
+        return;
+    }
+    q->Peer        = ifc;
+    q->PeerFileObj = fo;
+    q->PeerOpen    = TRUE;
+    q->CoreCount   = 2;
+    q->CoreIdle   |= (1u << 1);
+    q->CorePending[1] = 0;
+    KeReleaseSpinLock(&q->Lock, irql);
+
+    /* Phase 3 (Task 3.4): register our completion callback on the
+     * peer.  RVD1 invokes RkMppPeerCompletion when a foreign job's
+     * codec interrupt completes.  Done outside the queue lock —
+     * peer.RegisterCompletion takes its own lock. */
+    if (ifc.RegisterCompletion) {
+        ifc.RegisterCompletion(ifc.Header.Context, Device,
+                               RkMppPeerCompletion);
+    }
+
+    /* Phase 4 (Task 4.1): register inverse hook so RVD1 can cascade
+     * tell us to detach before it goes away. */
+    if (ifc.RegisterQueryRemove) {
+        ifc.RegisterQueryRemove(ifc.Header.Context, Device,
+                                RkMppPeerOnQueryRemove);
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkvdec: peer worker attached (RVD1), CoreCount=2\n");
+}
+
+static VOID
+RkMppPeerRemoval(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymbolicLink)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    UNREFERENCED_PARAMETER(SymbolicLink);
+    /* Authoritative detach is via the peer's QueryRemove callback,
+     * wired in Phase 4.  Removal notification just logs. */
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkvdec: peer worker removal notification\n");
+}
+
 NTSTATUS
 RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                         _In_ WDFCMRESLIST ResourcesRaw,
@@ -218,6 +400,24 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     NTSTATUS status = RkMppReadAcpiId(Device, &ctx->Hid, &ctx->Uid);
     if (!NT_SUCCESS(status)) return status;
+
+    /* Register the user-mode GUID_DEVINTERFACE_RKMPP only for RVD0
+     * (UID==0).  RVD1 has no user-mode IOCTL surface — only RVD0 is
+     * opened by MFT, RVD0 dispatches to RVD1 via the in-kernel
+     * PEER_WORKER ifc.  Holding registration until UID is known keeps
+     * RVD1 invisible to user-mode enumeration entirely (vs registering
+     * for both then disabling, which leaves a brief enumerable window
+     * + lets MFT cache stale symlinks). */
+    if (ctx->Uid == 0) {
+        NTSTATUS si = WdfDeviceCreateDeviceInterface(
+            Device, &GUID_DEVINTERFACE_RKMPP, NULL);
+        if (!NT_SUCCESS(si)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkvdec UID=0: WdfDeviceCreateDeviceInterface failed 0x%x\n", si);
+            return si;
+        }
+    }
+
 
     /* First kick after PnP MUST reset: empirically, a fresh PD power-on
      * leaves the codec FSM in a state where dec_e=1 is accepted but the
@@ -307,6 +507,74 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                "rkmpp: ifcs opened (iommu v%u, ccu v%u)\n",
                ctx->Ifcs.Iommu.Header.Version, ctx->Ifcs.Ccu.Header.Version);
 
+    ctx->IommuAttached = FALSE;  /* set TRUE below after Iommu.Enable succeeds */
+
+    /* Phase 4 (Task 4.2): if our paired rkiommu is the master, also open
+     * its MASTER interface so we receive cascade query-remove notifications.
+     * Slave rkiommu doesn't need this — its lifecycle is bound to master's
+     * via the master→slave RegisterQueryRemove already wired in Task 2.2. */
+    if (RkMppIsMasterIommu(ctx->Ifcs.Iommu.Hid, ctx->Ifcs.Iommu.Uid)) {
+        PWSTR symlinks = NULL;
+        NTSTATUS sl = IoGetDeviceInterfaces((LPGUID)&GUID_DEVINTERFACE_RKIOMMU_MASTER,
+                                            NULL, 0, &symlinks);
+        if (NT_SUCCESS(sl) && symlinks && *symlinks) {
+            UNICODE_STRING uname;
+            RtlInitUnicodeString(&uname, symlinks);
+            PFILE_OBJECT fo = NULL;
+            PDEVICE_OBJECT devObj = NULL;
+            sl = IoGetDeviceObjectPointer(&uname, FILE_READ_DATA, &fo, &devObj);
+            if (NT_SUCCESS(sl)) {
+                RtlZeroMemory(&ctx->MasterIommuIfc, sizeof(ctx->MasterIommuIfc));
+                sl = RkMppQueryOne(devObj, &GUID_DEVINTERFACE_RKIOMMU_MASTER,
+                                   RKIOMMU_MASTER_IFC_VERSION,
+                                   &ctx->MasterIommuIfc,
+                                   sizeof(ctx->MasterIommuIfc));
+                if (NT_SUCCESS(sl)) {
+                    ctx->MasterIommuFileObj = fo;
+                    ctx->MasterIommuOpen    = TRUE;
+                    /* Register our cascade-detach callback. */
+                    if (ctx->MasterIommuIfc.RegisterQueryRemove) {
+                        ctx->MasterIommuIfc.RegisterQueryRemove(
+                            ctx->MasterIommuIfc.Header.Context,
+                            Device,
+                            RkMppOnMasterIommuQueryRemove);
+                    }
+                } else {
+                    ObDereferenceObject(fo);
+                }
+            }
+        }
+        if (symlinks) ExFreePool(symlinks);
+        /* Non-fatal: if master ifc isn't queryable, we just don't get
+         * the cascade callback.  Surprise-remove path still works (with
+         * the 0xCE risk that wdf_query_interface memory documents). */
+    }
+
+    /* RVD1 (rkvdec UID==1) is paired with the slave rkiommu (UID 10),
+     * whose page tables are not attached to master until slave's PnP
+     * arrival callback fires (asynchronously after master rkiommu
+     * starts).  Don't block PrepareHardware on that — instead, allow
+     * PnP to complete with IommuAttached=FALSE, publish PEER_WORKER,
+     * and rely on RVD0's later RegisterCompletion call (when RVD0
+     * comes online) to trigger our lazy Enable.  This handles every
+     * PnP order: RVD1-before-master, master-first, and master+RVD0
+     * cycling while we stay loaded.  See RkMppPeerOnRvd0Connected
+     * below for the enable trigger. */
+
+    /* Phase 1 (Task 1.5): if this is RVD1, publish PEER_WORKER so RVD0
+     * can dispatch jobs to us in dual-core mode.  Stub bodies for now —
+     * Phase 3 wires the actual kick path. */
+    {
+        NTSTATUS sPeerPub = RkMppPeerWorkerPublish(Device, ctx->Uid);
+        if (!NT_SUCCESS(sPeerPub)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkvdec: PEER_WORKER publish failed 0x%x (UID=%u)\n",
+                       sPeerPub, ctx->Uid);
+            RkMppCloseIfcs(&ctx->Ifcs);
+            return sPeerPub;
+        }
+    }
+
     /* Raise the cluster.  Refcounted; matching DropCluster in ReleaseHardware.
      * Picks the rkvdec0/1 path or the AV1 path based on personality, which
      * we look up from the profile early because the per-codec branch below
@@ -324,6 +592,40 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
      * Task 2 — PD_VCODEC + PD_VDPU + PD_RKVDEC0/1 all power on cleanly,
      * NIU/CCU resets deassert, codec MMIO at 0xFDC38100/0xFDC48100 reads
      * REVISION = 0x53813f05.  Now the rest of PrepareHardware is safe. */
+
+    /* Phase 2 fix: slave rkiommu (UID 10, paired with RVD1) has its
+     * shadow Domain ready (set by OnMasterArrival via the PnP watch)
+     * but its MMU MMIO is NOT yet programmed — that step was deferred
+     * to avoid SError on slave's bus clocks before RaiseCluster.  Now
+     * that RVD1's cluster is up and bus clocks are ungated, drive an
+     * explicit Iommu.Enable through the ifc to program slave's DTE_ADDR
+     * + ENABLE_PAGING.
+     *
+     * RVD0 (master rkiommu): Enable always succeeds (Domain already
+     * allocated at master PrepareHardware).  Sets IommuAttached=TRUE.
+     *
+     * RVD1 (slave rkiommu): if slave hasn't yet attached to master
+     * (Domain still NULL), Enable returns DEVICE_NOT_READY.  That's
+     * fine — leave IommuAttached=FALSE and let RkMppPeerOnRvd0Connected
+     * retry the Enable when RVD0 later calls RegisterCompletion. */
+    ctx->IommuAttached = FALSE;
+    if (ctx->Ifcs.Iommu.Enable) {
+        NTSTATUS se = ctx->Ifcs.Iommu.Enable(ctx->Ifcs.Iommu.Header.Context);
+        if (NT_SUCCESS(se)) {
+            ctx->IommuAttached = TRUE;
+        } else if (ctx->Uid == 0) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkvdec UID=0: Iommu.Enable after RaiseCluster failed 0x%x\n", se);
+            ctx->Ifcs.Ccu.DropCluster(cookie);
+            RkMppCloseIfcs(&ctx->Ifcs);
+            return se;
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "rkvdec UID=1: Iommu.Enable not ready yet (0x%x) — "
+                       "will retry on RVD0 connect\n", se);
+        }
+    }
+
     const RKMPP_PROFILE *p = RkMppFindProfile(ctx->Hid, ctx->Uid);
     if (p) {
         ctx->SupportedCodecs = p->SupportedCodecs;
@@ -410,6 +712,29 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     RKMPP_LOG_INFO(
                "rkmpp: HID=RKCP%04x UID=%u rev=0x%08x codecs=0x%08x\n",
                ctx->Hid, ctx->Uid, ctx->RevisionWord, ctx->SupportedCodecs);
+
+    /* RVD0 watches for RVD1's PEER_WORKER device interface arrival.
+     * Registered LAST so that the synchronous-arrival callback (which
+     * runs RVD1's full reset via RkMppPeerOnRvd0Connected) happens
+     * AFTER our own FullCoreReset0 + Reattach + Assert/Deassert above.
+     * Otherwise RVD0's later reset would disturb RVD1's freshly-reset
+     * codec state and break RVD1 playback — surfaced as "disable +
+     * re-enable RVD0 alone breaks RVD1 until RVD1 reinstall."
+     * Non-fatal if registration fails — driver stays in single-core
+     * mode silently. */
+    if (ctx->Uid == 0) {
+        NTSTATUS sw = RkMppWatchPeer(&GUID_DEVINTERFACE_RKMPP_PEER_WORKER,
+                                     Device,
+                                     RkMppPeerArrival,
+                                     RkMppPeerRemoval,
+                                     &RkMppGetJobQueue(Device)->PeerWatch);
+        if (!NT_SUCCESS(sw)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkvdec: RkMppWatchPeer failed 0x%x (single-core fallback)\n",
+                       sw);
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -418,6 +743,43 @@ RkMppEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTransl
 {
     UNREFERENCED_PARAMETER(ResourcesTranslated);
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+
+    /* Phase 1 (Task 1.6) / Phase 4 (Task 4.1): unwatch peer + drop any
+     * held peer ref.  Order matters: stop the PnP notification first (no
+     * more arrival callbacks can fire), then call RkMppDetachPeer which
+     * does the under-lock snapshot + deref dance.  Dereference of the
+     * interface MUST precede release of the file-object — provider's
+     * Dereference callback runs while its binary is still pinned (see
+     * ifc_client.c:241-252, [[wdf_query_interface.md]] for the 0xCE
+     * rationale). */
+    if (ctx->Uid == 0) {
+        RkMppUnwatchPeer(&RkMppGetJobQueue(Device)->PeerWatch);
+        RkMppDetachPeer(Device);
+    }
+
+    /* Phase 4 (Task 4.2): drop master rkiommu ifc ref if we opened it.
+     *
+     * Critical: scrub our cascade callback out of master's Consumers[]
+     * registry BEFORE releasing the file-object.  If we release first
+     * and master gets disabled next (e.g. ACPI _DEP-triggered order
+     * leaves master alive momentarily after we're gone), master would
+     * invoke our (now stale) callback against this freed Device →
+     * bugcheck → reboot to recover.  Symptom seen on RKCP3570 UID 9
+     * disable: Device Manager demands reboot. */
+    if (ctx->MasterIommuOpen) {
+        if (ctx->MasterIommuIfc.UnregisterQueryRemove) {
+            ctx->MasterIommuIfc.UnregisterQueryRemove(
+                ctx->MasterIommuIfc.Header.Context, Device);
+        }
+        if (ctx->MasterIommuIfc.Header.InterfaceDereference)
+            ctx->MasterIommuIfc.Header.InterfaceDereference(
+                ctx->MasterIommuIfc.Header.Context);
+        if (ctx->MasterIommuFileObj) {
+            ObDereferenceObject(ctx->MasterIommuFileObj);
+            ctx->MasterIommuFileObj = NULL;
+        }
+        ctx->MasterIommuOpen = FALSE;
+    }
 
     /* Stop the poller before anything that takes MMIO out from under it.
      * The poller's tight `READ_REGISTER_ULONG(mmio + IntStatusOffset)`
@@ -472,6 +834,143 @@ RkMppEvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTransl
     ctx->MmioLength = 0;
     ctx->MmioCount  = 0;
     return STATUS_SUCCESS;
+}
+
+/* Phase 4 (Task 4.1): EvtDeviceQueryRemove — called by PnP before
+ * uninstalling or disabling this device.  On RVD1 (the PEER_WORKER
+ * provider), we synchronously notify RVD0 (the consumer) so it can
+ * transition to single-core mode and dereference the interface before
+ * RVD1's driver binary is unloaded.  Returning STATUS_SUCCESS grants
+ * permission to proceed with query-remove. */
+NTSTATUS
+RkMppEvtDeviceQueryRemove(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    /* RVD1 only — when our PEER_WORKER provider is going away,
+     * notify the consumer (RVD0).  This invokes RVD0's registered
+     * RKMPP_PEER_QUERY_REMOVE_CB synchronously; on return RVD0 has
+     * detached and we can finalize PnP query-remove. */
+    if (ctx->Uid == 1) {
+        RkMppPeerWorkerNotifyQueryRemove();
+    }
+    return STATUS_SUCCESS;
+}
+
+/* Phase 4 (Task 4.2): master rkiommu is going away — flip IommuAttached
+ * to FALSE so subsequent IOCTLs return STATUS_DEVICE_NOT_READY, drain
+ * in-flight jobs briefly, then deref our master ifc.  Runs at PASSIVE on
+ * master rkiommu's EvtDeviceQueryRemove thread; returning grants master
+ * permission to proceed.  When master reinstalls, our (re-attached)
+ * iommu's PtAttached flips back on its own; MFT re-opens us and
+ * IommuAttached goes TRUE again via a new PrepareHardware cycle. */
+static VOID
+RkMppOnMasterIommuQueryRemove(_In_ PVOID ConsumerContext)
+{
+    WDFDEVICE Device = (WDFDEVICE)ConsumerContext;
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+
+    ctx->IommuAttached = FALSE;
+
+    /* Drain in-flight on both cores (best effort; 500ms each). */
+    for (ULONG c = 0; c < 2; c++) {
+        KIRQL irql;
+        KeAcquireSpinLock(&q->Lock, &irql);
+        RKMPP_JOB *jf = q->InFlightPerCore[c];
+        KEVENT *done = jf ? &jf->Done : NULL;
+        KeReleaseSpinLock(&q->Lock, irql);
+        if (done) {
+            LARGE_INTEGER to; to.QuadPart = -((LONGLONG)500 * 10000);
+            KeWaitForSingleObject(done, Executive, KernelMode, FALSE, &to);
+        }
+    }
+
+    /* Deref master ifc.  Order: Dereference callback first (runs while
+     * binary is still pinned by fo), then release file-object.
+     * See [[wdf_query_interface.md]] — inverting races with provider
+     * unload and BSODs 0xCE. */
+    if (ctx->MasterIommuOpen) {
+        if (ctx->MasterIommuIfc.Header.InterfaceDereference)
+            ctx->MasterIommuIfc.Header.InterfaceDereference(
+                ctx->MasterIommuIfc.Header.Context);
+        if (ctx->MasterIommuFileObj) {
+            ObDereferenceObject(ctx->MasterIommuFileObj);
+            ctx->MasterIommuFileObj = NULL;
+        }
+        ctx->MasterIommuOpen = FALSE;
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkvdec: master rkiommu cascade-detach, IommuAttached=FALSE\n");
+}
+
+/* Called from peer_worker.c when RVD0 (re-)connects to RVD1 via
+ * RegisterCompletion.  RVD0's connection signals "master rkiommu is
+ * up, slave should be attached, dispatch is ready" — so this is the
+ * point at which RVD1 must do a fresh-PrepareHardware-equivalent
+ * reset: Iommu.Enable + FullCoreReset1 + Reattach + narrow codec
+ * reset pulse.  Without the codec reset, RVD1's FSM remains in the
+ * half-initialized state from when initial PrepareHardware reset it
+ * with no working IOMMU — symptom is broken playback that only a
+ * driver reinstall clears.  Runs at PASSIVE on RVD0's PnP arrival
+ * thread.  Idempotent — second connection just does the same reset
+ * dance (RVD0 isn't dispatching during disconnect, so safe). */
+VOID RkMppPeerOnRvd0Connected(_In_ WDFDEVICE Device)
+{
+    PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
+    if (!ctx) return;
+
+    /* Slave PT might still be propagating.  Brief poll (1s).  In the
+     * common case IsPtAttached is TRUE on the first check. */
+    if (ctx->Ifcs.Iommu.IsPtAttached) {
+        for (ULONG i = 0; i < 10; i++) {
+            if (ctx->Ifcs.Iommu.IsPtAttached(ctx->Ifcs.Iommu.Header.Context))
+                break;
+            LARGE_INTEGER interval; interval.QuadPart = -1LL * 100 * 10000;
+            KeDelayExecutionThread(KernelMode, FALSE, &interval);
+        }
+    }
+
+    /* Step 1: program slave's MMU (idempotent for master). */
+    if (ctx->Ifcs.Iommu.Enable) {
+        NTSTATUS s = ctx->Ifcs.Iommu.Enable(ctx->Ifcs.Iommu.Header.Context);
+        if (!NT_SUCCESS(s)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkvdec UID=%u: RVD0 connect → Iommu.Enable 0x%x — "
+                       "leaving IommuAttached=FALSE\n", ctx->Uid, s);
+            return;
+        }
+    }
+
+    /* Step 2-4: same reset chain RkMppEvtPrepareHardware does after
+     * cluster raise.  FullCoreReset zeroes IOMMU DTE as a side effect,
+     * so Reattach is required to reprogram it before any kick.  The
+     * narrow Assert/Deassert pulse re-initializes the codec FSM — this
+     * is the step that was missing on initial RVD1 bring-up when slave
+     * PT wasn't yet attached, and that a driver reinstall fixes. */
+    if (ctx->Uid == 1 && ctx->Ifcs.CcuOpen) {
+        if (ctx->Ifcs.Ccu.FullCoreReset1) {
+            ctx->Ifcs.Ccu.FullCoreReset1(ctx->Ifcs.Ccu.Header.Context);
+        }
+        if (ctx->Ifcs.Iommu.Reattach) {
+            NTSTATUS rs = ctx->Ifcs.Iommu.Reattach(ctx->Ifcs.Iommu.Header.Context);
+            if (!NT_SUCCESS(rs)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "rkvdec UID=1: RVD0 connect → Reattach 0x%x\n", rs);
+                return;
+            }
+        }
+        if (ctx->Ifcs.Ccu.AssertRvdec1CoreReset &&
+            ctx->Ifcs.Ccu.DeassertRvdec1CoreReset) {
+            ctx->Ifcs.Ccu.AssertRvdec1CoreReset(ctx->Ifcs.Ccu.Header.Context);
+            ctx->Ifcs.Ccu.DeassertRvdec1CoreReset(ctx->Ifcs.Ccu.Header.Context);
+        }
+    }
+
+    ctx->IommuAttached = TRUE;
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkvdec UID=%u: RVD0 connect → reset+Enable OK, "
+               "IommuAttached=TRUE\n", ctx->Uid);
 }
 
 /* Per-device context cleanup — fires when the WDFDEVICE is destroyed

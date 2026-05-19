@@ -19,7 +19,7 @@ static NTSTATUS RkMppQiCompletion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID C
 }
 
 /* Issues IRP_MN_QUERY_INTERFACE on a single device. */
-static NTSTATUS QueryOne(_In_ PDEVICE_OBJECT devObj,
+NTSTATUS RkMppQueryOne(_In_ PDEVICE_OBJECT devObj,
                          _In_ const GUID *Guid,
                          _In_ USHORT IfcVersion,
                          _Out_writes_bytes_(BufLen) PVOID Buf,
@@ -89,7 +89,7 @@ static NTSTATUS QueryByGuid(_In_ const GUID *Guid,
             continue;
         }
 
-        status = QueryOne(devObj, Guid, IfcVersion, Buf, BufLen);
+        status = RkMppQueryOne(devObj, Guid, IfcVersion, Buf, BufLen);
 
         if (NT_SUCCESS(status)) {
             /* Hand the file-object reference to the caller — they pin
@@ -160,8 +160,8 @@ static NTSTATUS QueryIommuByHidUid(UINT32 TargetHid, UINT32 TargetUid,
 
         RKIOMMU_INTERFACE ifc;
         RtlZeroMemory(&ifc, sizeof(ifc));
-        status = QueryOne(devObj, &GUID_DEVINTERFACE_RKIOMMU,
-                          RKIOMMU_IFC_VERSION, &ifc, sizeof(ifc));
+        status = RkMppQueryOne(devObj, &GUID_DEVINTERFACE_RKIOMMU,
+                               RKIOMMU_IFC_VERSION, &ifc, sizeof(ifc));
         if (NT_SUCCESS(status) &&
             ifc.Hid == TargetHid && ifc.Uid == TargetUid) {
             *Out         = ifc;
@@ -249,4 +249,69 @@ VOID RkMppCloseIfcs(_Inout_ RKMPP_IFC_CLIENT *c)
     if (c->IommuFileObj) ObDereferenceObject(c->IommuFileObj);
     if (c->CcuFileObj)   ObDereferenceObject(c->CcuFileObj);
     RtlZeroMemory(c, sizeof(*c));
+}
+
+BOOLEAN RkMppIsMasterIommu(_In_ UINT32 IommuHid, _In_ UINT32 IommuUid)
+{
+    /* Master = the iommu instance that OWNS the page tables.
+     *   Hid=0x3570: rkvdec rkiommus.  Master = UID 9 (paired with RVD0).
+     *     UIDs 0-8 are NON-codec IOMMUs (VPMU, ENC, etc.) that own
+     *     their OWN page tables; they are not "master" of anything
+     *     shared, and they are not "slaves" of UID 9 either.  They are
+     *     standalone — neither master nor slave in the multi-core
+     *     dispatch system.
+     *   Hid=0x3571: AV1 rkiommu, single instance, always master. */
+    if (IommuHid == 0x3570) return IommuUid == 9;
+    if (IommuHid == 0x3571) return TRUE;
+    return FALSE;
+}
+
+BOOLEAN RkMppIsCodecSlaveIommu(_In_ UINT32 IommuHid, _In_ UINT32 IommuUid)
+{
+    /* TRUE only for the codec slave instance(s) that must SHARE a
+     * master's page-table base.  On RK3588 rkvdec: UID 10 (paired
+     * with RVD1) is the slave of UID 9.  AV1 has no slave (single
+     * codec instance).  Non-codec IOMMUs (UIDs 0-8 on Hid=0x3570)
+     * return FALSE — they own their own page tables. */
+    return IommuHid == 0x3570 && IommuUid == 10;
+}
+
+BOOLEAN RkMppLookupPeerCodec(_In_  UINT32 CodecHid,
+                             _In_  UINT32 CodecUid,
+                             _Out_ UINT32 *PeerHid,
+                             _Out_ UINT32 *PeerUid)
+{
+    *PeerHid = 0; *PeerUid = 0;
+    /* RKCP3550 rkvdec2: RVD0 (Uid 0) peers with RVD1 (Uid 1).
+     * We dispatch master→slave only, so the reverse mapping is not
+     * supported (returns FALSE). */
+    if (CodecHid == 0x3550 && CodecUid == 0) {
+        *PeerHid = 0x3550;
+        *PeerUid = 1;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+#include "../../../shared/rkmpp_peer_worker_ifc.h"
+
+NTSTATUS RkMppQueryPeerWorkerBySymlink(_In_ PUNICODE_STRING SymbolicLink,
+                                       _Out_ RKMPP_PEER_WORKER_INTERFACE *Out,
+                                       _Out_ PFILE_OBJECT *OutFileObj)
+{
+    *OutFileObj = NULL;
+    PFILE_OBJECT fo = NULL;
+    PDEVICE_OBJECT devObj = NULL;
+    NTSTATUS s = IoGetDeviceObjectPointer(SymbolicLink, FILE_READ_DATA,
+                                          &fo, &devObj);
+    if (!NT_SUCCESS(s)) return s;
+    RtlZeroMemory(Out, sizeof(*Out));
+    s = RkMppQueryOne(devObj, &GUID_DEVINTERFACE_RKMPP_PEER_WORKER,
+                      RKMPP_PEER_WORKER_IFC_VERSION, Out, sizeof(*Out));
+    if (!NT_SUCCESS(s)) {
+        ObDereferenceObject(fo);
+        return s;
+    }
+    *OutFileObj = fo;
+    return STATUS_SUCCESS;
 }

@@ -18,8 +18,9 @@
 #include "job.h"
 
 /* Provided by device.c */
-extern void RkMppGetPublic(_In_ WDFDEVICE Device, _Out_ RKMPP_DEVICE_PUBLIC *Out);
-extern void RkMppGetFaultState(_In_ WDFDEVICE Device, _Out_ RKMPP_FAULT_STATE *Out);
+extern void    RkMppGetPublic(_In_ WDFDEVICE Device, _Out_ RKMPP_DEVICE_PUBLIC *Out);
+extern void    RkMppGetFaultState(_In_ WDFDEVICE Device, _Out_ RKMPP_FAULT_STATE *Out);
+extern BOOLEAN RkMppIsIommuAttached(_In_ WDFDEVICE Device);  /* Phase 4 (Task 4.2) */
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RkMppEvtIoDeviceControl;
 
@@ -53,6 +54,16 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
     NTSTATUS   status = STATUS_INVALID_DEVICE_REQUEST;
     ULONG_PTR  info   = 0;
     WDFDEVICE  device = WdfIoQueueGetDevice(Queue);
+
+    /* Phase 4 (Task 4.2): when master rkiommu has cascade-detached us,
+     * refuse any IOCTL that requires IOMMU.  GET_CAPS is the exception —
+     * it only reads device-context fields, no IOMMU needed; allowing it
+     * lets MFT discover us during the transient detach window without
+     * spurious errors. */
+    if (!RkMppIsIommuAttached(device) && IoControlCode != IOCTL_RKMPP_GET_CAPS) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
 
     switch (IoControlCode) {
 

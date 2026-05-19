@@ -28,6 +28,9 @@
 #include <wdf.h>
 
 #include "../../shared/rkiommu_ifc.h"
+#include "../../shared/rkiommu_master_ifc.h"
+#include "../../shared/rkmpp_ccu_ifc.h"          /* GUID_DEVINTERFACE_RKMPP_CCU */
+#include "../../shared/rkmpp_peer_worker_ifc.h"  /* GUID_DEVINTERFACE_RKMPP_PEER_WORKER */
 #include "../../shared/rkmpp_ioctl.h"  /* RkMppBufferUsage* enum */
 #include "device.h"
 #include "../shared/rkmpp_log.h"
@@ -80,6 +83,11 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
      * always land in VPMU (UID=0). */
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev) return STATUS_DEVICE_NOT_READY;
+    /* Slave instances share master's page tables (Task 2.2): they
+     * never own a Domain.  Map/Unmap must go through master.  Codec
+     * drivers route MapMdl through the RVD0-paired master ifc; this
+     * defensive check guards the impossible-by-design case. */
+    if (!dev->IsMaster) return STATUS_NOT_SUPPORTED;
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
 
@@ -181,6 +189,11 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     /* See RkIommuMapMdl: the consumer passes its iommu->Header.Context. */
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev) return STATUS_DEVICE_NOT_READY;
+    /* Slave instances share master's page tables (Task 2.2): they
+     * never own a Domain.  Map/Unmap must go through master.  Codec
+     * drivers route MapMdl through the RVD0-paired master ifc; this
+     * defensive check guards the impossible-by-design case. */
+    if (!dev->IsMaster) return STATUS_NOT_SUPPORTED;
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
 
@@ -457,6 +470,19 @@ RkIommuUnmaskIrq(_In_ PVOID ProviderContext)
     return STATUS_SUCCESS;
 }
 
+/* IsPtAttached — returns TRUE once this instance's MMU registers are
+ * programmed with a valid page-directory physical address.  Master
+ * instances are always attached once Domain is allocated (set during
+ * PrepareHardware).  Slave instances start FALSE and transition to TRUE
+ * when RkIommuSlaveAttach runs in OnMasterArrival. */
+static BOOLEAN
+RkIommuIfcIsPtAttached(_In_ PVOID ProviderContext)
+{
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev) return FALSE;
+    return dev->PtAttached;
+}
+
 /* ---------------------------------------------------------------------------
  * RkIommuRegisterIfc — called from device.c after WdfDeviceCreate
  * --------------------------------------------------------------------------- */
@@ -497,6 +523,7 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.Disable                  = RkIommuDisable;
     ifc.MaskIrq                  = RkIommuMaskIrq;
     ifc.UnmaskIrq                = RkIommuUnmaskIrq;
+    ifc.IsPtAttached             = RkIommuIfcIsPtAttached;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,
@@ -504,4 +531,96 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
                                     &GUID_DEVINTERFACE_RKIOMMU,
                                     NULL);
     return WdfDeviceAddQueryInterface(Device, &cfg);
+}
+
+/* ---------------------------------------------------------------------------
+ * Master interface — published by the rkiommu instance that owns the
+ * page tables (UID 9 on RK3588 rkvdec topology).  Allows the slave
+ * instance to attach to the master's page-directory root and program
+ * its own MMU registers with that PdPhys.  Mirrors BSP Linux's
+ * rkvdec2_attach_ccu domain-aliasing (mpp_rkvdec2_link.c:1342).
+ * --------------------------------------------------------------------------- */
+
+static NTSTATUS
+MasterGetPtBase(_In_ PVOID provCtx, _Out_ PULONG32 PdPhys)
+{
+    PRKIOMMU_DEVICE dev = (PRKIOMMU_DEVICE)provCtx;
+    if (!dev || !dev->IsMaster || !dev->Domain) return STATUS_DEVICE_NOT_READY;
+    *PdPhys = dev->Domain->PdPhys;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+MasterRegisterQueryRemove(_In_ PVOID provCtx,
+                          _In_ PVOID consCtx,
+                          _In_ RKIOMMU_MASTER_QUERY_REMOVE_CB cb)
+{
+    PRKIOMMU_DEVICE dev = (PRKIOMMU_DEVICE)provCtx;
+    if (!dev) return STATUS_DEVICE_NOT_READY;
+    KIRQL irql;
+    NTSTATUS s = STATUS_INSUFFICIENT_RESOURCES;
+    KeAcquireSpinLock(&dev->ConsumersLock, &irql);
+    if (dev->ConsumerCount < ARRAYSIZE(dev->Consumers)) {
+        dev->Consumers[dev->ConsumerCount].ConsumerCtx = consCtx;
+        dev->Consumers[dev->ConsumerCount].Cb         = (PVOID)cb;
+        dev->ConsumerCount++;
+        s = STATUS_SUCCESS;
+    }
+    KeReleaseSpinLock(&dev->ConsumersLock, irql);
+    return s;
+}
+
+/* v2: consumers MUST call this on their own teardown path before
+ * releasing the master file-object — otherwise master's later cascade
+ * invokes a stale callback pointer against a freed Device context and
+ * bugchecks.  Idempotent (consumer absent → no-op). */
+static VOID
+MasterUnregisterQueryRemove(_In_ PVOID provCtx, _In_ PVOID consCtx)
+{
+    PRKIOMMU_DEVICE dev = (PRKIOMMU_DEVICE)provCtx;
+    if (!dev) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&dev->ConsumersLock, &irql);
+    for (ULONG i = 0; i < dev->ConsumerCount; i++) {
+        if (dev->Consumers[i].ConsumerCtx == consCtx) {
+            /* Compact: move last entry into this slot. */
+            ULONG last = dev->ConsumerCount - 1;
+            if (i != last) dev->Consumers[i] = dev->Consumers[last];
+            dev->Consumers[last].ConsumerCtx = NULL;
+            dev->Consumers[last].Cb         = NULL;
+            dev->ConsumerCount = last;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&dev->ConsumersLock, irql);
+}
+
+NTSTATUS RkIommuPublishMasterInterface(_In_ WDFDEVICE Device,
+                                       _In_ PRKIOMMU_DEVICE Ctx)
+{
+    if (!Ctx->IsMaster) return STATUS_SUCCESS;
+
+    /* Publish the symlink first so IoGetDeviceInterfaces sees us. */
+    NTSTATUS s = WdfDeviceCreateDeviceInterface(Device,
+                                                &GUID_DEVINTERFACE_RKIOMMU_MASTER,
+                                                NULL);
+    if (!NT_SUCCESS(s)) return s;
+
+    RKIOMMU_MASTER_INTERFACE ifc;
+    RtlZeroMemory(&ifc, sizeof(ifc));
+    ifc.Header.Size                = sizeof(ifc);
+    ifc.Header.Version             = RKIOMMU_MASTER_IFC_VERSION;
+    ifc.Header.Context             = Ctx;
+    ifc.Header.InterfaceReference  = WdfDeviceInterfaceReferenceNoOp;
+    ifc.Header.InterfaceDereference= WdfDeviceInterfaceDereferenceNoOp;
+    ifc.Hid                        = Ctx->Hid;
+    ifc.Uid                        = Ctx->Uid;
+    ifc.GetPageTableBase           = MasterGetPtBase;
+    ifc.RegisterQueryRemove        = MasterRegisterQueryRemove;
+    ifc.UnregisterQueryRemove      = MasterUnregisterQueryRemove;
+
+    WDF_QUERY_INTERFACE_CONFIG qic;
+    WDF_QUERY_INTERFACE_CONFIG_INIT(&qic, (PINTERFACE)&ifc,
+                                    &GUID_DEVINTERFACE_RKIOMMU_MASTER, NULL);
+    return WdfDeviceAddQueryInterface(Device, &qic);
 }

@@ -18,6 +18,9 @@
 #include "../shared/iommu/pgtable.h"
 #include "../shared/iommu/fault.h"
 #include "../shared/acpi_uid.h"
+#include "../shared/rkmpp/ifc_client.h"   /* for RkMppIsMasterIommu, RkMppQueryOne */
+#include "../shared/rkmpp/peer_attach.h"
+#include "../../shared/rkiommu_master_ifc.h"
 
 /* ---------------------------------------------------------------------------
  * Global instance list — all RKIOMMU_DEVICE instances live here.
@@ -33,8 +36,12 @@ static BOOLEAN g_listInitialized = FALSE;
  * --------------------------------------------------------------------------- */
 EVT_WDF_DEVICE_PREPARE_HARDWARE  RkIommuEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE  RkIommuEvtReleaseHardware;
+static EVT_WDF_DEVICE_QUERY_REMOVE RkIommuEvtDeviceQueryRemove;
 
 extern NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device);  /* in ifc.c */
+
+static VOID RkIommuSlaveOnMasterArrival(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymLink);
+static VOID RkIommuSlaveOnMasterQueryRemove(_In_ PVOID ConsumerCtx);
 
 /* ---------------------------------------------------------------------------
  * ACPI HID/UID parse
@@ -296,6 +303,216 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
 }
 
 /* ---------------------------------------------------------------------------
+ * Slave-mode shadow Domain + attach/detach helpers
+ * --------------------------------------------------------------------------- */
+
+/* Slave-mode shadow-Domain allocator.  Returns a Domain struct with
+ * only PdPhys populated.  All other pointers are NULL — slave never
+ * walks its own page tables.  MapMdl/UnmapMdl on slave reject early
+ * (see ifc.c).  Memory freed by RkIommuSlaveFreeShadowDomain. */
+static NTSTATUS
+RkIommuSlaveAllocShadowDomain(_In_ ULONG MasterPdPhys,
+                              _Out_ PRKIOMMU_DOMAIN *Out)
+{
+    PRKIOMMU_DOMAIN dom = (PRKIOMMU_DOMAIN)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(*dom), 'DhSI');
+    if (!dom) return STATUS_INSUFFICIENT_RESOURCES;
+    /* ExAllocatePool2 already zero-fills — only PdPhys needs setting. */
+    dom->PdPhys = MasterPdPhys;
+    *Out = dom;
+    return STATUS_SUCCESS;
+}
+
+static VOID
+RkIommuSlaveFreeShadowDomain(_Inout_ PRKIOMMU_DOMAIN *DomPtr)
+{
+    if (*DomPtr) {
+        ExFreePoolWithTag(*DomPtr, 'DhSI');
+        *DomPtr = NULL;
+    }
+}
+
+/* Slave attach is in two phases:
+ *
+ *   Phase A (this function): allocate a shadow Domain with master's
+ *     PdPhys and point ctx->Domain at it.  Does NOT touch MMU MMIO.
+ *     Called from OnMasterArrival, which fires asynchronously from a
+ *     PnP notification — at that moment RVD1 has not yet RaiseCluster'd
+ *     and the codec bus clocks slave's MMU shares (per
+ *     [[rkvdec_iommu_shares_codec_bus_clocks.md]]) may still be gated.
+ *     Touching MMIO here → SError → WHEA bugcheck (see
+ *     [[rk3588_gated_mmio_serror.md]]).
+ *
+ *   Phase B (RkIommuEnableHw): programs DTE_ADDR + ENABLE_PAGING on
+ *     slave's MMU.  Called via the public ifc.Enable wrapper from
+ *     RVD1's PrepareHardware AFTER RaiseCluster, when clocks are safe.
+ *     Master uses the same lazy-enable model via MapMdl, but slave's
+ *     MapMdl is blocked so RVD1 must call Enable explicitly. */
+static NTSTATUS
+RkIommuSlaveAttach(_In_ PRKIOMMU_DEVICE Slave, _In_ ULONG MasterPdPhys)
+{
+    PRKIOMMU_DOMAIN dom = NULL;
+    NTSTATUS s = RkIommuSlaveAllocShadowDomain(MasterPdPhys, &dom);
+    if (!NT_SUCCESS(s)) return s;
+
+    /* Stash the shadow Domain on the device context so a later
+     * RkIommuEnableHw (triggered via ifc.Enable from RVD1's
+     * PrepareHardware) can find it.  PtAttached is set by the caller
+     * after we return — it advertises "Domain pointer is valid", not
+     * "MMU is paging-enabled". */
+    Slave->ShadowDomain = dom;
+    Slave->Domain       = dom;
+    return STATUS_SUCCESS;
+}
+
+static VOID
+RkIommuSlaveDetach(_In_ PRKIOMMU_DEVICE Slave)
+{
+    /* Disable paging (zeros DTE_ADDR on the hardware).  Idempotent. */
+    if (Slave->Domain) {
+        (void)RkIommuDisableHw(Slave);
+        Slave->Domain = NULL;
+    }
+    RkIommuSlaveFreeShadowDomain(&Slave->ShadowDomain);
+}
+
+static VOID
+RkIommuSlaveOnMasterArrival(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymLink)
+{
+    PRKIOMMU_DEVICE slave = (PRKIOMMU_DEVICE)Ctx;
+    if (!slave->IsCodecSlave) return;   /* defensive — not a codec slave */
+    if (slave->MasterOpen) return;      /* already attached */
+
+    /* Resolve symlink → device object. */
+    PFILE_OBJECT fo = NULL;
+    PDEVICE_OBJECT devObj = NULL;
+    NTSTATUS s = IoGetDeviceObjectPointer(SymLink, FILE_READ_DATA,
+                                          &fo, &devObj);
+    if (!NT_SUCCESS(s)) return;
+
+    /* Query master interface. */
+    RKIOMMU_MASTER_INTERFACE ifc;
+    RtlZeroMemory(&ifc, sizeof(ifc));
+    s = RkMppQueryOne(devObj, &GUID_DEVINTERFACE_RKIOMMU_MASTER,
+                      RKIOMMU_MASTER_IFC_VERSION, &ifc, sizeof(ifc));
+    if (!NT_SUCCESS(s)) { ObDereferenceObject(fo); return; }
+
+    /* Topology filter: only match a master of our own Hid (so RVD slave
+     * doesn't accidentally attach to an AV1 master if both existed). */
+    if (ifc.Hid != slave->Hid) {
+        if (ifc.Header.InterfaceDereference)
+            ifc.Header.InterfaceDereference(ifc.Header.Context);
+        ObDereferenceObject(fo);
+        return;
+    }
+
+    ULONG32 pdPhys = 0;
+    s = ifc.GetPageTableBase(ifc.Header.Context, &pdPhys);
+    if (!NT_SUCCESS(s) || pdPhys == 0) {
+        if (ifc.Header.InterfaceDereference)
+            ifc.Header.InterfaceDereference(ifc.Header.Context);
+        ObDereferenceObject(fo);
+        return;
+    }
+
+    /* Program slave MMU. */
+    s = RkIommuSlaveAttach(slave, pdPhys);
+    if (!NT_SUCCESS(s)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkiommu_vdec slave (UID=%u): SlaveAttach failed 0x%x\n",
+                   slave->Uid, s);
+        if (ifc.Header.InterfaceDereference)
+            ifc.Header.InterfaceDereference(ifc.Header.Context);
+        ObDereferenceObject(fo);
+        return;
+    }
+
+    /* Register query-remove hook so master can cascade-detach us
+     * before unloading. */
+    if (ifc.RegisterQueryRemove) {
+        ifc.RegisterQueryRemove(ifc.Header.Context, slave,
+                                RkIommuSlaveOnMasterQueryRemove);
+    }
+
+    /* Commit attach state. */
+    slave->MasterIfcCtx       = ifc.Header.Context;
+    slave->MasterUnregisterFn = (PVOID)ifc.UnregisterQueryRemove;
+    slave->MasterFileObj      = fo;
+    slave->MasterOpen         = TRUE;
+    slave->PtAttached         = TRUE;
+    KeSetEvent(&slave->PtAttachedEvent, IO_NO_INCREMENT, FALSE);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkiommu_vdec slave (UID=%u): attached to master PT 0x%08x\n",
+               slave->Uid, pdPhys);
+}
+
+static VOID
+RkIommuSlaveOnMasterQueryRemove(_In_ PVOID ConsumerCtx)
+{
+    PRKIOMMU_DEVICE slave = (PRKIOMMU_DEVICE)ConsumerCtx;
+    if (!slave->MasterOpen) return;
+
+    KeClearEvent(&slave->PtAttachedEvent);
+    slave->PtAttached = FALSE;
+
+    /* Disable slave MMU (paging off, DTE_ADDR zeroed) + free shadow. */
+    RkIommuSlaveDetach(slave);
+
+    /* Drop master file-object ref.  We don't have the ifc.Header
+     * stashed, but the file-object reference is what kept master
+     * pinned for us — releasing it lets master complete its
+     * query-remove.  Master's Dereference is a no-op
+     * (WdfDeviceInterfaceDereferenceNoOp) per Task 2.1's publish, so
+     * we don't need to explicitly call it. */
+    if (slave->MasterFileObj) {
+        ObDereferenceObject(slave->MasterFileObj);
+        slave->MasterFileObj = NULL;
+    }
+    slave->MasterIfcCtx = NULL;
+    slave->MasterOpen   = FALSE;
+}
+
+/* ---------------------------------------------------------------------------
+ * EvtDeviceQueryRemove — master only; cascades to registered consumers.
+ * --------------------------------------------------------------------------- */
+static NTSTATUS
+RkIommuEvtDeviceQueryRemove(_In_ WDFDEVICE Device)
+{
+    PRKIOMMU_DEVICE ctx = RkIommuDeviceGet(Device);
+    if (!ctx->IsMaster) return STATUS_SUCCESS;
+
+    /* Snapshot consumer list under lock, then clear so no new registrations
+     * land into a stale registry after we drop the lock. */
+    KIRQL irql;
+    KeAcquireSpinLock(&ctx->ConsumersLock, &irql);
+    ULONG n = ctx->ConsumerCount;
+    struct { PVOID Ctx; PVOID Cb; } local[4];
+    for (ULONG i = 0; i < n && i < ARRAYSIZE(local); i++) {
+        local[i].Ctx = ctx->Consumers[i].ConsumerCtx;
+        local[i].Cb  = ctx->Consumers[i].Cb;
+    }
+    ctx->ConsumerCount = 0;
+    KeReleaseSpinLock(&ctx->ConsumersLock, irql);
+
+    /* Invoke each consumer synchronously.  Per design, consumers detach
+     * and release their file-object refs before returning, granting
+     * master permission to proceed with query-remove. */
+    for (ULONG i = 0; i < n && i < ARRAYSIZE(local); i++) {
+        if (local[i].Cb) {
+            RKIOMMU_MASTER_QUERY_REMOVE_CB cb =
+                (RKIOMMU_MASTER_QUERY_REMOVE_CB)local[i].Cb;
+            cb(local[i].Ctx);
+        }
+    }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "rkiommu_vdec master (UID=%u): cascade query-remove notified %u consumer(s)\n",
+               ctx->Uid, n);
+    return STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
  * EvtPrepareHardware
  * --------------------------------------------------------------------------- */
 NTSTATUS
@@ -313,6 +530,13 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
                    "rkiommu_vdec: failed to read ACPI ID (0x%08x)\n", status);
         return status;
     }
+
+    ctx->IsMaster     = RkMppIsMasterIommu(ctx->Hid, ctx->Uid);
+    ctx->IsCodecSlave = RkMppIsCodecSlaveIommu(ctx->Hid, ctx->Uid);
+    KeInitializeEvent(&ctx->PtAttachedEvent, NotificationEvent, FALSE);
+    KeInitializeSpinLock(&ctx->ConsumersLock);
+    ctx->ConsumerCount = 0;
+    ctx->PtAttached    = FALSE;
 
     /* UIDs 7-10 are RE0M/RE1M/RD0M/RD1M — codec IOMMUs carry the three
      * BSP _DSD flags.  Block IOMMUs (UIDs 0-6) do not. */
@@ -358,12 +582,40 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    /* Allocate the v2 IOMMU domain (page directory + IOVA bitmap) */
-    status = RkIommuDomainCreateVdec(&ctx->Domain);
-    if (!NT_SUCCESS(status)) {
-        MmUnmapIoSpace((PVOID)ctx->MmioBase, ctx->MmioLength);
-        ctx->MmioBase = NULL;
-        return status;
+    /* Three-way role split:
+     *   IsCodecSlave (UID 10): skip Domain alloc, register PnP watch for
+     *     master arrival, attach to master's PdPhys when it comes up.
+     *   IsMaster (UID 9): allocate Domain, publish master ifc below.
+     *   Standalone (everything else — UIDs 0-8, VPMU/ENC etc.): allocate
+     *     own Domain just like the pre-Phase-2 behavior.  These IOMMUs
+     *     are NOT codec instances and must not participate in the
+     *     master/slave dance — that bug saturated master's Consumers[]
+     *     and pushed RVD0 out of the cascade registry. */
+    if (ctx->IsCodecSlave) {
+        ctx->Domain = NULL;
+        /* Register PnP notification for master arrival.  Callback
+         * runs at PASSIVE and may fire synchronously for an already-
+         * present master (PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES). */
+        NTSTATUS sw = RkMppWatchPeer(&GUID_DEVINTERFACE_RKIOMMU_MASTER,
+                                     ctx,
+                                     RkIommuSlaveOnMasterArrival,
+                                     NULL,
+                                     &ctx->MasterWatch);
+        if (!NT_SUCCESS(sw)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkiommu_vdec slave (UID=%u): RkMppWatchPeer failed 0x%x\n",
+                       ctx->Uid, sw);
+            MmUnmapIoSpace((PVOID)ctx->MmioBase, ctx->MmioLength);
+            ctx->MmioBase = NULL;
+            return sw;
+        }
+    } else {
+        status = RkIommuDomainCreateVdec(&ctx->Domain);
+        if (!NT_SUCCESS(status)) {
+            MmUnmapIoSpace((PVOID)ctx->MmioBase, ctx->MmioLength);
+            ctx->MmioBase = NULL;
+            return status;
+        }
     }
 
     /* Register in the global list */
@@ -372,8 +624,37 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
     InsertTailList(&g_deviceList, &ctx->ListEntry);
     KeReleaseSpinLock(&g_deviceListLock, irql);
 
-    RKMPP_LOG_INFO("rkiommu_vdec: RKCP%04x UID=%u ready, MMIO=%p PdPhys=0x%08x\n",
-                   ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PdPhys);
+    if (ctx->IsMaster) {
+        RKMPP_LOG_INFO("rkiommu_vdec MASTER: RKCP%04x UID=%u ready, MMIO=%p PdPhys=0x%08x\n",
+                       ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PdPhys);
+    } else if (ctx->IsCodecSlave) {
+        RKMPP_LOG_INFO("rkiommu_vdec SLAVE: RKCP%04x UID=%u ready, MMIO=%p (awaiting master attach)\n",
+                       ctx->Hid, ctx->Uid, ctx->MmioBase);
+    } else {
+        RKMPP_LOG_INFO("rkiommu_vdec standalone: RKCP%04x UID=%u ready, MMIO=%p PdPhys=0x%08x\n",
+                       ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PdPhys);
+    }
+
+    /* Phase 2 (Task 2.1): for master instances, mark PT-attached and
+     * publish the MASTER interface.  Slave instances stay PtAttached=
+     * FALSE here; Task 2.2 will wire their attach to master via PnP
+     * notification.  AV1 (single-instance, always master in its
+     * topology) also runs through this path harmlessly — no slave
+     * ever opens its master interface. */
+    if (ctx->IsMaster) {
+        ctx->PtAttached = TRUE;
+        KeSetEvent(&ctx->PtAttachedEvent, IO_NO_INCREMENT, FALSE);
+
+        NTSTATUS sm = RkIommuPublishMasterInterface(Device, ctx);
+        if (!NT_SUCCESS(sm)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkiommu_vdec: PublishMasterInterface failed 0x%x "
+                       "(UID=%u)\n", sm, ctx->Uid);
+            /* Non-fatal: codec on UID 0 can still operate single-core
+             * via the existing RKIOMMU_INTERFACE.  Master-interface
+             * absence just means no slave can attach to us. */
+        }
+    }
 
     /* Phase 2: leave IOMMU paging disabled until first client maps.
      * RkIommuEnable(ctx) will be called lazily from the MapMdl path. */
@@ -391,6 +672,36 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
     UNREFERENCED_PARAMETER(ResourcesTranslated);
 
     PRKIOMMU_DEVICE ctx = RkIommuDeviceGet(Device);
+
+    /* Codec slave: unwatch + detach from master BEFORE generic teardown.
+     * Standalone (non-codec) IOMMUs skip this entirely — they never
+     * registered a watch and never opened a master ifc. */
+    if (ctx->IsCodecSlave) {
+        RkMppUnwatchPeer(&ctx->MasterWatch);
+        if (ctx->MasterOpen) {
+            /* Direct detach (we're going away — no need to wait for
+             * master's cascade).
+             *
+             * Critical: scrub our callback out of master's Consumers[]
+             * BEFORE releasing the file-object.  If we release first
+             * and master gets disabled next, master's cascade would
+             * invoke our (now stale) callback against this freed
+             * device → bugcheck → reboot to recover. */
+            RkIommuSlaveDetach(ctx);
+            if (ctx->MasterUnregisterFn && ctx->MasterIfcCtx) {
+                RKIOMMU_MASTER_UNREGISTER_QUERY_REMOVE unreg =
+                    (RKIOMMU_MASTER_UNREGISTER_QUERY_REMOVE)ctx->MasterUnregisterFn;
+                unreg(ctx->MasterIfcCtx, ctx);
+            }
+            if (ctx->MasterFileObj) {
+                ObDereferenceObject(ctx->MasterFileObj);
+                ctx->MasterFileObj = NULL;
+            }
+            ctx->MasterIfcCtx       = NULL;
+            ctx->MasterUnregisterFn = NULL;
+            ctx->MasterOpen         = FALSE;
+        }
+    }
 
     /* Remove from global list */
     KIRQL irql;
@@ -410,7 +721,12 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
      * skipping the disable-paging / int-mask writes here costs nothing. */
     ctx->PagingEnabled = FALSE;
 
-    if (ctx->Domain) {
+    /* Destroy the real domain on master + standalone (non-codec)
+     * instances.  Codec slave's shadow domain was already freed by
+     * RkIommuSlaveDetach above — it has no page tables of its own,
+     * freeing it through RkIommuDomainDestroy would crash on NULL
+     * Pd/IovaBitmap dereferences inside that function. */
+    if (!ctx->IsCodecSlave && ctx->Domain) {
         RkIommuDomainDestroy(ctx->Domain);
         ctx->Domain = NULL;
     }
@@ -441,6 +757,7 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDevicePrepareHardware = RkIommuEvtPrepareHardware;
     pnp.EvtDeviceReleaseHardware = RkIommuEvtReleaseHardware;
+    pnp.EvtDeviceQueryRemove     = RkIommuEvtDeviceQueryRemove;  /* Task 4.2 */
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
 
     WDF_OBJECT_ATTRIBUTES attr;

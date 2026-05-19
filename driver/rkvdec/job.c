@@ -140,6 +140,7 @@ static const RKMPP_CODEC_OPS g_ops = {
 };
 
 /* Forward declarations */
+static VOID JobKickLocalInner(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job);
 static VOID RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job);
 static VOID RkMppJobComplete(_In_ WDFDEVICE Device,
                              _In_ NTSTATUS Result,
@@ -183,7 +184,17 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     KeInitializeSpinLock(&Queue->Lock);
     InitializeListHead(&Queue->Pending);
     InitializeListHead(&Queue->Completed);
-    Queue->InFlight = NULL;
+    Queue->InFlightPerCore[0] = NULL;
+    Queue->InFlightPerCore[1] = NULL;
+    Queue->CoreCount = 1;             /* upgrades to 2 when peer attaches */
+    Queue->CoreIdle  = 1u;            /* bit 0 = local core idle */
+    Queue->CorePending[0] = 0;
+    Queue->CorePending[1] = 0;
+    Queue->LastKickCore   = -1;
+    Queue->PeerOpen = FALSE;
+    RtlZeroMemory(&Queue->Peer, sizeof(Queue->Peer));
+    Queue->PeerFileObj = NULL;
+    RtlZeroMemory(&Queue->PeerWatch, sizeof(Queue->PeerWatch));
     Queue->NextId   = 0;
     Queue->Device   = Device;
     Queue->Interrupt = NULL;
@@ -265,10 +276,8 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
     InitializeListHead(&toFree);
     *InFlightTimedOut = FALSE;
 
-    /* Phase 1: under-lock walk of Pending + Completed lists.  Also
-     * capture a pointer to the in-flight job (if it's ours) so we know
-     * whether to wait afterwards.  We must NOT touch InFlight under
-     * the lock here — the poller fills/clears it. */
+    /* Phase 1: under-lock walk of Pending + Completed lists.  Remove
+     * all jobs owned by this File and queue them for freeing. */
     KeAcquireSpinLock(&q->Lock, &old);
 
     PLIST_ENTRY entry = q->Pending.Flink;
@@ -293,17 +302,6 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
         entry = next;
     }
 
-    /* Snapshot in-flight ownership while still under the lock. */
-    RKMPP_JOB *inFlight = q->InFlight;
-    BOOLEAN inFlightIsOurs = (inFlight != NULL && inFlight->Owner == File);
-
-    /* Capture the Done event pointer for the wait below — it's safe to
-     * dereference once we have the spinlock-stable inFlight pointer
-     * because the poller never frees an in-flight job while it's still
-     * marked in-flight; it only moves to Completed (then we'd own it
-     * via the next under-lock walk). */
-    KEVENT *doneEvt = inFlightIsOurs ? &inFlight->Done : NULL;
-
     KeReleaseSpinLock(&q->Lock, old);
 
     /* Phase 2: free the pending+completed-of-ours list (no lock). */
@@ -313,10 +311,36 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
         ExFreePoolWithTag(j, 'JppM');
     }
 
-    /* Phase 3: wait for the in-flight job (if it was ours) to complete
-     * naturally.  Most decode kicks finish in <30ms; a 500ms cap is
-     * generous and keeps process-exit latency bounded. */
-    if (inFlightIsOurs && doneEvt) {
+    /* Phase 3: drain all in-flight jobs on either core owned by this File.
+     * Both cores can have jobs in flight simultaneously, so we loop until
+     * no more in-flight entries match this File's ownership.  Most decode
+     * kicks finish in <30ms; a 500ms cap per job is generous and keeps
+     * process-exit latency bounded. */
+    for (;;) {
+        RKMPP_JOB *inFlight = NULL;
+
+        /* Under lock, find the first in-flight job matching this File's
+         * ownership.  Check both cores — a peer-dispatched job lands
+         * on [1]. */
+        KeAcquireSpinLock(&q->Lock, &old);
+        for (ULONG c = 0; c < q->CoreCount; c++) {
+            if (q->InFlightPerCore[c] && q->InFlightPerCore[c]->Owner == File) {
+                inFlight = q->InFlightPerCore[c];
+                break;
+            }
+        }
+        KeReleaseSpinLock(&q->Lock, old);
+
+        if (!inFlight) {
+            /* No more in-flight jobs owned by this File. */
+            break;
+        }
+
+        /* Wait for this in-flight job to complete naturally.  Safe to
+         * dereference Done event because the poller never frees an
+         * in-flight job while it's still marked in-flight; it only moves
+         * to Completed (then we'd own it via the walk below). */
+        KEVENT *doneEvt = &inFlight->Done;
         LARGE_INTEGER timeout;
         timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
         NTSTATUS w = KeWaitForSingleObject(doneEvt, Executive, KernelMode,
@@ -325,49 +349,55 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
             *InFlightTimedOut = TRUE;
             RKMPP_LOG_WARN(
                        "rkmpp: file-cleanup in-flight wait timed out\n");
-            /* Sever the in-flight job's references to the buffer-pool
-             * MDLs before the caller (EvtFileCleanup) runs BufFreeAll.
-             * The poller is still alive and will eventually call
-             * JobComplete, which dereferences OutputFrameMdl /
-             * ColmvCurMdl in KeFlushIoBuffers.  Without this clear,
-             * those flushes hit freed MDL memory → bugcheck.
-             * JobComplete already null-checks both fields and skips
-             * the flush; taking q->Lock here serializes against its
-             * acquisition of the same lock around the flushes. */
+            /* Sever all in-flight jobs' references to the buffer-pool MDLs
+             * before the caller (EvtFileCleanup) runs BufFreeAll.  The
+             * poller is still alive and will eventually call JobComplete,
+             * which dereferences OutputFrameMdl / ColmvCurMdl in
+             * KeFlushIoBuffers.  Without this clear, those flushes hit
+             * freed MDL memory → bugcheck.  JobComplete already null-checks
+             * both fields and skips the flush; taking q->Lock here
+             * serializes against its acquisition of the same lock around
+             * the flushes. */
             KeAcquireSpinLock(&q->Lock, &old);
-            if (q->InFlight == inFlight && inFlight->Owner == File) {
-                inFlight->OutputFrameMdl = NULL;
-                inFlight->ColmvCurMdl    = NULL;
+            for (ULONG c = 0; c < q->CoreCount; c++) {
+                RKMPP_JOB *jf = q->InFlightPerCore[c];
+                if (jf && jf->Owner == File) {
+                    jf->OutputFrameMdl = NULL;
+                    jf->ColmvCurMdl    = NULL;
+                }
             }
             KeReleaseSpinLock(&q->Lock, old);
-            /* Don't free the in-flight job here — the poller still owns
-             * it and will eventually move it to Completed.  Leaking the
-             * struct is acceptable; the alternative (freeing while the
+            /* Don't free the in-flight jobs here — the poller still owns
+             * them and will eventually move them to Completed.  Leaking the
+             * structs is acceptable; the alternative (freeing while the
              * poller holds a pointer) is a use-after-free.  In practice
              * the next decode session triggers a core reset which
              * unblocks the wedged poll. */
-        } else {
-            /* In-flight completed cleanly.  It's now on the Completed
-             * list — pull it off so it doesn't leak waiting for a
-             * WaitJob caller that's never coming. */
-            KeAcquireSpinLock(&q->Lock, &old);
-            entry = q->Completed.Flink;
-            while (entry != &q->Completed) {
-                RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
-                PLIST_ENTRY next = entry->Flink;
-                if (cand->Owner == File) {
-                    RemoveEntryList(entry);
-                    InsertTailList(&toFree, entry);
-                }
-                entry = next;
-            }
-            KeReleaseSpinLock(&q->Lock, old);
-            while (!IsListEmpty(&toFree)) {
-                PLIST_ENTRY e = RemoveHeadList(&toFree);
-                RKMPP_JOB *j = CONTAINING_RECORD(e, RKMPP_JOB, Link);
-                ExFreePoolWithTag(j, 'JppM');
-            }
+            break;   /* Stop looping after timeout; caller handles force-reset. */
         }
+
+        /* In-flight completed cleanly.  It's now on the Completed list —
+         * pull it and any other just-completed jobs off so they don't leak
+         * waiting for a WaitJob caller that's never coming. */
+        InitializeListHead(&toFree);
+        KeAcquireSpinLock(&q->Lock, &old);
+        entry = q->Completed.Flink;
+        while (entry != &q->Completed) {
+            RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
+            PLIST_ENTRY next = entry->Flink;
+            if (cand->Owner == File) {
+                RemoveEntryList(entry);
+                InsertTailList(&toFree, entry);
+            }
+            entry = next;
+        }
+        KeReleaseSpinLock(&q->Lock, old);
+        while (!IsListEmpty(&toFree)) {
+            PLIST_ENTRY e = RemoveHeadList(&toFree);
+            RKMPP_JOB *j = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+            ExFreePoolWithTag(j, 'JppM');
+        }
+        /* Loop back — check if there's another in-flight on the other core. */
     }
 
     return STATUS_SUCCESS;
@@ -391,9 +421,13 @@ RkMppJobQueueHasOtherOwner(_In_ WDFDEVICE Device, _In_ WDFFILEOBJECT File)
     BOOLEAN otherActive = FALSE;
 
     KeAcquireSpinLock(&q->Lock, &old);
-    if (q->InFlight && q->InFlight->Owner != File) {
-        otherActive = TRUE;
-    } else {
+    for (ULONG c = 0; c < q->CoreCount; c++) {
+        if (q->InFlightPerCore[c] && q->InFlightPerCore[c]->Owner != File) {
+            otherActive = TRUE;
+            break;
+        }
+    }
+    if (!otherActive) {
         for (PLIST_ENTRY e = q->Pending.Flink;
              e != &q->Pending;
              e = e->Flink) {
@@ -523,7 +557,7 @@ RkMppEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&q->Lock, &oldIrql);
-    RKMPP_JOB *job = q->InFlight;
+    RKMPP_JOB *job = q->InFlightPerCore[0];
     KeReleaseSpinLock(&q->Lock, oldIrql);
 
     if (job) {
@@ -570,8 +604,14 @@ RkMppEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
 /* RKVDEC2_SWREG_BASE is defined at file scope above; it accounts for
  * the 0x100 cluster-link prefix at the head of our ACPI MMIO mapping. */
 
+/* Local-core kick body — writes the dense SWREG bank to this device's
+ * MMIO, programs CCU clocks/reset as needed, signals the poller.
+ * Factored out of the old RkMppJobStart in Phase 3 (Task 3.1) so that
+ * Task 3.3's dispatcher can call this for jobs targeted at the local
+ * core while Task 3.2's RkMppJobRunForeign dispatches peer-targeted
+ * jobs to RVD1.  No behavior change vs. the pre-3.1 RkMppJobStart. */
 static VOID
-RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
+JobKickLocalInner(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
 {
     PRKMPP_JOB_QUEUE q       = RkMppGetJobQueue(Device);
     PVOID            mmio    = RkMppGetMmioBase(Device);
@@ -607,21 +647,10 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         q->LastOwner   = Job->Owner;
         q->LastDecMode = dec_mode;
         q->LastValid   = TRUE;
-
-        /* Upsert (Owner, Id) into the per-Owner LRU table used by
-         * RkMppJobComplete's promotion path.  Find an existing slot
-         * for this Owner, else the slot with the smallest LastKickId
-         * (or an empty slot — File==NULL counts as 0). */
-        const ULONG K = ARRAYSIZE(q->OwnerLru);
-        ULONG hit   = K;
-        ULONG evict = 0;
-        for (ULONG i = 0; i < K; ++i) {
-            if (q->OwnerLru[i].File == Job->Owner) { hit = i; break; }
-            if (q->OwnerLru[i].LastKickId < q->OwnerLru[evict].LastKickId) evict = i;
-        }
-        ULONG slot = (hit < K) ? hit : evict;
-        q->OwnerLru[slot].File       = Job->Owner;
-        q->OwnerLru[slot].LastKickId = Job->Id;
+        /* NOTE: per-Owner LRU upsert moved to PromoteUntilFull (Task 3.3)
+         * so it happens atomically with slot/idle bookkeeping under the
+         * queue lock.  Foreign kicks (Owner == NULL) bypass Pending
+         * entirely via RkMppJobRunForeign so they never reach PromoteUntilFull. */
     }
 
     /* Conditional core reset.  BSP only resets after error/timeout — see
@@ -924,6 +953,316 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
     }
 }
 
+/* Thin wrapper — kept so existing call sites that haven't been
+ * converted to the dispatcher path (RkMppJobComplete, RkMppJobSubmitDense
+ * in Phase 1) still compile.  Task 3.3 replaces these call sites with
+ * the multi-core promotion loop. */
+static VOID
+RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
+{
+    JobKickLocalInner(Device, Job);
+}
+
+/* See declaration in job.h.  Strategy:
+ *   1. Allocate transient RKMPP_JOB (non-paged), zero it.
+ *   2. Copy Bank + IovaSlots into the job.  Owner = NULL.  Id = a
+ *      synthesized monotonic id from q->NextId (so completion can
+ *      match it back via InFlightPerCore[0]->Id if anyone checks).
+ *   3. Under q->Lock: confirm InFlightPerCore[0] == NULL.  If it's
+ *      occupied (shouldn't happen — peer worker serializes kicks),
+ *      fail with STATUS_DEVICE_BUSY.  Else stamp the job into the
+ *      slot and update CoreIdle bit accordingly.
+ *   4. Call JobKickLocalInner(Device, Job).
+ *   5. Wait on Job->Done (no timeout — codec watchdog + reset
+ *      escalation are the ultimate backstops; we do not introduce
+ *      a second timeout layer here).
+ *   6. Snapshot Job->Result + Job->HardwareStatus.  Free Job.
+ *      Invoke Cb.
+ * Note: RkMppJobComplete already clears InFlightPerCore[0] and
+ * signals Job->Done.  RVD1's Pending list is empty so the promotion
+ * code path in RkMppJobComplete is a no-op. */
+NTSTATUS RkMppJobRunForeign(_In_ WDFDEVICE Device,
+                            _In_ const VOID  *Bank,
+                            _In_ UINT32       BankBytes,
+                            _In_ UINT32       KickValue,
+                            _In_ const VOID  *IovaSlots,
+                            _In_ UINT32       IovaSlotCount,
+                            _In_ UINT64       CompletionCookie,
+                            _In_ RKMPP_FOREIGN_COMPLETION_CB Cb,
+                            _In_ PVOID        CbCtx)
+{
+    if (BankBytes != sizeof(RKMPP_DENSE_BANK)) return STATUS_INVALID_PARAMETER;
+    if (IovaSlotCount > RKMPP_MAX_DENSE_IOVA_SLOTS) return STATUS_INVALID_PARAMETER;
+
+    RKMPP_JOB *job = (RKMPP_JOB*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                  sizeof(*job), 'gFKR');
+    if (!job) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(job, sizeof(*job));
+
+    KeInitializeEvent(&job->Done, NotificationEvent, FALSE);
+    job->Owner          = NULL;
+    job->Result         = STATUS_PENDING;
+    job->HardwareStatus = 0;
+    job->DenseKickValue      = KickValue;
+    job->DenseIovaSlotCount  = IovaSlotCount;
+    RtlCopyMemory(&job->DenseBank, Bank, sizeof(job->DenseBank));
+    if (IovaSlotCount) {
+        RtlCopyMemory(&job->DenseIovaSlots, IovaSlots,
+                      IovaSlotCount * sizeof(RKMPP_DENSE_IOVA_SLOT));
+    }
+
+    PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(Device);
+    job->Id = (UINT64)InterlockedIncrement64(&q->NextId);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+    if (q->InFlightPerCore[0] != NULL) {
+        KeReleaseSpinLock(&q->Lock, irql);
+        ExFreePoolWithTag(job, 'gFKR');
+        return STATUS_DEVICE_BUSY;
+    }
+    q->InFlightPerCore[0] = job;
+    q->CoreIdle &= ~1u;
+    KeReleaseSpinLock(&q->Lock, irql);
+
+    JobKickLocalInner(Device, job);
+
+    /* Wait for completion.  Codec watchdog will eventually fire if
+     * something goes wrong, surfacing as STATUS_IO_TIMEOUT in
+     * job->Result.  No additional timeout here. */
+    KeWaitForSingleObject(&job->Done, Executive, KernelMode, FALSE, NULL);
+
+    NTSTATUS res = job->Result;
+    UINT32   hw  = job->HardwareStatus;
+
+    /* RkMppJobComplete moved job to Completed list and set job->Done.
+     * Remove it from Completed before freeing — it was inserted there
+     * by RkMppJobComplete and no WaitJob caller will ever dequeue it
+     * (foreign jobs have no Owner to wait on them). */
+    KeAcquireSpinLock(&q->Lock, &irql);
+    RemoveEntryList(&job->Link);
+    KeReleaseSpinLock(&q->Lock, irql);
+
+    ExFreePoolWithTag(job, 'gFKR');
+
+    if (Cb) Cb(CbCtx, CompletionCookie, res, hw);
+    return STATUS_SUCCESS;
+}
+
+/* -----------------------------------------------------------------------
+ * Multi-core dispatcher helpers — Task 3.3.
+ *
+ * Pick policy:
+ *   PickPendingByOwnerLru — extracted from RkMppJobComplete's
+ *     pre-3.3 single-shot promotion.  Picks the Pending job whose
+ *     Owner has the oldest LastKickId (NULL = never kicked = oldest).
+ *   PickTargetCore — among currently-idle cores, picks the one with
+ *     the lowest CorePending count.  Ties → lowest index.  Mirrors
+ *     BSP's rkvdec2_get_idle_core in mpp_rkvdec2_link.c:1818.
+ *   PromoteUntilFull — loops Pick× while both cores idle and Pending
+ *     non-empty.  Caller holds queue lock; PromoteUntilFull does NOT
+ *     kick — it collects (job, core) pairs into Out[].  Caller releases
+ *     lock then walks Out[] via KickPromotions.
+ *   KickPromotions — no lock held.  For each (job, core) pair, dispatch:
+ *     core==0 → JobKickLocalInner; core==1 → q->Peer.KickJob.
+ *     Emits a #if DBG trace per kick.  Failed peer kicks fail the job
+ *     inline (complete with the peer's error, free the slot).
+ * --------------------------------------------------------------------- */
+
+typedef struct _PROMOTION { RKMPP_JOB *Job; ULONG Core; } PROMOTION;
+
+/* Caller holds q->Lock.  Removes the chosen job from Pending or returns NULL. */
+static RKMPP_JOB *
+PickPendingByOwnerLru(_Inout_ RKMPP_JOB_QUEUE *q)
+{
+    if (IsListEmpty(&q->Pending)) return NULL;
+    PLIST_ENTRY chosen = q->Pending.Flink;
+    UINT64 bestScore = (UINT64)-1;
+    for (PLIST_ENTRY e = q->Pending.Flink; e != &q->Pending; e = e->Flink) {
+        RKMPP_JOB *cand = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+        UINT64 score = 0;
+        for (ULONG i = 0; i < ARRAYSIZE(q->OwnerLru); ++i) {
+            if (q->OwnerLru[i].File == cand->Owner) {
+                score = q->OwnerLru[i].LastKickId;
+                break;
+            }
+        }
+        if (score < bestScore) {
+            bestScore = score;
+            chosen = e;
+            if (score == 0) break;
+        }
+    }
+    RemoveEntryList(chosen);
+    return CONTAINING_RECORD(chosen, RKMPP_JOB, Link);
+}
+
+/* Caller holds q->Lock.  Returns -1 if no idle core.
+ *
+ * Selection rule:
+ *   primary: lowest in-flight count (CorePending), gives load-balance
+ *            under bursty multi-stream submission.
+ *   tiebreak: prefer the core that ISN'T LastKickCore, so a serial
+ *            submitter that always sees CorePending=[0,0] alternates
+ *            cores instead of pinning to core 0.  Mirrors BSP's
+ *            cumulative-task_index intent without keeping a separate
+ *            counter — for the tied-at-zero case the two are equivalent.
+ *   final fallback: lowest index. */
+static LONG
+PickTargetCore(_In_ const RKMPP_JOB_QUEUE *q)
+{
+    ULONG mask = q->CoreIdle & ((1u << q->CoreCount) - 1);
+    if (!mask) return -1;
+    LONG best = -1;
+    ULONG bestPending = (ULONG)-1;
+    for (ULONG i = 0; i < q->CoreCount; i++) {
+        if (!(mask & (1u << i))) continue;
+        if (q->CorePending[i] < bestPending) {
+            bestPending = q->CorePending[i];
+            best = (LONG)i;
+        } else if (q->CorePending[i] == bestPending &&
+                   best >= 0 &&
+                   (LONG)i != q->LastKickCore &&
+                   best     == q->LastKickCore) {
+            /* Tied pending — swap to the not-last-kicked core. */
+            best = (LONG)i;
+        }
+    }
+    return best;
+}
+
+/* Caller holds q->Lock.  Fills Out[] with up to q->CoreCount kicks.
+ * Returns the number of promotions made.  Each promotion clears its
+ * CoreIdle bit, increments CorePending[core], and upserts the per-
+ * Owner LRU table. */
+static ULONG
+PromoteUntilFull(_Inout_ RKMPP_JOB_QUEUE *q, _Out_writes_(2) PROMOTION Out[2])
+{
+    ULONG n = 0;
+    while (n < q->CoreCount && !IsListEmpty(&q->Pending)) {
+        LONG core = PickTargetCore(q);
+        if (core < 0) break;
+        RKMPP_JOB *job = PickPendingByOwnerLru(q);
+        if (!job) break;
+
+        job->TargetCore = (UINT32)core;
+        q->InFlightPerCore[core] = job;
+        q->CoreIdle &= ~(1u << core);
+        q->CorePending[core]++;
+        q->LastKickCore = core;
+
+        /* Per-Owner LRU upsert — moved here from JobKickLocalInner so it
+         * happens atomically with the slot/idle bookkeeping under the
+         * queue lock.  Skip for foreign jobs (Owner == NULL); none enter
+         * via PromoteUntilFull (they bypass Pending entirely through
+         * RkMppJobRunForeign), but the guard is cheap insurance. */
+        if (job->Owner != NULL) {
+            const ULONG K = ARRAYSIZE(q->OwnerLru);
+            ULONG hit = K;
+            ULONG evict = 0;
+            for (ULONG i = 0; i < K; ++i) {
+                if (q->OwnerLru[i].File == job->Owner) { hit = i; break; }
+                if (q->OwnerLru[i].LastKickId < q->OwnerLru[evict].LastKickId) evict = i;
+            }
+            ULONG slot = (hit < K) ? hit : evict;
+            q->OwnerLru[slot].File       = job->Owner;
+            q->OwnerLru[slot].LastKickId = job->Id;
+        }
+
+        Out[n].Job  = job;
+        Out[n].Core = (ULONG)core;
+        n++;
+    }
+    return n;
+}
+
+/* No lock held.  Dispatches each promoted job to its target core. */
+static VOID
+KickPromotions(_In_ WDFDEVICE Device, _In_ RKMPP_JOB_QUEUE *q,
+               _In_reads_(Count) const PROMOTION *Promos, _In_ ULONG Count)
+{
+    for (ULONG i = 0; i < Count; i++) {
+        RKMPP_JOB *job = Promos[i].Job;
+        ULONG core     = Promos[i].Core;
+
+#if DBG
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                   "rkvdec: dispatch job %llu owner=%p core=%u pending=[%u,%u] idle=0x%x\n",
+                   (unsigned long long)job->Id, job->Owner, core,
+                   q->CorePending[0], q->CorePending[1], q->CoreIdle);
+#endif
+
+        if (core == 0) {
+            JobKickLocalInner(Device, job);
+        } else {
+            /* Peer dispatch.  If peer is closed (race with detach), fail
+             * the job inline.  Otherwise hand off to RVD1's KickJob;
+             * completion will arrive via the consumer callback wired in
+             * Task 3.4. */
+            if (!q->PeerOpen || !q->Peer.KickJob) {
+                /* Race: peer detached between promote and kick.  Roll
+                 * the slot back and fail the job. */
+                KIRQL irql;
+                KeAcquireSpinLock(&q->Lock, &irql);
+                if (q->InFlightPerCore[core] == job) {
+                    q->InFlightPerCore[core] = NULL;
+                    q->CoreIdle |= (1u << core);
+                    if (q->CorePending[core] > 0) q->CorePending[core]--;
+                }
+                InsertTailList(&q->Completed, &job->Link);
+                KeReleaseSpinLock(&q->Lock, irql);
+                job->Result = STATUS_DEVICE_NOT_READY;
+                KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
+                continue;
+            }
+
+            /* Cross-core cache maintenance: clean CPU-dirty input
+             * buffers (bitstream, packed PPS/RPS/scaling, ColmvCur)
+             * so RVD1's codec sees fresh data on first AXI read.
+             * Mirrors JobKickLocalInner's pre-kick KeFlushIoBuffers
+             * loop — the foreign-job materialization on RVD1's side
+             * has no MDL tracking (Owner=NULL, CleanMdlCount=0), so
+             * if we don't do this here, the codec DMAs stale lines
+             * and decode produces artifacts. */
+            for (UINT32 fi = 0; fi < job->CleanMdlCount; fi++) {
+                if (job->CleanMdls[fi]) {
+                    KeFlushIoBuffers(job->CleanMdls[fi],
+                                     /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
+                }
+            }
+            if (job->ColmvCurMdl) {
+                KeFlushIoBuffers(job->ColmvCurMdl,
+                                 /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
+            }
+
+            RKMPP_PEER_KICK_PARAMS p;
+            RtlZeroMemory(&p, sizeof(p));
+            p.Bank             = &job->DenseBank;
+            p.BankBytes        = sizeof(job->DenseBank);
+            p.KickValue        = job->DenseKickValue;
+            p.IovaSlots        = job->DenseIovaSlots;
+            p.IovaSlotCount    = job->DenseIovaSlotCount;
+            p.CompletionCookie = job->Id;
+
+            NTSTATUS s = q->Peer.KickJob(q->Peer.Header.Context, &p);
+            if (!NT_SUCCESS(s)) {
+                /* Peer rejected kick — fail inline. */
+                KIRQL irql;
+                KeAcquireSpinLock(&q->Lock, &irql);
+                if (q->InFlightPerCore[core] == job) {
+                    q->InFlightPerCore[core] = NULL;
+                    q->CoreIdle |= (1u << core);
+                    if (q->CorePending[core] > 0) q->CorePending[core]--;
+                }
+                InsertTailList(&q->Completed, &job->Link);
+                KeReleaseSpinLock(&q->Lock, irql);
+                job->Result = s;
+                KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
+            }
+        }
+    }
+}
+
 /* -----------------------------------------------------------------------
  * RkMppJobComplete — finalise a job.
  *
@@ -941,7 +1280,7 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     KIRQL oldIrql;
     KeAcquireSpinLock(&q->Lock, &oldIrql);
 
-    RKMPP_JOB *job = q->InFlight;
+    RKMPP_JOB *job = q->InFlightPerCore[0];
     if (!job) {
         KeReleaseSpinLock(&q->Lock, oldIrql);
         return;
@@ -1025,82 +1364,35 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
                          /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
     }
     /* Move from InFlight to Completed. */
-    q->InFlight = NULL;
     InsertTailList(&q->Completed, &job->Link);
 
     /* Signal the waiter before we potentially start the next job. */
     KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
 
-    /* Promote the next pending job with per-Owner LRU fairness.
-     *
-     * Strict FIFO promotion would let a File submitting a burst of N
-     * jobs kick all N before a peer File's first job runs.  Under
-     * sustained multi-stream load that starves the peer past the
-     * codec's reg32 watchdog (78 ms @ 4K) — see
-     * `rkmpp_cross_file_starvation` + the Linux baseline showing BSP
-     * multiplexes the same workload on one core with zero resets via
-     * global per-task fair-share.
-     *
-     * LRU rule: for each Pending candidate, score = the Owner's
-     * LastKickId from q->OwnerLru (0 = never kicked = oldest).  Pick
-     * the minimum.  Stable tiebreak via list order (first encountered
-     * wins) so within an Owner we still drain in submit order.  Two
-     * streams → strict alternation (peer's LastKickId is always older).
-     * Three+ streams → cycles fairly through all Owners regardless of
-     * how bursty any one is. */
-    RKMPP_JOB *next = NULL;
-    if (!IsListEmpty(&q->Pending)) {
-        PLIST_ENTRY chosen = q->Pending.Flink;
-        UINT64 bestScore = (UINT64)-1;
-        for (PLIST_ENTRY e = q->Pending.Flink;
-             e != &q->Pending;
-             e = e->Flink) {
-            RKMPP_JOB *cand = CONTAINING_RECORD(e, RKMPP_JOB, Link);
-            UINT64 score = 0;
-            for (ULONG i = 0; i < ARRAYSIZE(q->OwnerLru); ++i) {
-                if (q->OwnerLru[i].File == cand->Owner) {
-                    score = q->OwnerLru[i].LastKickId;
-                    break;
-                }
-            }
-            if (score < bestScore) {
-                bestScore = score;
-                chosen = e;
-                if (score == 0) break; /* never-kicked Owner — can't beat */
-            }
-        }
-        RemoveEntryList(chosen);
-        next = CONTAINING_RECORD(chosen, RKMPP_JOB, Link);
-        q->InFlight = next;
-    }
+    /* Phase 3 (Task 3.3): release this core's slot + idle bit, then
+     * promote pending jobs to any idle core.  Local completion path:
+     * the completing core is always 0 here.  Peer completions
+     * (Task 3.4) take the symmetric path via RkMppPeerCompletion. */
+    ULONG completedCore = job->TargetCore;   /* 0 in single-core; set by promote */
+    q->InFlightPerCore[completedCore] = NULL;
+    q->CoreIdle |= (1u << completedCore);
+    if (q->CorePending[completedCore] > 0) q->CorePending[completedCore]--;
+
+    PROMOTION promos[2];
+    RtlZeroMemory(promos, sizeof(promos));
+    ULONG nPromos = PromoteUntilFull(q, promos);
+
+    /* Clock-gate only when ALL cores idle.  Under multi-core, gating
+     * while one core is busy would mis-target (we gate based on this
+     * device's UID, but the peer core's clocks belong to a different
+     * UID).  Snapshot idleAfter under lock so we don't race with a
+     * concurrent submit. */
+    BOOLEAN idleAfter = (q->CoreIdle == ((1u << q->CoreCount) - 1)) &&
+                        IsListEmpty(&q->Pending);
 
     KeReleaseSpinLock(&q->Lock, oldIrql);
 
-    /* Gate the codec's leaf clocks ONLY when the queue is idle (no next
-     * job to promote).  BSP `mpp_rkvdec2.c` only does clk_off at
-     * end-of-task — between back-to-back kicks of the same device the
-     * codec stays ungated.  Per-kick gate→ungate adds CDC settle time
-     * that under sustained dual-stream contention pushed tail-end
-     * codec work over its internal watchdog at low rate (Windows
-     * 0.12-0.35% reset rate vs Linux BSP 0% over 8000 matched kicks).
-     *
-     * When `next != NULL` (a job was promoted under the queue lock
-     * above), the codec moves directly into the next kick's
-     * UngateLeafClocks → bulk-write at JobStart.  The Ungate is
-     * idempotent at the register level (re-writes the same CLKGATE_CON
-     * bits) so JobStart doesn't need to know whether we skipped here.
-     *
-     * Note: per-job RaiseCluster/DropCluster removed — they were
-     * always short-circuit no-ops nested under the device-lifetime
-     * Raise from PrepareHardware, and DropCluster ran from DISPATCH
-     * (DPC) which would have blocked the FAST_MUTEX serialization
-     * added in rkmpp_ccu.
-     *
-     * v7 ifc split: GateRvdec0LeafClocks targets CLKGATE_CON40 bits
-     * (RVD0's leaves), GateRvdec1LeafClocks targets CLKGATE_CON41
-     * bits 6..8 (RVD1's leaves).  Dispatch on UID so each codec only
-     * gates its own clocks. */
-    if (!next) {
+    if (idleAfter) {
         RKMPP_DEVICE_PUBLIC pub;
         RkMppGetPublic(Device, &pub);
         PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
@@ -1113,10 +1405,99 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
         }
     }
 
-    /* Kick the next job outside the spin lock. */
-    if (next) {
-        RkMppJobStart(Device, next);
+    KickPromotions(Device, q, promos, nPromos);
+}
+
+/* -----------------------------------------------------------------------
+ * RkMppPeerCompletion — peer-side completion callback for Task 3.4.
+ *
+ * Invoked by RVD1's PEER_WORKER provider when a foreign-dispatched
+ * job completes on RVD1's hardware.  Mirrors the local RkMppJobComplete
+ * but operates on InFlightPerCore[1] instead of [0].  Re-enters the
+ * dispatcher to promote pending jobs to any freshly-idle core.
+ *
+ * Runs at PASSIVE on the peer's worker thread (PeerKickWorker → the
+ * trampoline → here), so paged operations are legal.  Holds q->Lock
+ * across slot bookkeeping + PromoteUntilFull; releases before
+ * KickPromotions.
+ * --------------------------------------------------------------------- */
+VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
+                         _In_ UINT64   CompletionCookie,
+                         _In_ NTSTATUS JobStatus,
+                         _In_ UINT32   HardwareStatus)
+{
+    WDFDEVICE        Device = (WDFDEVICE)ConsumerContext;
+    PRKMPP_JOB_QUEUE q      = RkMppGetJobQueue(Device);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+
+    RKMPP_JOB *job = q->InFlightPerCore[1];
+    if (!job || job->Id != CompletionCookie) {
+        /* Stale completion (peer-reset or cancellation race).  Drop. */
+        KeReleaseSpinLock(&q->Lock, irql);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "rkvdec: peer completion cookie=%llu doesn't match "
+                   "InFlightPerCore[1]=%p — stale, ignoring\n",
+                   (unsigned long long)CompletionCookie, job);
+        return;
     }
+
+    job->EndQpc        = KeQueryPerformanceCounter(NULL);
+    job->Result        = JobStatus;
+    job->HardwareStatus = HardwareStatus;
+
+    /* Charge errors to Owner for FileCleanup escalation, mirroring
+     * RkMppJobComplete's error-attribution logic. */
+    BOOLEAN failed = (!NT_SUCCESS(JobStatus) || (HardwareStatus & 0xF0u));
+    if (failed && job->Owner) {
+        PRKMPP_FILE_CTX fctx = RkMppFileGet(job->Owner);
+        if (fctx) InterlockedIncrement(&fctx->ErrorCount);
+    }
+
+    /* Cache invalidate the codec's output buffers — same logic as
+     * RkMppJobComplete.  These MDLs were populated by RVD0's
+     * RkMppJobSubmitDense (the foreign job inherits the original
+     * job's MDL list since RVD0 dispatched the job from its own
+     * Pending → InFlightPerCore[1]). */
+    if (job->OutputFrameMdl) {
+        KeFlushIoBuffers(job->OutputFrameMdl, /*Read*/TRUE, /*DMA*/TRUE);
+    }
+    if (job->ColmvCurMdl) {
+        KeFlushIoBuffers(job->ColmvCurMdl, /*Read*/TRUE, /*DMA*/TRUE);
+    }
+
+    q->InFlightPerCore[1] = NULL;
+    q->CoreIdle |= (1u << 1);
+    if (q->CorePending[1] > 0) q->CorePending[1]--;
+    InsertTailList(&q->Completed, &job->Link);
+
+    PROMOTION promos[2];
+    RtlZeroMemory(promos, sizeof(promos));
+    ULONG nPromos = PromoteUntilFull(q, promos);
+
+    BOOLEAN idleAfter = (q->CoreIdle == ((1u << q->CoreCount) - 1)) &&
+                        IsListEmpty(&q->Pending);
+
+    KeReleaseSpinLock(&q->Lock, irql);
+
+    KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
+
+    if (idleAfter) {
+        RKMPP_DEVICE_PUBLIC pub;
+        RkMppGetPublic(Device, &pub);
+        PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
+        if (ccu) {
+            /* This is RVD0's device.  Gate its own clocks (UID 0).
+             * RVD1's clocks are gated by RVD1's own JobComplete path
+             * when its foreign-job completion finalizes locally. */
+            if (pub.Uid == 0 && ccu->GateRvdec0LeafClocks) {
+                ccu->GateRvdec0LeafClocks(ccu->Header.Context);
+            }
+        }
+    }
+
+    KickPromotions(Device, q, promos, nPromos);
 }
 
 /* -----------------------------------------------------------------------
@@ -1330,7 +1711,9 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
 
     ULONG pendingCount = 0;
     ULONG ownerCount   = 0;
-    if (q->InFlight && q->InFlight->Owner == File) ownerCount++;
+    for (ULONG c = 0; c < q->CoreCount; c++) {
+        if (q->InFlightPerCore[c] && q->InFlightPerCore[c]->Owner == File) ownerCount++;
+    }
     for (PLIST_ENTRY e = q->Pending.Flink;
          e != &q->Pending;
          e = e->Flink) {
@@ -1347,17 +1730,19 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
         return STATUS_DEVICE_BUSY;
     }
 
-    BOOLEAN startNow = (q->InFlight == NULL);
-    if (startNow) {
-        q->InFlight = job;
-    } else {
-        InsertTailList(&q->Pending, &job->Link);
-    }
+    /* Phase 3 (Task 3.3): enqueue to Pending unconditionally, then
+     * let PromoteUntilFull dispatch to any idle core (or both, if both
+     * are free).  This is also how the first job after a quiescent
+     * period gets kicked — without this, both InFlightPerCore[]
+     * slots stay empty and no completion ever fires. */
+    InsertTailList(&q->Pending, &job->Link);
+
+    PROMOTION promos[2];
+    RtlZeroMemory(promos, sizeof(promos));
+    ULONG nPromos = PromoteUntilFull(q, promos);
     KeReleaseSpinLock(&q->Lock, oldIrql);
 
-    if (startNow) {
-        RkMppJobStart(Device, job);
-    }
+    KickPromotions(Device, q, promos, nPromos);
 
     Out->JobId = job->Id;
     return STATUS_SUCCESS;
@@ -1376,7 +1761,12 @@ RkMppJobPeekDense(_In_ WDFDEVICE Device,
     KeAcquireSpinLock(&q->Lock, &oldIrql);
 
     RKMPP_JOB *job = NULL;
-    if (q->InFlight && q->InFlight->Id == JobId) job = q->InFlight;
+    for (ULONG c = 0; c < q->CoreCount; c++) {
+        if (q->InFlightPerCore[c] && q->InFlightPerCore[c]->Id == JobId) {
+            job = q->InFlightPerCore[c];
+            break;
+        }
+    }
     if (!job) {
         for (PLIST_ENTRY e = q->Pending.Flink;
              e != &q->Pending; e = e->Flink) {
@@ -1419,9 +1809,11 @@ RkMppJobBufferInUse(_In_ WDFDEVICE Device,
 
     KeAcquireSpinLock(&q->Lock, &oldIrql);
 
-    if (RkMppJobReferencesBuffer(q->InFlight, File, Cookie)) {
-        inUse = TRUE;
-        goto done;
+    for (ULONG c = 0; c < q->CoreCount; c++) {
+        if (RkMppJobReferencesBuffer(q->InFlightPerCore[c], File, Cookie)) {
+            inUse = TRUE;
+            goto done;
+        }
     }
 
     for (PLIST_ENTRY e = q->Pending.Flink; e != &q->Pending; e = e->Flink) {
@@ -1478,9 +1870,13 @@ RkMppJobWait(_In_ WDFDEVICE Device,
     }
 
     if (!job) {
-        /* Check InFlight. */
-        if (q->InFlight && q->InFlight->Id == JobId) {
-            job = q->InFlight;
+        /* Check InFlight on all cores. */
+        for (ULONG c = 0; c < q->CoreCount; c++) {
+            if (q->InFlightPerCore[c] && q->InFlightPerCore[c]->Id == JobId &&
+                q->InFlightPerCore[c]->Owner == File) {
+                job = q->InFlightPerCore[c];
+                break;
+            }
         }
     }
 
@@ -1571,11 +1967,18 @@ RkMppJobWait(_In_ WDFDEVICE Device,
             } else if (onCompleted) {
                 RemoveEntryList(&job->Link);
                 safeToFree = TRUE;
-            } else if (q->InFlight == job) {
-                RKMPP_LOG_WARN(
-                           "rkmpp: WAIT_JOB timeout on InFlight job %llu — "
-                           "leaving attached for poller completion\n",
-                           (unsigned long long)job->Id);
+            } else {
+                /* Check if still in-flight on any core. */
+                BOOLEAN inFlight = FALSE;
+                for (ULONG c = 0; c < q->CoreCount; c++) {
+                    if (q->InFlightPerCore[c] == job) { inFlight = TRUE; break; }
+                }
+                if (inFlight) {
+                    RKMPP_LOG_WARN(
+                               "rkmpp: WAIT_JOB timeout on InFlight job %llu — "
+                               "leaving attached for poller completion\n",
+                               (unsigned long long)job->Id);
+                }
             }
             KeReleaseSpinLock(&q->Lock, oldIrql);
 

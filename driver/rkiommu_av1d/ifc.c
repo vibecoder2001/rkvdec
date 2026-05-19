@@ -15,6 +15,7 @@
 #include "../../shared/rkiommu_ifc.h"
 #include "../../shared/rkmpp_ioctl.h"  /* RkMppBufferUsage* enum */
 #include "device.h"
+#include "../shared/rkmpp_log.h"
 #include "../shared/iommu/pgtable.h"
 
 /* ---------------------------------------------------------------------------
@@ -256,7 +257,7 @@ RkIommuReattach(_In_ PVOID ProviderContext)
                    "rkiommu_av1d: Reattach enable phase failed 0x%08x\n", s);
         return s;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkiommu_av1d: reattached (HID=RKCP%04x UID=%u)\n",
                dev->Hid, dev->Uid);
     return STATUS_SUCCESS;

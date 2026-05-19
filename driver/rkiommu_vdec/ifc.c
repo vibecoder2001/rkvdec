@@ -30,6 +30,7 @@
 #include "../../shared/rkiommu_ifc.h"
 #include "../../shared/rkmpp_ioctl.h"  /* RkMppBufferUsage* enum */
 #include "device.h"
+#include "../shared/rkmpp_log.h"
 #include "../shared/iommu/pgtable.h"
 
 /* ---------------------------------------------------------------------------
@@ -328,7 +329,7 @@ RkIommuReattach(_In_ PVOID ProviderContext)
                    "rkiommu_vdec: Reattach enable phase failed 0x%08x\n", s);
         return s;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkiommu_vdec: reattached (HID=RKCP%04x UID=%u)\n",
                dev->Hid, dev->Uid);
     return STATUS_SUCCESS;
@@ -382,7 +383,7 @@ RkIommuForceReset(_In_ PVOID ProviderContext)
             KeStallExecutionProcessor(1);
         }
         if (poll >= 100000) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            RKMPP_LOG_WARN(
                        "rkiommu_vdec: ForceReset MMU#%d DTE_ADDR didn't clear\n", mi);
             rs = STATUS_TIMEOUT;
         }

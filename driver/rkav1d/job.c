@@ -16,6 +16,7 @@
 #include <wdf.h>
 
 #include "../../shared/rkmpp_ioctl.h"
+#include "../shared/rkmpp_log.h"
 #include "job.h"
 #include "profile.h"      /* RKMPP_CODEC_PERSONALITY for per-codec dispatch */
 #include "../shared/rkmpp/bufpool.h"      /* for RkMppBufLookupIova (iova substitution) */
@@ -302,7 +303,7 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
                                            FALSE, &timeout);
         if (w == STATUS_TIMEOUT) {
             *InFlightTimedOut = TRUE;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            RKMPP_LOG_WARN(
                        "rkav1d: file-cleanup in-flight wait timed out\n");
             /* Sever the in-flight job's references to the buffer-pool
              * MDLs before the caller (EvtFileCleanup) runs BufFreeAll.
@@ -417,7 +418,7 @@ RkMppJobQueueQuiesce(_Inout_ RKMPP_JOB_QUEUE *Queue,
     NTSTATUS w = KeWaitForSingleObject(doneEvt, Executive, KernelMode,
                                        FALSE, &timeout);
     if (w == STATUS_TIMEOUT) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkav1d: D0Exit Quiesce in-flight wait timed out\n");
         return STATUS_TIMEOUT;
     }
@@ -1359,7 +1360,7 @@ RkMppJobWait(_In_ WDFDEVICE Device,
                 RemoveEntryList(&job->Link);
                 safeToFree = TRUE;
             } else if (q->InFlight == job) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                RKMPP_LOG_WARN(
                            "rkav1d: WAIT_JOB timeout on InFlight job %llu — "
                            "leaving attached for poller completion\n",
                            (unsigned long long)job->Id);

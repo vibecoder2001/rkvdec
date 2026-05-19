@@ -44,7 +44,7 @@ ServiceBinary  = %13%\rkav1d.sys
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002
-ManufacturerName       = "Rockchip Windows Drivers Project"
+ManufacturerName       = "Vibe Coder"
 DiskName               = "rkav1d Installation Disk"
 rkav1d.DeviceDesc      = "Rockchip RK3588 AV1 video decoder"
 rkav1d.SVCDESC         = "rkav1d Service"

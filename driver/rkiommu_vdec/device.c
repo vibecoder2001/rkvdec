@@ -14,6 +14,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include "device.h"
+#include "../shared/rkmpp_log.h"
 #include "../shared/iommu/pgtable.h"
 #include "../shared/iommu/fault.h"
 #include "../shared/acpi_uid.h"
@@ -150,7 +151,7 @@ NTSTATUS RkIommuDisableHw(PRKIOMMU_DEVICE Dev)
             RK_MMU_CMD_DISABLE_STALL);
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkiommu_vdec: disabled (HID=RKCP%04x UID=%u cfg=%d)\n",
                Dev->Hid, Dev->Uid, n_cfg);
     return STATUS_SUCCESS;
@@ -196,9 +197,8 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
             RK_MMU_CMD_ENABLE_STALL);
         KeStallExecutionProcessor(50);
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-               "rkiommu_vdec: HID=RKCP%04x UID=%u (MmioLength=0x%x) cfg=%d paged=%d\n",
-               Dev->Hid, Dev->Uid, Dev->MmioLength, n_cfg, n_paged);
+    RKMPP_LOG_INFO("rkiommu_vdec: HID=RKCP%04x UID=%u (MmioLength=0x%x) cfg=%d paged=%d\n",
+                   Dev->Hid, Dev->Uid, Dev->MmioLength, n_cfg, n_paged);
 
     /* Configure ALL MMU instances (n_mmu) — RK3588 codec MMUs come in
      * pairs (read-port + write-port).  See comment above for details. */
@@ -241,6 +241,7 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
      * MMIO writes above actually landed.  If the IOMMU is mis-clocked, the
      * read returns 0xFFFFFFFF or stale; if DTE_ADDR readback != PdPhys,
      * the IOMMU isn't in our page table. */
+#if DBG
     {
         ULONG dteRb  = READ_REGISTER_ULONG(
             (volatile ULONG*)(Dev->MmioBase + RK_MMU_DTE_ADDR));
@@ -248,11 +249,11 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
             (volatile ULONG*)(Dev->MmioBase + RK_MMU_STATUS));
         ULONG maskRb = READ_REGISTER_ULONG(
             (volatile ULONG*)(Dev->MmioBase + RK_MMU_INT_MASK));
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkiommu_vdec: pre-enable readback HID=RKCP%04x UID=%u "
-                   "DTE_ADDR=0x%08x (want 0x%08x) STATUS=0x%08x INT_MASK=0x%08x\n",
-                   Dev->Hid, Dev->Uid, dteRb, Dev->Domain->PdPhys, statRb, maskRb);
+        RKMPP_LOG_INFO("rkiommu_vdec: pre-enable readback HID=RKCP%04x UID=%u "
+                       "DTE_ADDR=0x%08x (want 0x%08x) STATUS=0x%08x INT_MASK=0x%08x\n",
+                       Dev->Hid, Dev->Uid, dteRb, Dev->Domain->PdPhys, statRb, maskRb);
     }
+#endif
 
     /* 6. Enable paging on ALL MMU instances. */
     ULONG attempts = Dev->FlagEnableCmdRetry ? 3u : 1u;
@@ -266,6 +267,7 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
             (volatile ULONG*)(Dev->MmioBase + RK_MMU_STATUS));
         ULONG st1 = (n_cfg > 1) ? READ_REGISTER_ULONG(
             (volatile ULONG*)(Dev->MmioBase + 0x40 + RK_MMU_STATUS)) : 0u;
+        (void)st1;  /* consumed only by RKMPP_LOG_INFO below (compiled out in release) */
         if ((st0 & RK_MMU_STATUS_PAGING_ENABLED)) {
             Dev->PagingEnabled = TRUE;
             /* UN-STALL all instances to release in-flight AXI traffic. */
@@ -274,9 +276,8 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
                     (volatile ULONG*)(Dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
                     RK_MMU_CMD_DISABLE_STALL);
             }
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkiommu_vdec: paging enabled (HID=RKCP%04x UID=%u attempt=%u st0=0x%x st1=0x%x cfg=%d paged=%d)\n",
-                       Dev->Hid, Dev->Uid, i + 1u, st0, st1, n_cfg, n_paged);
+            RKMPP_LOG_INFO("rkiommu_vdec: paging enabled (HID=RKCP%04x UID=%u attempt=%u st0=0x%x st1=0x%x cfg=%d paged=%d)\n",
+                           Dev->Hid, Dev->Uid, i + 1u, st0, st1, n_cfg, n_paged);
             return STATUS_SUCCESS;
         }
         KeStallExecutionProcessor(20);
@@ -342,9 +343,8 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
             /* Non-adjacent — would need a separate ioremap.  Log a
              * warning and ignore for now; only the rk3588 paired-MMU
              * layout matters for our scope. */
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkiommu_vdec: non-adjacent mem resource at 0x%llx ignored\n",
-                       d->u.Memory.Start.QuadPart);
+            RKMPP_LOG_WARN("rkiommu_vdec: non-adjacent mem resource at 0x%llx ignored\n",
+                           d->u.Memory.Start.QuadPart);
         }
     }
     if (totalLen) {
@@ -372,9 +372,8 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
     InsertTailList(&g_deviceList, &ctx->ListEntry);
     KeReleaseSpinLock(&g_deviceListLock, irql);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-               "rkiommu_vdec: RKCP%04x UID=%u ready, MMIO=%p PdPhys=0x%08x\n",
-               ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PdPhys);
+    RKMPP_LOG_INFO("rkiommu_vdec: RKCP%04x UID=%u ready, MMIO=%p PdPhys=0x%08x\n",
+                   ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PdPhys);
 
     /* Phase 2: leave IOMMU paging disabled until first client maps.
      * RkIommuEnable(ctx) will be called lazily from the MapMdl path. */
@@ -494,8 +493,7 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
          * service for the working ones.  Continue without an ISR. */
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-               "rkiommu_vdec: device created\n");
+    RKMPP_LOG_INFO("rkiommu_vdec: device created\n");
 
     return RkIommuRegisterIfc(device);
 }

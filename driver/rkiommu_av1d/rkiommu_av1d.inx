@@ -44,7 +44,7 @@ ServiceBinary  = %13%\rkiommu_av1d.sys
 
 [Strings]
 SPSVCINST_ASSOCSERVICE  = 0x00000002
-ManufacturerName        = "Rockchip Windows Drivers Project"
+ManufacturerName        = "Vibe Coder"
 DiskName                = "rkiommu_av1d Installation Disk"
 rkiommu_av1d.DeviceDesc = "Rockchip RK3588 AV1 decoder IOMMU"
 rkiommu_av1d.SVCDESC    = "rkiommu_av1d Service"

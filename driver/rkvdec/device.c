@@ -12,6 +12,7 @@
 #include <wdf.h>
 
 #include "../../shared/rkmpp_ioctl.h"
+#include "../shared/rkmpp_log.h"
 #include "profile.h"
 #include "devpub.h"
 #include "../shared/rkmpp/ifc_client.h"
@@ -276,7 +277,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     ctx->MmioCount       = 1;
     ctx->MmioBase        = v;
     ctx->MmioLength      = mmioLen;
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkvdec: HID=RKCP%04x UID=%u MmioBase=phys 0x%llx len 0x%x\n",
                ctx->Hid, ctx->Uid, mmioLow.QuadPart, mmioLen);
 
@@ -302,7 +303,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         RkMppCloseIfcs(&ctx->Ifcs);
         return STATUS_REVISION_MISMATCH;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkmpp: ifcs opened (iommu v%u, ccu v%u)\n",
                ctx->Ifcs.Iommu.Header.Version, ctx->Ifcs.Ccu.Header.Version);
 
@@ -358,7 +359,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         if (ctx->Ifcs.IommuOpen && ctx->Ifcs.Iommu.Reattach) {
             NTSTATUS rs = ctx->Ifcs.Iommu.Reattach(ctx->Ifcs.Iommu.Header.Context);
             if (!NT_SUCCESS(rs)) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                RKMPP_LOG_WARN(
                            "rkmpp: post-Raise Reattach failed 0x%08x\n", rs);
             }
         }
@@ -406,7 +407,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         }
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkmpp: HID=RKCP%04x UID=%u rev=0x%08x codecs=0x%08x\n",
                ctx->Hid, ctx->Uid, ctx->RevisionWord, ctx->SupportedCodecs);
     return STATUS_SUCCESS;
@@ -558,7 +559,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
         return;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkmpp: EvtFileCleanup fileobject=%p — draining jobs\n",
                FileObject);
 
@@ -583,16 +584,16 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
     PRKMPP_DEVICE devCtx = RkMppDeviceGet(ctx->Device);
 
     if (timedOut) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkmpp: FileCleanup in-flight wait timed out — "
                    "session-end PD power-cycle below; in-flight work lost\n");
     } else if (sessionErrors > 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        RKMPP_LOG_INFO(
                    "rkmpp: drain clean fileobject=%p but %d error-flagged "
                    "jobs — session-end PD power-cycle below\n",
                    FileObject, sessionErrors);
     } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        RKMPP_LOG_INFO(
                    "rkmpp: drain done fileobject=%p clean — "
                    "session-end PD power-cycle below\n", FileObject);
     }
@@ -640,7 +641,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
         PRKMPP_CCU_INTERFACE ccu   = devCtx->Ifcs.CcuOpen   ? &devCtx->Ifcs.Ccu   : NULL;
 
         if (otherActive && !timedOut) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            RKMPP_LOG_INFO(
                        "rkmpp: FileCleanup with concurrent File on UID=%u — "
                        "skipping IOMMU/CCU touches (would disrupt peer DMA); "
                        "flagging NeedsCoreReset for peer's next kick\n",
@@ -658,7 +659,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
             RkMppSetNeedsCoreReset(ctx->Device);
         } else {
             if (timedOut && otherActive) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                RKMPP_LOG_WARN(
                            "rkmpp: FileCleanup drain timed out on UID=%u with "
                            "concurrent File active — PD-cycle will disrupt it\n",
                            devCtx->Uid);
@@ -679,7 +680,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
             if (iommu && iommu->Enable) {
                 NTSTATUS rs = iommu->Enable(iommu->Header.Context);
                 if (!NT_SUCCESS(rs)) {
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                    RKMPP_LOG_WARN(
                                "rkmpp: post-FileCleanup IOMMU Enable failed 0x%08x — "
                                "next session will lazy-Enable on first MapMdl\n", rs);
                 }

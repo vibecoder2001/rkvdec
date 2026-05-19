@@ -5,6 +5,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include "device.h"
+#include "../shared/rkmpp_log.h"
 #include "../shared/iommu/pgtable.h"
 #include "../shared/iommu/fault.h"
 #include "../shared/acpi_uid.h"
@@ -67,7 +68,7 @@ NTSTATUS RkIommuDisableHw(PRKIOMMU_DEVICE Dev)
     WRITE_REGISTER_ULONG(
         (volatile ULONG*)(Dev->MmioBase + AV1_MMU_AHB_CONTROL), 0u);
     Dev->PagingEnabled = FALSE;
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkiommu_av1d: disabled (HID=RKCP%04x UID=%u)\n",
                Dev->Hid, Dev->Uid);
     return STATUS_SUCCESS;
@@ -84,7 +85,7 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
         (volatile ULONG*)(base + AV1_MMU_AHB_CONTROL));
     if (ctrl & AV1_MMU_AHB_CONTROL_ENABLE) {
         Dev->PagingEnabled = TRUE;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        RKMPP_LOG_INFO(
                    "rkiommu_av1d: already enabled (ctrl=0x%08x)\n", ctrl);
         return STATUS_SUCCESS;
     }
@@ -112,7 +113,7 @@ NTSTATUS RkIommuEnableHw(PRKIOMMU_DEVICE Dev)
         return STATUS_DEVICE_HARDWARE_ERROR;
     }
     Dev->PagingEnabled = TRUE;
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkiommu_av1d: paging enabled (HID=RKCP%04x UID=%u PTA=0x%08x)\n",
                Dev->Hid, Dev->Uid, Dev->Domain->PtaPhys);
     return STATUS_SUCCESS;
@@ -174,9 +175,8 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
     InsertTailList(&g_deviceList, &ctx->ListEntry);
     KeReleaseSpinLock(&g_deviceListLock, irql);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-               "rkiommu_av1d: RKCP%04x UID=%u ready, MMIO=%p PtaPhys=0x%08x\n",
-               ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PtaPhys);
+    RKMPP_LOG_INFO("rkiommu_av1d: RKCP%04x UID=%u ready, MMIO=%p PtaPhys=0x%08x\n",
+                   ctx->Hid, ctx->Uid, ctx->MmioBase, ctx->Domain->PtaPhys);
     return STATUS_SUCCESS;
 }
 

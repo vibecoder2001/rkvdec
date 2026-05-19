@@ -80,9 +80,8 @@ typedef struct _RKMPP_JOB {
 
     /* Stamped by RkMppJobStart from JobQueue.LastOwner/LastDecMode so
      * the poller's timeout dump can report whether THIS kick crossed
-     * an owner / codec-mode boundary, without inferring from nearby
-     * `kick-switch` log lines.  All zero / FALSE on the first kick of
-     * a PnP cycle (KickPrevValid=FALSE). */
+     * an owner / codec-mode boundary.  All zero / FALSE on the first
+     * kick of a PnP cycle (KickPrevValid=FALSE). */
     UINT32          KickDecMode;
     UINT32          KickPrevDecMode;
     WDFFILEOBJECT   KickPrevOwner;

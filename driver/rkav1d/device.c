@@ -12,6 +12,7 @@
 #include <wdf.h>
 
 #include "../../shared/rkmpp_ioctl.h"
+#include "../shared/rkmpp_log.h"
 #include "profile.h"
 #include "devpub.h"
 #include "../shared/rkmpp/ifc_client.h"
@@ -220,7 +221,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
             ULONG len = d->u.Memory.Length;
 
             if (ctx->MmioCount >= RKMPP_MAX_MMIO_WINDOWS) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                RKMPP_LOG_WARN(
                            "rkav1d: AV1 declares >%u memory windows, "
                            "ignoring extras\n", RKMPP_MAX_MMIO_WINDOWS);
                 continue;
@@ -239,7 +240,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
             ctx->Mmios[ctx->MmioCount].Length = len;
             ctx->Mmios[ctx->MmioCount].Phys   = start;
             ctx->MmioCount++;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            RKMPP_LOG_INFO(
                        "rkav1d: window[%u] phys=0x%llx len=0x%x va=%p\n",
                        ctx->MmioCount - 1,
                        (ULONGLONG)start.QuadPart, len, v);
@@ -254,7 +255,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
     ctx->MmioBase   = ctx->Mmios[0].Base;
     ctx->MmioLength = ctx->Mmios[0].Length;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkav1d: HID=RKCP%04x UID=%u MmioBase=phys 0x%llx len 0x%zx "
                "windows=%u\n",
                ctx->Hid, ctx->Uid,
@@ -283,7 +284,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         RkMppCloseIfcs(&ctx->Ifcs);
         return STATUS_REVISION_MISMATCH;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkav1d: ifcs opened (iommu v%u, ccu v%u)\n",
                ctx->Ifcs.Iommu.Header.Version, ctx->Ifcs.Ccu.Header.Version);
 
@@ -337,7 +338,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
         if (ctx->Ifcs.IommuOpen && ctx->Ifcs.Iommu.Reattach) {
             NTSTATUS rs = ctx->Ifcs.Iommu.Reattach(ctx->Ifcs.Iommu.Header.Context);
             if (!NT_SUCCESS(rs)) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                RKMPP_LOG_WARN(
                            "rkav1d: post-Raise Reattach failed 0x%08x\n", rs);
             }
         }
@@ -363,7 +364,7 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
          * per-kick prev-mask invalidation path in job.c. */
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkav1d: HID=RKCP%04x UID=%u rev=0x%08x codecs=0x%08x\n",
                ctx->Hid, ctx->Uid, ctx->RevisionWord, ctx->SupportedCodecs);
     return STATUS_SUCCESS;
@@ -420,6 +421,7 @@ RkMppEvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE PreviousState
 {
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     PVOID cookie = WdfDeviceWdmGetDeviceObject(Device);
+    UNREFERENCED_PARAMETER(PreviousState);
 
     /* Step 1: ungate AV1 leaf clocks.  Idempotent — RaiseAv1Cluster already
      * ungated as part of bring-up, so the first call after PrepareHardware
@@ -445,7 +447,7 @@ RkMppEvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE PreviousState
         NTSTATUS s = ctx->Ifcs.Iommu.Enable(ctx->Ifcs.Iommu.Header.Context);
         if (!NT_SUCCESS(s)) {
             if (s == STATUS_DEVICE_NOT_READY) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                RKMPP_LOG_INFO(
                            "rkav1d: D0Entry Iommu.Enable deferred — sibling "
                            "rkiommu_av1d not yet ready (lazy enable on first "
                            "MapMdl)\n");
@@ -469,7 +471,7 @@ RkMppEvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE PreviousState
      * Quiesce and restarts any Pending chain that didn't get drained. */
     RkMppJobQueueResume(Device, &ctx->JobQueue);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkav1d: D0Entry done (prev=%u)\n", PreviousState);
     return STATUS_SUCCESS;
 }
@@ -499,17 +501,18 @@ RkMppEvtD0Exit(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE TargetState)
 {
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     PVOID cookie = WdfDeviceWdmGetDeviceObject(Device);
+    UNREFERENCED_PARAMETER(TargetState);
 
     /* Step 1: drain in-flight job + suppress new starts.  Even on timeout,
      * we proceed — the alternative is leaving clocks ungated in D3, which
      * defeats the whole D-state effort. */
     NTSTATUS qs = RkMppJobQueueQuiesce(&ctx->JobQueue, 500);
     if (qs == STATUS_TIMEOUT) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkav1d: D0Exit Quiesce timed out — proceeding with "
                    "gate sequence (in-flight kick may be lost)\n");
     } else if (!NT_SUCCESS(qs)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkav1d: D0Exit Quiesce status 0x%08x — continuing\n", qs);
     }
 
@@ -525,7 +528,7 @@ RkMppEvtD0Exit(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE TargetState)
     if (ctx->Ifcs.IommuOpen && ctx->Ifcs.Iommu.Disable) {
         NTSTATUS s = ctx->Ifcs.Iommu.Disable(ctx->Ifcs.Iommu.Header.Context);
         if (!NT_SUCCESS(s)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            RKMPP_LOG_WARN(
                        "rkav1d: D0Exit Iommu.Disable failed 0x%08x\n", s);
         }
     }
@@ -535,12 +538,12 @@ RkMppEvtD0Exit(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE TargetState)
     if (ctx->Ifcs.CcuOpen && ctx->Ifcs.Ccu.GateAv1LeafClocks) {
         NTSTATUS s = ctx->Ifcs.Ccu.GateAv1LeafClocks(cookie);
         if (!NT_SUCCESS(s)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            RKMPP_LOG_WARN(
                        "rkav1d: D0Exit GateAv1LeafClocks failed 0x%08x\n", s);
         }
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkav1d: D0Exit done (target=%u)\n", TargetState);
     return STATUS_SUCCESS;
 }
@@ -630,7 +633,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
         return;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+    RKMPP_LOG_INFO(
                "rkav1d: EvtFileCleanup fileobject=%p — draining jobs\n",
                FileObject);
 
@@ -673,7 +676,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
     PRKMPP_DEVICE devCtx = RkMppDeviceGet(ctx->Device);
 
     if (timedOut) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkav1d: FileCleanup in-flight wait timed out — "
                    "wide CRU reset + WDF restart for full PD cycle\n");
         RkMppSetNeedsCoreReset(ctx->Device);
@@ -712,13 +715,13 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
          *
          * Re-enable the soft tier when we replicate BSP's stall +
          * power-down + clock-gate sequencing around the FORCE_RESET. */
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        RKMPP_LOG_INFO(
                    "rkav1d: drain clean fileobject=%p but %d error-flagged "
                    "jobs — flagging next-kick wide reset (soft tier disabled)\n",
                    FileObject, sessionErrors);
         RkMppSetNeedsCoreReset(ctx->Device);
     } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        RKMPP_LOG_INFO(
                    "rkav1d: drain done fileobject=%p clean\n", FileObject);
     }
 
@@ -736,7 +739,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
 
     if (devCtx && devCtx->Ifcs.IommuOpen && devCtx->Ifcs.Iommu.Reattach) {
         if (otherActive) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            RKMPP_LOG_INFO(
                        "rkav1d: FileCleanup with concurrent File active — "
                        "skipping Reattach (would disrupt peer DMA); per-iova "
                        "ZAP_CACHE from UnmapMdl already flushed our walk-cache\n");
@@ -751,7 +754,7 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
             NTSTATUS rs = devCtx->Ifcs.Iommu.Reattach(
                 devCtx->Ifcs.Iommu.Header.Context);
             if (!NT_SUCCESS(rs)) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                RKMPP_LOG_WARN(
                            "rkav1d: post-drain Reattach failed 0x%08x\n", rs);
             }
         }

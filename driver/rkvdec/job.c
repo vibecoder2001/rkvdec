@@ -15,6 +15,7 @@
 #include <ntstrsafe.h>
 
 #include "../../shared/rkmpp_ioctl.h"
+#include "../shared/rkmpp_log.h"
 #include "job.h"
 #include "profile.h"      /* RKMPP_CODEC_PERSONALITY for per-codec dispatch */
 #include "devpub.h"       /* RKMPP_DEVICE_PUBLIC for UID query */
@@ -322,7 +323,7 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
                                            FALSE, &timeout);
         if (w == STATUS_TIMEOUT) {
             *InFlightTimedOut = TRUE;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            RKMPP_LOG_WARN(
                        "rkmpp: file-cleanup in-flight wait timed out\n");
             /* Sever the in-flight job's references to the buffer-pool
              * MDLs before the caller (EvtFileCleanup) runs BufFreeAll.
@@ -590,10 +591,7 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
     /* Cross-kick scheduling probe.  Extract dec_mode from the kick's
      * dense bank (swreg9 = Common[1], low 5 bits) and compare to the
      * previous kick.  Stamp the result onto the job so the poller's
-     * timeout dump can surface it directly (no inference from nearby
-     * `kick-switch` log lines).  Log ONLY on transitions to keep noise
-     * bounded (a clean playback emits roughly one line per ~thousand
-     * kicks at steady state). */
+     * timeout dump can surface owner/mode transitions directly. */
     {
         UINT32 dec_mode = Job->DenseBank.Common[1] & 0x1Fu;
         BOOLEAN owner_switch = q->LastValid && (q->LastOwner != Job->Owner);
@@ -606,19 +604,6 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         Job->KickSwitchMode  = mode_switch;
         Job->KickPrevValid   = q->LastValid;
 
-        if (!q->LastValid || owner_switch || mode_switch) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "rkmpp: kick-switch job=%llu owner=%p mode=%u (prev owner=%p mode=%u) "
-                       "switch_owner=%d switch_mode=%d first=%d\n",
-                       (unsigned long long)Job->Id,
-                       Job->Owner,
-                       dec_mode,
-                       Job->KickPrevOwner,
-                       Job->KickPrevDecMode,
-                       owner_switch ? 1 : 0,
-                       mode_switch  ? 1 : 0,
-                       q->LastValid ? 0 : 1);
-        }
         q->LastOwner   = Job->Owner;
         q->LastDecMode = dec_mode;
         q->LastValid   = TRUE;
@@ -691,7 +676,7 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         PRKIOMMU_INTERFACE      iommu = RkMppGetIommuIfc(Device);
         RKMPP_DEVICE_PUBLIC pub;
         RkMppGetPublic(Device, &pub);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkmpp: escalating to FullCoreReset on UID=%u (job %llu)\n",
                    pub.Uid, (unsigned long long)Job->Id);
 
@@ -1587,7 +1572,7 @@ RkMppJobWait(_In_ WDFDEVICE Device,
                 RemoveEntryList(&job->Link);
                 safeToFree = TRUE;
             } else if (q->InFlight == job) {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                RKMPP_LOG_WARN(
                            "rkmpp: WAIT_JOB timeout on InFlight job %llu — "
                            "leaving attached for poller completion\n",
                            (unsigned long long)job->Id);

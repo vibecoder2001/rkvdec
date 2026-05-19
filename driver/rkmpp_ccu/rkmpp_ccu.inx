@@ -45,7 +45,7 @@ ServiceBinary  = %13%\rkmpp_ccu.sys
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002
-ManufacturerName       = "Rockchip Windows Drivers Project"
+ManufacturerName       = "Vibe Coder"
 DiskName               = "rkmpp_ccu Installation Disk"
 rkmpp_ccu.DeviceDesc   = "Rockchip RK3588 MPP cluster control unit"
 rkmpp_ccu.SVCDESC      = "rkmpp_ccu Service"

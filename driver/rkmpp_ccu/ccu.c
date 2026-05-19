@@ -55,6 +55,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include "../../shared/rkmpp_ccu_ifc.h"
+#include "../shared/rkmpp_log.h"
 #include "pmu.h"
 
 /* CRU register offsets relative to g_cru_mmio (which maps 0xfd7c0000+). */
@@ -437,35 +438,6 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
     /* Resets were deasserted earlier (before each PD's idle handshake) —
      * the NIU has to be out of reset for the PMU bus-idle ack to fire. */
 
-    /* DEBUG (2026-05-12 RVD0/RVD1 rate asymmetry investigation): dump the
-     * CRU CON registers controlling clock rates + gate state for both
-     * cores so we can confirm what RVD1 actually runs at on Windows
-     * (vs BSP's 594/1000/594 MHz triple).  Remove once the wedge root
-     * cause is pinned down. */
-    {
-        ULONG con89 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x464));
-        ULONG con90 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x468));
-        ULONG con91 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x46C));
-        ULONG con93 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x474));
-        ULONG con94 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x478));
-        ULONG con40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8A0));
-        ULONG con41 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8A4));
-        ULONG rst40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0xAA0));
-        ULONG rst41 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0xAA4));
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkmpp_ccu: post-RaiseCluster CRU dump:\n"
-                   "  CLKSEL_CON89=0x%08x  (aclk_rkvdec_ccu mux/div)\n"
-                   "  CLKSEL_CON90=0x%08x  (RVD0 ca + hevc_ca)\n"
-                   "  CLKSEL_CON91=0x%08x  (RVD0 core)\n"
-                   "  CLKSEL_CON93=0x%08x  (RVD1 hclk_root + aclk_root + ca)\n"
-                   "  CLKSEL_CON94=0x%08x  (RVD1 hevc_ca + core)\n"
-                   "  CLKGATE_CON40=0x%08x (RVD0 leaves)\n"
-                   "  CLKGATE_CON41=0x%08x (RVD1 leaves)\n"
-                   "  SOFTRST_CON40=0x%08x SOFTRST_CON41=0x%08x\n",
-                   con89, con90, con91, con93, con94,
-                   con40, con41, rst40, rst41);
-    }
-
     /* Codec MMIO at 0xFDC30000 / 0xFDC38xxx / 0xFDC48xxx is now reachable. */
     g_raise_refcount = 1;
     ExReleaseFastMutex(&g_ccu_mutex);
@@ -485,7 +457,7 @@ NTSTATUS RkMppCcuDropCluster(_In_ PVOID Ctx)
     }
     if (g_raise_refcount == 0) {
         /* Defensive: Drop without matching Raise.  Skip teardown. */
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkmpp_ccu: DropCluster with refcount==0 — ignored\n");
         ExReleaseFastMutex(&g_ccu_mutex);
         return STATUS_SUCCESS;
@@ -617,7 +589,7 @@ NTSTATUS RkMppCcuDropAv1Cluster(_In_ PVOID Ctx)
     }
     if (g_av1_refcount == 0) {
         /* Defensive: Drop without matching Raise.  Skip teardown. */
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkmpp_ccu: DropAv1Cluster with refcount==0 — ignored\n");
         ExReleaseFastMutex(&g_ccu_mutex);
         return STATUS_SUCCESS;
@@ -861,7 +833,7 @@ NTSTATUS RkMppCcuFullCoreReset0(_In_ PVOID Ctx)
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+    RKMPP_LOG_WARN(
                "rkmpp_ccu: FullCoreReset0 — power-cycle PD_RKVDEC0 + wide CRU reset\n");
 
     /* Empirical recipe (proven to unwedge by CCU driver reinstall):
@@ -885,7 +857,7 @@ NTSTATUS RkMppCcuFullCoreReset0(_In_ PVOID Ctx)
 
     NTSTATUS s = RkMppPmuPowerOff(&g_pdRkvdec0);
     if (!NT_SUCCESS(s)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkmpp_ccu: FullCoreReset0 PowerOff failed 0x%08x — "
                    "continuing reset anyway\n", s);
     }
@@ -927,7 +899,7 @@ NTSTATUS RkMppCcuFullCoreReset1(_In_ PVOID Ctx)
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+    RKMPP_LOG_WARN(
                "rkmpp_ccu: FullCoreReset1 — power-cycle PD_RKVDEC1 + wide CRU reset\n");
 
     /* Mirror of FullCoreReset0 for the CON41 / PD_RKVDEC1 group.  No
@@ -938,7 +910,7 @@ NTSTATUS RkMppCcuFullCoreReset1(_In_ PVOID Ctx)
 
     NTSTATUS s = RkMppPmuPowerOff(&g_pdRkvdec1);
     if (!NT_SUCCESS(s)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+        RKMPP_LOG_WARN(
                    "rkmpp_ccu: FullCoreReset1 PowerOff failed 0x%08x — "
                    "continuing reset anyway\n", s);
     }
@@ -978,7 +950,7 @@ NTSTATUS RkMppCcuFullAv1Reset(_In_ PVOID Ctx)
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+    RKMPP_LOG_WARN(
                "rkmpp_ccu: FullAv1Reset — wide CRU reset for AV1\n");
 
     (void)RkMppPmuIdleRequest(&g_pdAv1, TRUE);

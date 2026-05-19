@@ -44,7 +44,7 @@ ServiceBinary  = %13%\rkvdec.sys
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002
-ManufacturerName       = "Rockchip Windows Drivers Project"
+ManufacturerName       = "Vibe Coder"
 DiskName               = "rkvdec Installation Disk"
 rkvdec.DeviceDesc      = "Rockchip RK3588 RKVDEC v2 H.264 / HEVC decoder"
 rkvdec.SVCDESC         = "rkvdec Service"

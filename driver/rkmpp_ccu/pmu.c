@@ -33,6 +33,7 @@
  * timed out even when the hardware actually came up.
  */
 #include "pmu.h"
+#include "../shared/rkmpp_log.h"
 
 extern volatile UCHAR *g_pmu_mmio;
 
@@ -167,9 +168,8 @@ NTSTATUS RkMppPmuPowerOn(_In_ const RKMPP_PMU_DOMAIN *D)
     /* Step 2: wait for is-on status. */
     for (ULONG i = 0; i < 10000; i++) {
         if (PmuDomainIsOn(D)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkmpp_ccu: PD pwrBit=0x%x powered on after %u µs\n",
-                       D->PwrBit, i);
+            RKMPP_LOG_INFO("rkmpp_ccu: PD pwrBit=0x%x powered on after %u µs\n",
+                           D->PwrBit, i);
             goto powered_on;
         }
         KeStallExecutionProcessor(1);
@@ -193,9 +193,8 @@ powered_on:
             (volatile ULONG*)(g_pmu_mmio + D->IdleStOffset));
         if ((idle_st & D->IdleStBit) == 0) {
             /* Bus already not idle — nothing to do. */
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkmpp_ccu: PD pwrBit=0x%x bus already active\n",
-                       D->PwrBit);
+            RKMPP_LOG_INFO("rkmpp_ccu: PD pwrBit=0x%x bus already active\n",
+                           D->PwrBit);
             return STATUS_SUCCESS;
         }
     }
@@ -208,9 +207,8 @@ powered_on:
         ULONG ack = READ_REGISTER_ULONG(
             (volatile ULONG*)(g_pmu_mmio + D->IdleAckOffset));
         if ((ack & D->IdleAckBit) == 0) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkmpp_ccu: PD pwrBit=0x%x bus active after %u µs\n",
-                       D->PwrBit, i);
+            RKMPP_LOG_INFO("rkmpp_ccu: PD pwrBit=0x%x bus active after %u µs\n",
+                           D->PwrBit, i);
             return STATUS_SUCCESS;
         }
         KeStallExecutionProcessor(1);
@@ -286,7 +284,7 @@ NTSTATUS RkMppPmuIdleRequest(_In_ const RKMPP_PMU_DOMAIN *D, _In_ BOOLEAN Idle)
         KeStallExecutionProcessor(1);
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+    RKMPP_LOG_WARN(
                "rkmpp_ccu: pmu_idle_request(%s) ack timeout (PD pwrBit=0x%x) — "
                "continuing without bus quiesce\n",
                Idle ? "TRUE" : "FALSE", D->PwrBit);

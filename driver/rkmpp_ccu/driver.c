@@ -14,6 +14,7 @@
 #include <wdf.h>
 
 #include "../../shared/rkmpp_ccu_ifc.h"
+#include "../shared/rkmpp_log.h"
 #include "pmu.h"
 
 /* Globals consumed by ccu.c.
@@ -104,8 +105,7 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
     UNREFERENCED_PARAMETER(ResourcesRaw);
 
     UINT32 hid = RkMppCcuReadHid(Device);
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-               "rkmpp_ccu: PrepareHardware HID=RKCP%04x\n", hid);
+    RKMPP_LOG_INFO("rkmpp_ccu: PrepareHardware HID=RKCP%04x\n", hid);
 
     ULONG count = WdfCmResourceListGetCount(ResourcesTranslated);
     for (ULONG i = 0; i < count; i++) {
@@ -123,9 +123,8 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
                  * mapping live so the address space is reserved. */
                 g_rdcc_mmio     = (volatile UCHAR*)base;
                 g_rdcc_mmio_len = d->u.Memory.Length;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "rkmpp_ccu: RDCC coord mapped @ %p len 0x%Ix\n",
-                           base, g_rdcc_mmio_len);
+                RKMPP_LOG_INFO("rkmpp_ccu: RDCC coord mapped @ %p len 0x%Ix\n",
+                               base, g_rdcc_mmio_len);
 
                 /* Also map the system CRU (not exposed via ACPI) so we can
                  * gate clocks and assert resets for the rkvdec cluster. */
@@ -142,9 +141,8 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
                 }
                 g_cru_mmio     = (volatile UCHAR*)cruVa;
                 g_cru_mmio_len = RKMPP_CCU_CRU_MAP_LENGTH;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "rkmpp_ccu: system CRU mapped @ %p (phys 0x%llx)\n",
-                           cruVa, (unsigned long long)cruPhys.QuadPart);
+                RKMPP_LOG_INFO("rkmpp_ccu: system CRU mapped @ %p (phys 0x%llx)\n",
+                               cruVa, (unsigned long long)cruPhys.QuadPart);
 
                 /* Map the PMU (not exposed via ACPI) for power-domain control. */
                 PHYSICAL_ADDRESS pmuPhys;
@@ -163,18 +161,16 @@ RkMppCcuEvtPrepareHardware(_In_ WDFDEVICE Device,
                 }
                 g_pmu_mmio     = (volatile UCHAR*)pmuVa;
                 g_pmu_mmio_len = RKMPP_PMU_MAP_LENGTH;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "rkmpp_ccu: PMU mapped @ %p (phys 0x%llx)\n",
-                           pmuVa, (unsigned long long)pmuPhys.QuadPart);
+                RKMPP_LOG_INFO("rkmpp_ccu: PMU mapped @ %p (phys 0x%llx)\n",
+                               pmuVa, (unsigned long long)pmuPhys.QuadPart);
             } else {
                 /* RKCP3501/3502 — map succeeds but we don't use it for RDCC.
                  * Unmap immediately; CCU functions will return gracefully via
                  * the g_cru_mmio == NULL guards in ccu.c.
                  */
                 MmUnmapIoSpace(base, d->u.Memory.Length);
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "rkmpp_ccu: HID %04x — RDCC not managed, skipped\n",
-                           hid);
+                RKMPP_LOG_INFO("rkmpp_ccu: HID %04x — RDCC not managed, skipped\n",
+                               hid);
             }
             break;
         }
@@ -239,8 +235,7 @@ RkMppCcuEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
                                       &device);
     if (!NT_SUCCESS(status)) return status;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-               "rkmpp_ccu: device added\n");
+    RKMPP_LOG_INFO("rkmpp_ccu: device added\n");
 
     return RkMppCcuRegisterIfc(device);
 }

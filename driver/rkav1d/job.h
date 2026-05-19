@@ -88,6 +88,19 @@ typedef struct _RKMPP_JOB_QUEUE {
     WDFDEVICE       Device;         /* back-pointer for poller context */
     WDFINTERRUPT    Interrupt;      /* WDFINTERRUPT for ISR/DPC */
 
+    /* hwStatus handoff from RkMppEvtIsr → RkMppEvtDpc.
+     *
+     * The ISR reads INT_STATUS (acknowledging by writing 0), then
+     * writes the value here BEFORE WdfInterruptQueueDpcForIsr.  The DPC
+     * reads it on entry and passes it to RkMppJobComplete so the
+     * err_mask classifier (TIMEOUT_STA → FullCoreReset, other err bits
+     * → CoreReset, firebreak flags, etc.) sees the real codec status
+     * rather than the placeholder 0 the DPC used during initial
+     * bring-up.  Volatile because ISR/DPC run on different processors;
+     * WdfInterruptQueueDpcForIsr provides the implicit memory barrier
+     * between the write and the DPC's read. */
+    volatile UINT32 LastIsrHwStatus;
+
     /* Polling-completion thread.  WdfInterruptCreate currently fails for
      * rkmpp instances (STATUS_WDF_INVALID_INTERRUPT_CONFIG), so we run a
      * per-device kernel thread that polls INT_STATUS after each kick.

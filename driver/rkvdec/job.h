@@ -89,6 +89,24 @@ typedef struct _RKMPP_JOB {
     BOOLEAN         KickSwitchOwner;
     BOOLEAN         KickSwitchMode;
     BOOLEAN         KickPrevValid;
+    /* Live readback of CLKGATE_CON40 (RVD0) or CLKGATE_CON41 (RVD1)
+     * captured immediately AFTER UngateRvdec{0,1}LeafClocks returns in
+     * RkMppJobStart.  Lets the timeout dump distinguish "ungate didn't
+     * take effect" (kick-time gate value already shows leaves gated)
+     * from "leaves got gated mid-kick by something else" (kick-time
+     * value clean, live readback at timeout shows leaves gated).
+     * 0xFFFFFFFF = no snapshot taken (no CCU ifc, wrong UID, etc.). */
+    UINT32          KickClkGateAtKick;
+    /* DEC_MODE (idx 9) MMIO readback captured immediately AFTER the
+     * dense-bank bulk write and BEFORE writing the kick (idx 10).
+     * Compared against Job->DenseBank.Common[1] (the intended dec_mode)
+     * to detect "bulk write didn't land on this kick" vs "the codec
+     * rolled the register back after self-timeout".  Surfaced in the
+     * poller's timeout dump alongside the at-timeout readback so a
+     * mismatch between (intended, kick-time, timeout-time) classifies
+     * which window the divergence opens in.  0xFFFFFFFF = no snapshot
+     * taken (early-return before the readback site). */
+    UINT32          KickDecModeAtKick;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------
@@ -103,6 +121,19 @@ typedef struct _RKMPP_JOB_QUEUE {
     volatile LONG64 NextId;         /* next job ID to assign */
     WDFDEVICE       Device;         /* back-pointer for poller context */
     WDFINTERRUPT    Interrupt;      /* WDFINTERRUPT for ISR/DPC */
+
+    /* hwStatus handoff from RkMppEvtIsr → RkMppEvtDpc.
+     *
+     * The ISR reads INT_STATUS (acknowledging by writing 0), then
+     * writes the value here BEFORE WdfInterruptQueueDpcForIsr.  The DPC
+     * reads it on entry and passes it to RkMppJobComplete so the
+     * err_mask classifier (TIMEOUT_STA → FullCoreReset, other err bits
+     * → CoreReset, firebreak flags, etc.) sees the real codec status
+     * rather than the placeholder 0 the DPC used during initial
+     * bring-up.  Volatile because ISR/DPC run on different processors;
+     * WdfInterruptQueueDpcForIsr provides the implicit memory barrier
+     * between the write and the DPC's read. */
+    volatile UINT32 LastIsrHwStatus;
 
     /* Cross-kick scheduling probe — updated in RkMppJobStart so the
      * next kick can log whether the codec just switched Owner (File)

@@ -90,7 +90,7 @@ static VOID RkMppOnIommuFault(_In_ PVOID  ClientCookie,
                                _In_ ULONG   StatusReg);
 
 /* ISR and DPC live in job.c but are declared via EVT_WDF_INTERRUPT_* here
- * so we can pass them to WdfInterruptCreate in PrepareHardware. */
+ * so we can pass them to WdfInterruptCreate in RkMppDeviceCreate. */
 extern EVT_WDF_INTERRUPT_ISR  RkMppEvtIsr;
 extern EVT_WDF_INTERRUPT_DPC  RkMppEvtDpc;
 
@@ -141,6 +141,38 @@ RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
     PRKMPP_DEVICE devCtx = RkMppDeviceGet(device);
     RkMppJobQueueInit(device, &devCtx->JobQueue);
 
+    /* Wire the codec IRQ from EvtDeviceAdd-time with the default config.
+     * The AV1 ACPI declares 3 interrupt resources in order: VCD (140),
+     * CACHE (139), AFBC (138).  Only VCD signals decode completion (see
+     * BSP mpp_av1dec.c:623 av1dec_vcd_irq); CACHE/AFBC are declared but
+     * never `request_irq`-ed by BSP.  Default WdfInterruptCreate
+     * auto-binds against the first available CmResourceTypeInterrupt
+     * descriptor in PnP-assignment order, which matches our ACPI's
+     * declaration order — so the first call claims VCD.
+     *
+     * Calling from EvtDevicePrepareHardware with explicit
+     * InterruptRaw+InterruptTranslated fails 0xC020020F on ARM64 GIC
+     * SPI lines (see RkMppDeviceCreate comment in driver/rkvdec/device.c
+     * for the WDF validator-path explanation).
+     *
+     * Fatal on failure: completion is interrupt-driven exclusively.
+     * The previous fall-back poller has been gated off. */
+    {
+        WDF_INTERRUPT_CONFIG intCfg;
+        WDF_INTERRUPT_CONFIG_INIT(&intCfg, RkMppEvtIsr, RkMppEvtDpc);
+        NTSTATUS intStatus = WdfInterruptCreate(
+            device, &intCfg, WDF_NO_OBJECT_ATTRIBUTES,
+            &devCtx->JobQueue.Interrupt);
+        if (!NT_SUCCESS(intStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkav1d: WdfInterruptCreate failed 0x%08x — "
+                       "refusing to load (interrupt-driven completion "
+                       "is non-optional)\n",
+                       (ULONG)intStatus);
+            return intStatus;
+        }
+    }
+
     return RkMppQueueInit(device);
 }
 
@@ -149,6 +181,10 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                         _In_ WDFCMRESLIST ResourcesRaw,
                         _In_ WDFCMRESLIST ResourcesTranslated)
 {
+    UNREFERENCED_PARAMETER(ResourcesRaw);  /* WDF auto-binds the IRQ
+                                            * descriptor for the interrupt
+                                            * registered in DeviceCreate;
+                                            * we don't touch raw resources. */
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     NTSTATUS status = RkMppReadAcpiId(Device, &ctx->Hid, &ctx->Uid);
     if (!NT_SUCCESS(status)) return status;
@@ -161,13 +197,12 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
      * mpp_common.c:2026 — gates mpp_dev_reset on reset_request > 0). */
     InterlockedExchange(&ctx->NeedsCoreReset, 1);
 
-    /* Step 1: walk resources to capture MMIO windows AND the raw+translated
-     * descriptors for the first interrupt.  ARM64 GIC line interrupts require
-     * the descriptors to be passed explicitly to WdfInterruptCreate; the
-     * default auto-bind path fails with STATUS_WDF_INVALID_INTERRUPT_CONFIG
-     * (0xC020020F) — confirmed empirically on first hardware bring-up. */
-    PCM_PARTIAL_RESOURCE_DESCRIPTOR irqRaw   = NULL;
-    PCM_PARTIAL_RESOURCE_DESCRIPTOR irqTrans = NULL;
+    /* Step 1: walk resources to capture MMIO windows.  The codec IRQ
+     * (VCD/interrupt 140 — the only one BSP uses for completion) was
+     * already registered at EvtDeviceAdd time via WdfInterruptCreate
+     * (see RkMppDeviceCreate); WDF auto-binds it against the first
+     * CmResourceTypeInterrupt entry in this resource list during PnP
+     * assignment, so we don't touch interrupt descriptors here. */
 
     /* AV1D (RKCP3560) declares THREE non-contiguous regions
      *   VCD   : 0xFDC70000 / 0x800
@@ -208,10 +243,11 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                        "rkav1d: window[%u] phys=0x%llx len=0x%x va=%p\n",
                        ctx->MmioCount - 1,
                        (ULONGLONG)start.QuadPart, len, v);
-        } else if (d->Type == CmResourceTypeInterrupt && !irqTrans) {
-            irqTrans = d;
-            irqRaw   = WdfCmResourceListGetDescriptor(ResourcesRaw, i);
         }
+        /* CmResourceTypeInterrupt entries are consumed by WDF's auto-bind
+         * for the WDFINTERRUPT registered in RkMppDeviceCreate — we don't
+         * extract them here.  The first interrupt resource (VCD/140) is
+         * what WDF claims; CACHE/AFBC are declared but unused. */
     }
 
     if (ctx->MmioCount == 0) return STATUS_INSUFFICIENT_RESOURCES;
@@ -225,28 +261,11 @@ RkMppEvtPrepareHardware(_In_ WDFDEVICE Device,
                (ULONGLONG)ctx->Mmios[0].Phys.QuadPart,
                ctx->MmioLength, ctx->MmioCount);
 
-    /* Connect the WDF interrupt with explicit raw + translated descriptors.
-     * Phase 3a: ISR/DPC are wired but the hardware kick path (Phase 3b) is
-     * what actually causes ISRs to fire. */
-    if (irqRaw && irqTrans) {
-        WDF_INTERRUPT_CONFIG intCfg;
-        WDF_INTERRUPT_CONFIG_INIT(&intCfg, RkMppEvtIsr, RkMppEvtDpc);
-        intCfg.InterruptRaw        = irqRaw;
-        intCfg.InterruptTranslated = irqTrans;
-
-        WDF_OBJECT_ATTRIBUTES intAttr;
-        WDF_OBJECT_ATTRIBUTES_INIT(&intAttr);
-        intAttr.ParentObject = Device;
-
-        NTSTATUS intStatus = WdfInterruptCreate(
-            Device, &intCfg, &intAttr, &ctx->JobQueue.Interrupt);
-        if (!NT_SUCCESS(intStatus)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkav1d: WdfInterruptCreate failed 0x%08x\n",
-                       intStatus);
-            /* Non-fatal in Phase 3a — Phase 3b real-kick path makes it fatal. */
-        }
-    }
+    /* WDF interrupt registration moved to RkMppDeviceCreate
+     * (EvtDeviceAdd-time) to avoid the STATUS_WDF_INVALID_INTERRUPT_CONFIG
+     * failure that the EvtPrepareHardware-time explicit-descriptor path
+     * hit on our ARM64 GIC SPI lines.  See the comment block in
+     * RkMppDeviceCreate. */
 
     /* Step 2: open the in-kernel ifcs of rkmpp_ccu.sys and rkiommu.sys.
      * Without them we cannot service a single IOCTL beyond GET_CAPS, so refuse

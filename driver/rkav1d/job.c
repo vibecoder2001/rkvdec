@@ -454,13 +454,24 @@ RkMppJobQueueResume(_In_ WDFDEVICE Device,
 }
 
 /* -----------------------------------------------------------------------
- * RkMppPollerThread — per-device kernel thread that polls INT_STATUS for
- * job completion.
+ * RkMppPollerThread — vestigial.  Completion is interrupt-driven
+ * exclusively (RkMppDeviceCreate makes WdfInterruptCreate failure fatal
+ * at PnP load); RkMppEvtIsr → RkMppEvtDpc → RkMppJobComplete handles
+ * every kick.  This thread now just consumes KickEvent signals and
+ * waits for ExitEvent at teardown; the prior INT_STATUS poll loop
+ * (Phase A 50µs busy-wait + Phase B 1ms sleep, with on-done AXI drain
+ * and on-timeout diagnostic dump) has been removed.
  *
- * Runs at PASSIVE_LEVEL; waits on (KickEvent | ExitEvent).  A kick means
- * RkMppJobStart just wrote the register list and asserted dec_e.  We
- * poll INT_STATUS up to a deadline; on done bit set we ack the status,
- * call RkMppJobComplete, and loop.  Exit unblocks teardown.
+ * If we re-enable cached buffers the AXI drain (PERF_WORKING_CNT
+ * settle + 1500µs stall) will need to live somewhere — either in the
+ * DPC (DISPATCH_LEVEL, would spin) or here as a drain-only thread
+ * that the DPC defers to.  Likewise the timeout diagnostic dump
+ * previously fired from this thread; under ISR-driven completion the
+ * DPC could dump on err_mask hits if we want that signal back.
+ *
+ * The thread + KickEvent/ExitEvent infrastructure stays in place so
+ * re-enabling polling for triage is a small revert rather than a
+ * rebuild of the kernel-thread plumbing.
  * --------------------------------------------------------------------- */
 
 static VOID
@@ -473,147 +484,8 @@ RkMppPollerThread(_In_ PVOID Context)
         NTSTATUS w = KeWaitForMultipleObjects(2, waitObjects, WaitAny,
                                               Executive, KernelMode,
                                               FALSE, NULL, NULL);
-        if (w == STATUS_WAIT_0) break;     /* exit */
-        if (w != STATUS_WAIT_0 + 1) continue;
-
-        /* KickEvent — poll INT_STATUS until done or timeout. */
-        PVOID mmio = RkMppGetMmioBase(q->Device);
-        if (!mmio) {
-            RkMppJobComplete(q->Device, STATUS_DEVICE_NOT_READY, 0);
-            continue;
-        }
-
-        const RKMPP_CODEC_OPS *ops = &g_ops;
-        UINT32 hwStatus = 0;
-        NTSTATUS result = STATUS_DEVICE_HUNG;
-        /* Cooperative wait: KeDelayExecutionThread yields the CPU to
-         * other threads between polls.  An earlier busy-wait via
-         * KeStallExecutionProcessor pinned the CPU for the entire poll
-         * window which made the system feel hung when decode never
-         * completes.  Use a tight burst of stalls to catch a quick
-         * completion, then fall back to yieldable sleeps so the system
-         * stays responsive while the codec works (or hangs).
-         *
-         * Phase A: 32 × 50us busy-wait — covers the typical
-         *          single-millisecond decode without context-switch cost.
-         * Phase B: ~200 × 1ms KeDelayExecutionThread — yields each tick;
-         *          200ms total budget; system stays responsive. */
-        const ULONG kBusyIters = 32;
-        for (ULONG i = 0; i < kBusyIters; i++) {
-            hwStatus = READ_REGISTER_ULONG(
-                (volatile ULONG *)((PUCHAR)mmio + ops->IntStatusOffset));
-            if (hwStatus & ops->IntDoneMask) goto have_status;
-            KeStallExecutionProcessor(50);
-        }
-        {
-            const ULONG kSleepIters = 200;
-            LARGE_INTEGER iv;
-            iv.QuadPart = -10000;   /* 1 ms relative, 100ns units */
-            for (ULONG i = 0; i < kSleepIters; i++) {
-                hwStatus = READ_REGISTER_ULONG(
-                    (volatile ULONG *)((PUCHAR)mmio + ops->IntStatusOffset));
-                if (hwStatus & ops->IntDoneMask) goto have_status;
-                KeDelayExecutionThread(KernelMode, FALSE, &iv);
-            }
-        }
-have_status:
-        if (hwStatus & ops->IntDoneMask) {
-            result = (hwStatus & ops->IntErrorMask)
-                   ? STATUS_DEVICE_HARDWARE_ERROR
-                   : STATUS_SUCCESS;
-
-            /* AXI write-buffer drain.  RK3588 vdpu's IRQ asserts on the
-             * codec's internal "core done" event, NOT after the last
-             * outbound write reaches DRAM.  When buffers are mapped
-             * uncached, the slow ~12 ms user-mode read provides plenty
-             * of drain time; when cached + invalidate, we read fast
-             * enough to race the codec's tail-end writes — manifests
-             * as deterministic top-fresh / bottom-stale tearing.
-             *
-             * Force a drain before signalling completion: a dummy MMIO
-             * read of the codec's REVISION register (offset 0x000, REG0)
-             * goes through the same AXI bus the codec used for its DMA
-             * writes; the read can't return until prior writes from the
-             * same master domain have committed, so it forces drain.
-             * Plus a short KeStallExecutionProcessor as a belt-and-
-             * suspenders upper bound for any NoC-side buffering not
-             * covered by the AXI ordering rule. */
-            volatile ULONG drain = READ_REGISTER_ULONG(
-                (volatile ULONG *)((PUCHAR)mmio + ops->RevisionOffset));
-            UNREFERENCED_PARAMETER(drain);
-            /* AXI write-tail drain via polled idle indicator.  The
-             * codec's PERF_WORKING_CNT (offset 0x41c) increments every
-             * cycle the codec is processing.  Once DEC_RDY is asserted
-             * AND the counter stops changing for several consecutive
-             * reads, the codec's processing engine is idle — but the
-             * AXI write channel may still be retiring buffered pixel
-             * writes through the NoC to DRAM.
-             *
-             * Bounds: minimum 200 µs (covers basic AXI BVALID round-
-             * trip), maximum 20000 µs (4K + 10-bit worst case).
-             * Step 100 µs per poll.  Require 10 consecutive equal
-             * reads (= 1000 µs of unchanged counter) before declaring
-             * the engine idle — 5 reads was sometimes hitting a
-             * transient pipeline stall mid-frame on 10-bit content and
-             * exiting before the actual tail writes started.
-             *
-             * After PERF_WORKING_CNT settles, an unconditional 4000 µs
-             * settle gives the AXI write channel time to retire the
-             * codec's last pixel writes through the NoC to DRAM.  The
-             * 1500 µs we used for 8-bit AV1 raced the codec's tail on
-             * 10-bit (P010, 2× the bytes vs NV12) and produced a
-             * ~50×200-pixel stale-frame corner at the bottom right.
-             * Cost: 4 ms × 30 fps = 120 ms/sec extra wait, still
-             * inside frame budget at 30 fps. */
-            {
-                volatile ULONG *perf_cnt =
-                    (volatile ULONG *)((PUCHAR)mmio + ops->PerfWorkingCntOffset);
-                KeStallExecutionProcessor(200);  /* min */
-                ULONG prev = READ_REGISTER_ULONG(perf_cnt);
-                ULONG stable = 0;
-                ULONG total_us = 200;
-                while (total_us < 20000) {
-                    KeStallExecutionProcessor(100);
-                    total_us += 100;
-                    ULONG cur = READ_REGISTER_ULONG(perf_cnt);
-                    if (cur == prev) {
-                        if (++stable >= 10) break;
-                    } else {
-                        stable = 0;
-                        prev = cur;
-                    }
-                }
-                KeStallExecutionProcessor(4000);
-            }
-        }
-
-        /* Ack pending status bits (write-1-to-clear). */
-        if (hwStatus) {
-            WRITE_REGISTER_ULONG(
-                (volatile ULONG *)((PUCHAR)mmio + ops->IntStatusOffset),
-                hwStatus);
-        }
-
-        /* AV1 error path: dump INT status + IOMMU snapshot when any
-         * error/timeout bit is set.  Only fires on real failures, not per-kick. */
-        if (hwStatus & AV1D_INT_ERROR_MASK) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkav1d: poller INT=0x%08x result=0x%08x\n",
-                       hwStatus, result);
-            PRKIOMMU_INTERFACE iommu = RkMppGetIommuIfc(q->Device);
-            if (iommu && iommu->Snapshot) {
-                RKIOMMU_FAULT_SNAPSHOT snap = {0};
-                if (NT_SUCCESS(iommu->Snapshot(iommu->Header.Context, &snap))) {
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                               "  av1d-iommu STATUS=0x%08x INT_RAWSTAT=0x%08x "
-                               "INT_STATUS=0x%08x FAULT_ADDR=0x%08x PTA=0x%08x\n",
-                               snap.Status, snap.IntRawStat, snap.IntStatus,
-                               snap.PageFaultAddr, snap.DteAddr);
-                }
-            }
-        }
-
-        RkMppJobComplete(q->Device, result, hwStatus);
+        if (w == STATUS_WAIT_0) break;     /* ExitEvent — teardown */
+        /* KickEvent: nothing to do — ISR/DPC handles completion. */
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -636,15 +508,23 @@ RkMppEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
     PVOID mmioBase   = RkMppGetMmioBase(device);
     const RKMPP_CODEC_OPS *ops = &g_ops;
 
-    /* Read and acknowledge the interrupt-status register. */
+    /* Read and acknowledge the interrupt-status register.
+     *
+     * Match BSP av1dec_vcd_irq (mpp_av1dec.c:634): write 0 to the
+     * status/clear register, not the read-back value.  The AV1 VCD
+     * status register at +0x004 is NOT write-1-to-clear — writing
+     * the read value back leaves the bits set, the IRQ line stays
+     * asserted (level-triggered ActiveHigh), and the ISR fires again
+     * immediately → endless loop → machine hang.  Latent until
+     * commit 3fdae48 made WdfInterruptCreate actually succeed; before
+     * that the ISR never ran so the wrong ack was invisible. */
     UINT32 hwStatus = 0;
     if (mmioBase) {
         hwStatus = READ_REGISTER_ULONG(
             (volatile ULONG *)((PUCHAR)mmioBase + ops->IntStatusOffset));
-        /* Ack by writing back the status bits (write-1-to-clear). */
         WRITE_REGISTER_ULONG(
             (volatile ULONG *)((PUCHAR)mmioBase + ops->IntStatusOffset),
-            hwStatus);
+            0);
     }
 
     if (hwStatus == 0) {
@@ -652,8 +532,14 @@ RkMppEvtIsr(WDFINTERRUPT Interrupt, ULONG MessageId)
         return FALSE;
     }
 
-    /* Stash status for the DPC to consume.  We repurpose SystemArgument1
-     * on the WDF interrupt DPC via WdfInterruptQueueDpcForIsr. */
+    /* Hand hwStatus off to the DPC via the queue's LastIsrHwStatus
+     * field.  Must be written BEFORE WdfInterruptQueueDpcForIsr — the
+     * queue operation is the memory barrier that publishes this write
+     * to the DPC running on (potentially) a different processor. */
+    {
+        PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(device);
+        if (q) q->LastIsrHwStatus = hwStatus;
+    }
     WdfInterruptQueueDpcForIsr(Interrupt);
     return TRUE;
 }
@@ -675,16 +561,43 @@ RkMppEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
     PRKMPP_JOB_QUEUE q = RkMppGetJobQueue(device);
     if (!q) return;
 
-    /* Grab InFlight under lock to safely read the hardware status captured
-     * during RkMppJobStart.  In Phase 3 the ISR will pass hwStatus via a
-     * per-device field; placeholder 0 is fine for Phase 2. */
+    /* Read the ISR's INT_STATUS snapshot (volatile in the queue struct
+     * — published via the implicit memory barrier in
+     * WdfInterruptQueueDpcForIsr).  Classify error vs success the same
+     * way the old poller did, then hand both result + hwStatus to
+     * RkMppJobComplete, whose existing err_mask logic routes
+     * AV1D_INT_TIMEOUT/BUS_ERROR/BUF_EMPTY/ASO/STRM/SLICE into a reset
+     * request and the wait-for-keyframe firebreak.  Without this, the
+     * codec could wedge with TIMEOUT and the DPC would silently
+     * complete as STATUS_SUCCESS, hwStatus=0 — user-mode would treat
+     * the garbage output as a valid frame and no reset would be
+     * requested for the next kick. */
+    UINT32   hwStatus = q->LastIsrHwStatus;
+    NTSTATUS result   = (hwStatus & g_ops.IntErrorMask)
+                      ? STATUS_DEVICE_HARDWARE_ERROR
+                      : STATUS_SUCCESS;
+
     KIRQL oldIrql;
     KeAcquireSpinLock(&q->Lock, &oldIrql);
     RKMPP_JOB *job = q->InFlight;
     KeReleaseSpinLock(&q->Lock, oldIrql);
 
     if (job) {
-        RkMppJobComplete(device, STATUS_SUCCESS, 0);
+        if (hwStatus & g_ops.IntErrorMask) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkav1d: DPC INT=0x%08x err_mask=0x%08x "
+                       "(BUS=%d BUF_EMPTY=%d ASO=%d STRM=%d SLICE=%d TIMEOUT=%d) "
+                       "job=%llu\n",
+                       hwStatus, hwStatus & g_ops.IntErrorMask,
+                       (hwStatus & AV1D_INT_BUS_ERROR)  ? 1 : 0,
+                       (hwStatus & AV1D_INT_BUF_EMPTY)  ? 1 : 0,
+                       (hwStatus & AV1D_INT_ASO_ERROR)  ? 1 : 0,
+                       (hwStatus & AV1D_INT_STRM_ERROR) ? 1 : 0,
+                       (hwStatus & AV1D_INT_SLICE)      ? 1 : 0,
+                       (hwStatus & AV1D_INT_TIMEOUT)    ? 1 : 0,
+                       (unsigned long long)job->Id);
+        }
+        RkMppJobComplete(device, result, hwStatus);
     }
 
     /* Mirror Linux `mpp_iommu_dev_deactivate` semantics: on every IRQ

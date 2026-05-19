@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
+
 
 /* DPB pool of 16 + ~8 codec-scratch buffers; pad generously.  Anything
  * higher would mean the MFT layer leaked an alloc — assert in debug. */
@@ -64,6 +67,23 @@ static void unregister_fd(LinuxBackendCtx *ctx, int fd) {
             ctx->fds[i] = ctx->fds[--ctx->n_fds];
             return;
         }
+    }
+}
+
+static int g_force_cached = -1;
+static int force_cached_enabled(void){
+    if (g_force_cached < 0) {
+        const char *e = getenv("MPP_FORCE_CACHED");
+        g_force_cached = (e && e[0]=="1"[0]) ? 1 : 0;
+    }
+    return g_force_cached;
+}
+static void sync_all_fds(LinuxBackendCtx *ctx, unsigned flags){
+    if (!force_cached_enabled()) return;
+    struct dma_buf_sync s = { .flags = flags };
+    for (int i=0;i<ctx->n_fds;i++){
+        if (ioctl(ctx->fds[i], DMA_BUF_IOCTL_SYNC, &s) < 0)
+            perror("DMA_BUF_IOCTL_SYNC");
     }
 }
 
@@ -216,6 +236,7 @@ static int LinuxBe_SubmitDense(void *vctx, const H26xDenseOutput *in,
     H264RegWriteList list;
     dense_to_sparse(in, &list);
 
+    sync_all_fds(ctx, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
     memset(ctx->irq_readback, 0, sizeof(ctx->irq_readback));
     if (MppSvc_Submit(ctx->svc_fd, &list, buf_map, ctx->n_fds,
                       ctx->irq_readback, ctx->width, ctx->height,
@@ -223,6 +244,7 @@ static int LinuxBe_SubmitDense(void *vctx, const H26xDenseOutput *in,
         return 1;
 
     int rc = MppSvc_Poll(ctx->svc_fd, timeout_ms, ctx->irq_readback);
+    sync_all_fds(ctx, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
     if (hw_status) *hw_status = ctx->irq_readback[0];
     /* MppSvc_Poll returns 0 on RDY, 1 on timeout, -1 on error.  Caller
      * (decode_engine.cpp) interprets non-zero rc + RDY-bit in hw_status

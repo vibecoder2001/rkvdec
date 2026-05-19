@@ -177,3 +177,11 @@ int  Vp9DecodeEngine_DecodeOne(Vp9DecodeEngine *e,
 /* Release a frame's slot back to the pool.  Required after every
  * DecodeOne that returned 0. */
 void Vp9DecodeEngine_ReleaseFrame(Vp9DecodeEngine *e, Vp9DecodedFrame *f);
+
+/* Flush all engine-level state across a host FLUSH command.  Equivalent
+ * to the failure-cascade firebreak: arm wait_for_keyframe, invalidate
+ * all CDF prob contexts, and clear sticky inter-frame state so the
+ * first frame after Flush is treated as a fresh start (drops inter
+ * frames until the next keyframe / intra_only).  Symmetric to
+ * DecodeEngine_Flush for H.264/H.265.  Pool buffers untouched. */
+void Vp9DecodeEngine_Flush(Vp9DecodeEngine *e);

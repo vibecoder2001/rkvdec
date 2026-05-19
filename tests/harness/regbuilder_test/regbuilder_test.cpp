@@ -47,6 +47,7 @@ int main()
      * parser_test fixture. */
     parsed.sps.profile_idc                = 66;
     parsed.sps.level_idc                  = 10;
+    parsed.sps.chroma_format_idc          = 1;
     parsed.sps.pic_width_in_mbs_minus1    = 0;   /* 16 px */
     parsed.sps.pic_height_in_map_units_minus1 = 0;
     parsed.sps.flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY |
@@ -80,7 +81,6 @@ int main()
            "str_len got 0x%x", BankValueAt(dense, RKVDEC2_REG_STR_LEN));
     EXPECT((BankValueAt(dense, RKVDEC2_REG_ERROR_MODE) &
             RKVDEC2_CUR_PIC_IS_IDR) != 0u, "cur_pic_is_idr not set");
-
     /* Codec params.  reg64 stays at zero — BSP H.264 capture shows
      * reg64=0 (the FIRSTSLICE_FLAG isn't programmed from user-mode). */
     EXPECT(BankValueAt(dense, RKVDEC2_REG_H264_FLAGS) == 0u,

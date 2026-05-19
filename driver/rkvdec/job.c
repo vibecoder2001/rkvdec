@@ -781,8 +781,6 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
      * JobComplete left leaf clocks gated; writing to slots in the
      * codec's leaf-gated domain (IntStatus at SWREG+0x380) before
      * ungating silently dropped the write. */
-    Job->KickClkGateAtKick  = 0xFFFFFFFFu;
-    Job->KickDecModeAtKick  = 0xFFFFFFFFu;
     {
         RKMPP_DEVICE_PUBLIC pub;
         RkMppGetPublic(Device, &pub);
@@ -792,15 +790,6 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                 ccu->UngateRvdec0LeafClocks(ccu->Header.Context);
             } else if (pub.Uid == 1 && ccu->UngateRvdec1LeafClocks) {
                 ccu->UngateRvdec1LeafClocks(ccu->Header.Context);
-            }
-            /* Stamp the post-Ungate CLKGATE readback onto the job.
-             * The timeout dump prints it alongside the live readback
-             * to distinguish "ungate never took effect" from "ungate
-             * was fine, something gated mid-kick". */
-            if (ccu->Header.Version >= 10 && ccu->ReadLeafGateState) {
-                ULONG gv = 0xFFFFFFFFu;
-                (void)ccu->ReadLeafGateState(ccu->Header.Context, pub.Uid, &gv);
-                Job->KickClkGateAtKick = gv;
             }
         }
     }
@@ -925,19 +914,6 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                 banks[b].src[p]);
         }
     }
-
-    /* Kick-time DEC_MODE readback (idx 9, byte offset 0x024 inside the
-     * SWREG window).  Tells us whether the bulk write above actually
-     * landed on idx 9 before we assert the kick.  Mismatch vs the
-     * intended value (Job->DenseBank.Common[1]) means the codec wasn't
-     * ready to accept the write — typical cause is the previous kick's
-     * AXI/CDC drain not being complete despite DEC_RDY having latched.
-     * Compared against the at-timeout readback by the poller's dump so
-     * we can classify mode-switch wedges as "write never landed" vs
-     * "codec rolled the register back during self-timeout". */
-    Job->KickDecModeAtKick =
-        READ_REGISTER_ULONG(
-            (volatile ULONG *)((PUCHAR)mmio + swregBase + 9u * 4u));
 
     /* Flush IOMMU TLB BEFORE the kick — matches BSP rkvdec2_run
      * order (mpp_rkvdec2.c:363 → mpp_write START_EN at :372).

@@ -34,7 +34,8 @@ int main() {
     in.bitstream_bytes  = pp.frame_size;
     in.decout_frame_handle = 2;
     in.decout_colmv_handle = 3;
-    in.prob_handle         = 4;
+    in.probe_handle        = 4;
+    in.prob_loop_handle    = 8;
     in.prob_default_handle = 5;
     in.segid_last_handle   = 6;
     in.segid_cur_handle    = 7;
@@ -67,16 +68,17 @@ int main() {
     //   reg161 pps_base (scratch)   = 1
     //   reg162 last_prob            = 1
     //   reg163 rps_base (scratch)   = 1
-    //   reg164/165/166 self-ref     = 3
     //   reg167 count_prob           = 1
     //   reg168/169 segid last/cur   = 2
-    //   reg170 ref_colmv self-ref   = 1
     //   reg171 intercmd_base        = 1
     //   reg172 update_prob_wr       = 1
     //   reg173..179 scratch         = 7
-    //   reg181..196 per-slot colmv = 16 [stride-1, all scratch-filled]
-    // Total = 51
-    CHECK(out.IovaSlotCount == 51);
+    // Total = 27
+    if (out.IovaSlotCount != 27) {
+        fprintf(stderr, "FAIL %s:%d: IovaSlotCount got %u\n",
+                __FILE__, __LINE__, out.IovaSlotCount);
+        return 1;
+    }
 
     // ---- B3 (post-B5 layout fix): reg103 keyframe ------------------
     // Bit layout starts at bit 20 (per BSP Vdpu34xVp9dParam.reg103).
@@ -105,12 +107,12 @@ int main() {
     CHECK(out.Bank.Common[11u - RKMPP_DENSE_COMMON_FIRST] == 0x01000062u);
     // reg12 SECONDARY_EN = 0x82 (NO dec_global_en for VP9).
     CHECK(out.Bank.Common[12u - RKMPP_DENSE_COMMON_FIRST] == 0x00000082u);
-    // reg13 ERROR_MODE: keyframe has CUR_PIC_IS_IDR set.
+    // reg13 ERROR_MODE: keyframe has TIMEOUT_MODE + CUR_PIC_IS_IDR.
+    // REQ_TIMEOUT_RST_SEL (bit 1) deliberately omitted — matches
+    // upstream rkvdec2 / rockchip-mpp, see regbuilder_vp9.cpp comment.
     CHECK(out.Bank.Common[13u - RKMPP_DENSE_COMMON_FIRST] == 0x01000001u);
     // reg26 BLOCK_GATING = 0x800FFFEF.
     CHECK(out.Bank.Common[26u - RKMPP_DENSE_COMMON_FIRST] == 0x800FFFEFu);
-    // reg32 TIMEOUT_THRESH = 0x3FFFF.
-    CHECK(out.Bank.Common[32u - RKMPP_DENSE_COMMON_FIRST] == 0x0003FFFFu);
     // reg18/19/20 strides (1280x720, 8-bit): hor = 80, y_vir = 57600.
     CHECK(out.Bank.Common[18u - RKMPP_DENSE_COMMON_FIRST] == 80u);
     CHECK(out.Bank.Common[19u - RKMPP_DENSE_COMMON_FIRST] == 80u);
@@ -143,7 +145,7 @@ int main() {
         in2.bitstream_handle = 1;
         in2.decout_frame_handle = 2;
         in2.decout_colmv_handle = 3;
-        in2.prob_handle = 4; in2.prob_default_handle = 5;
+        in2.probe_handle = 4; in2.prob_loop_handle = 8; in2.prob_default_handle = 5;
         in2.segid_last_handle = 6; in2.segid_cur_handle = 7;
         for (int i = 0; i < 10; ++i) in2.rcb_handles[i] = 100u + i;
         in2.error_ref_handle = 20;
@@ -204,17 +206,20 @@ int main() {
         CHECK(out2.Bank.CodecParams[86u - RKMPP_DENSE_CPARAM_FIRST] == 57600u);
         CHECK(out2.Bank.CodecParams[87u - RKMPP_DENSE_CPARAM_FIRST] == 57600u);
 
-        // reg13 inter ERROR_MODE = 0x1 (no CUR_PIC_IS_IDR on inter).
+        // reg13 inter ERROR_MODE = TIMEOUT_MODE only.
         CHECK(out2.Bank.Common[13u - RKMPP_DENSE_COMMON_FIRST] == 0x00000001u);
 
         // ---- B4 (post-B5 layout): iova slot count for inter case ------
         // pp.frame_refs[0..2].index = {0, 1, 2}; slots 0/1/2 valid.
         // pp.ref_frame_map[i] all default to index=0 → slot 0 valid.
         // Breakdown:
-        // Inter slot count: same shape as keyframe.  Per-slot colmv
-        // writes all 16 stride-1 entries (real handle for valid slots,
-        // scratch for invalid).  Total = 51.
-        CHECK(out2.IovaSlotCount == 51);
+        // Inter slot count: same shape as keyframe in the current dense
+        // layout.  Total = 27.
+        if (out2.IovaSlotCount != 27) {
+            fprintf(stderr, "FAIL %s:%d: inter IovaSlotCount got %u\n",
+                    __FILE__, __LINE__, out2.IovaSlotCount);
+            return 1;
+        }
 
         auto has_slot = [&](uint32_t reg_idx) {
             for (uint32_t i = 0; i < out2.IovaSlotCount; ++i)
@@ -238,7 +243,8 @@ int main() {
 
     // ---- B4: Vp9Regbuilder_FillProbs tests -------------------------
 
-    // (c1) Keyframe: memset+return — buffer must stay all-zero.
+    // (c1) Keyframe: flags start at zero, then static keyframe
+    // partition probabilities are packed into the value section.
     {
         uint8_t prob_buf[7088];
         memset(prob_buf, 0xAB, sizeof(prob_buf));   // poison
@@ -250,13 +256,13 @@ int main() {
 
         vp9::Vp9Regbuilder_FillProbs(kf_pp, pu, prob_buf);
 
-        // B4 keyframe path: memset(0) then immediate return.
-        // All bytes should be zero after the call.
-        bool all_zero = true;
-        for (size_t i = 0; i < sizeof(prob_buf); ++i) {
-            if (prob_buf[i] != 0) { all_zero = false; break; }
+        bool has_nonzero = false;
+        for (size_t i = 0; i < 4864; ++i) {
+            if (prob_buf[i] != 0) has_nonzero = true;
         }
-        CHECK(all_zero);
+        CHECK(prob_buf[0] == 0);
+        CHECK(has_nonzero);
+        CHECK(prob_buf[4864] == 0xAB);
     }
 
     // (c2) Null pointer guard — must not crash.
@@ -267,10 +273,11 @@ int main() {
         // reaches here → ok
     }
 
-    // (c3) Inter frame with skip_present: skip[3] bytes appear at offset 0.
+    // (c3) Inter frame with skip_present: skip flags are bit-packed into
+    // the active prob buffer.
     {
         uint8_t prob_buf[7088];
-        memset(prob_buf, 0, sizeof(prob_buf));
+        memset(prob_buf, 0xAB, sizeof(prob_buf));
 
         vp9::PicParams inter_pp{};
         inter_pp.frame_type = 1;   // INTER
@@ -283,12 +290,12 @@ int main() {
 
         vp9::Vp9Regbuilder_FillProbs(inter_pp, pu, prob_buf);
 
-        // B4 placeholder layout: skip written first at offset 0.
-        CHECK(prob_buf[0] == 0x11);
-        CHECK(prob_buf[1] == 0x22);
-        CHECK(prob_buf[2] == 0x33);
-        // Byte just past skip should still be zero (nothing else set).
-        CHECK(prob_buf[3] == 0x00);
+        bool has_nonzero = false;
+        for (size_t i = 0; i < 4864; ++i) {
+            if (prob_buf[i] != 0) { has_nonzero = true; break; }
+        }
+        CHECK(has_nonzero);
+        CHECK(prob_buf[4864] == 0xAB);
     }
 
     return 0;

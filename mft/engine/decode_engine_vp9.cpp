@@ -535,3 +535,34 @@ void Vp9DecodeEngine_ReleaseFrame(Vp9DecodeEngine *e, Vp9DecodedFrame *f)
     f->slot_idx = -1;
     f->yuv.clear();
 }
+
+void Vp9DecodeEngine_Flush(Vp9DecodeEngine *e)
+{
+    if (!e) return;
+    /* Cascade firebreak — same shape as the on-failure path at
+     * line 451.  Drops inter frames until the next refresh point. */
+    e->wait_for_keyframe = true;
+    for (int i = 0; i < 4; ++i) e->prob_ctx_valid[i] = 0u;
+
+    /* Reset sticky inter-frame state so the first post-flush frame's
+     * regbuilder doesn't compare against a kick from before the flush.
+     * These fields are read by the regbuilder via the `last_*`
+     * heuristics that decide reg103 bits / colmv / segid behaviour;
+     * carrying stale values across a flush programs the codec with a
+     * predicate evaluated against a frame the post-flush stream
+     * never saw. */
+    e->last_intra_only           = 0;
+    e->last_show_frame           = 0;
+    e->last_segmentation_enabled = 0;
+    e->last_widthheight_eqcur    = 0;
+    e->last_color_space          = 0;
+    e->last_tx_mode              = 4;  /* cold-start default (.h line 80) */
+    e->last_ref_mode             = 0;
+    e->last_mode_deltas[0]       = 0;
+    e->last_mode_deltas[1]       = 0;
+    for (int i = 0; i < 4; ++i) e->last_lf_ref_deltas[i] = 0;
+    e->col_ref_poc               = 0;
+    e->segid_ref_poc             = 0;
+    for (int i = 0; i < 4; ++i) e->prob_ref_poc[i]       = 0;
+    e->segid_phase               = 0;
+}

@@ -163,6 +163,24 @@ private:
      * is expected to drain ProcessOutput between ProcessInput calls. */
     static constexpr size_t kInputQueueCap = 8;
     uint64_t    samples_received_ = 0;
+
+    /* One-shot bitstream dumper for offline-replay debugging.  Active
+     * only while the sentinel file "mft_dump.flag" exists in the
+     * working directory at ProcessInput time of the first sample.
+     * Appends a fixed header plus length-prefixed AU records to
+     * `mft_input_dump.bin` and caps at kDumpBytesMax to avoid filling
+     * the disk on long playbacks.  See implementation in
+     * decoder_mft.cpp for the on-disk format. */
+    FILE       *dump_file_       = nullptr;
+    bool        dump_checked_    = false;     /* sentinel probed once */
+    size_t      dump_bytes_      = 0;
+    static constexpr size_t kDumpBytesMax = 50ULL * 1024ULL * 1024ULL;
+
+    /* Write one input AU to the dumper if active.  No-op on first call
+     * if sentinel "mft_dump.flag" is absent, or once the cap is hit.
+     * The on-disk format is documented in decoder_mft.cpp at the
+     * implementation site. */
+    void DumpAuIfActive(const uint8_t *au, size_t au_len, int64_t pts_hns);
     uint64_t    frames_emitted_   = 0;
     uint64_t    decode_errors_    = 0;
     /* Frames popped from the engine but skipped at emit time — tracked

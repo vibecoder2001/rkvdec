@@ -119,6 +119,7 @@ DecoderMFT::~DecoderMFT() {
         engine_vp9_ = nullptr;
     }
     ReleaseD3DManager();
+    if (dump_file_) { std::fclose(dump_file_); dump_file_ = nullptr; }
     if (attributes_) { attributes_->Release(); attributes_ = nullptr; }
     DllRelease();
 }
@@ -975,9 +976,16 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
         input_timestamps_.clear();
         return S_OK;
     case MFT_MESSAGE_COMMAND_DRAIN:
+        std::fprintf(stderr, "rkmpp MFT: COMMAND_DRAIN samples_received=%llu epoch=%u\n",
+                     (unsigned long long)samples_received_, stream_epoch_);
+        std::fflush(stderr);
         draining_ = true;
         return S_OK;
     case MFT_MESSAGE_COMMAND_FLUSH:
+        std::fprintf(stderr, "rkmpp MFT: COMMAND_FLUSH samples_received=%llu epoch=%u→%u\n",
+                     (unsigned long long)samples_received_,
+                     stream_epoch_, stream_epoch_ + 1);
+        std::fflush(stderr);
         input_queue_.clear();
         input_timestamps_.clear();
         draining_ = false;
@@ -991,15 +999,129 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
             auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
             (void)Av1DecodeEngine_Flush(eng);
         }
+        if (engine_vp9_) {
+            auto *eng = static_cast<Vp9DecodeEngine *>(engine_vp9_);
+            Vp9DecodeEngine_Flush(eng);
+        }
         vp9_out_queue_.clear();
         return S_OK;
     case MFT_MESSAGE_NOTIFY_START_OF_STREAM:
+        std::fprintf(stderr, "rkmpp MFT: NOTIFY_START_OF_STREAM samples_received=%llu\n",
+                     (unsigned long long)samples_received_);
+        std::fflush(stderr);
+        return S_OK;
     case MFT_MESSAGE_NOTIFY_END_OF_STREAM:
+        std::fprintf(stderr, "rkmpp MFT: NOTIFY_END_OF_STREAM samples_received=%llu\n",
+                     (unsigned long long)samples_received_);
+        std::fflush(stderr);
+        return S_OK;
     case MFT_MESSAGE_NOTIFY_RELEASE_RESOURCES:
+        std::fprintf(stderr, "rkmpp MFT: NOTIFY_RELEASE_RESOURCES\n");
+        std::fflush(stderr);
+        return S_OK;
     case MFT_MESSAGE_NOTIFY_REACQUIRE_RESOURCES:
+        std::fprintf(stderr, "rkmpp MFT: NOTIFY_REACQUIRE_RESOURCES\n");
+        std::fflush(stderr);
+        return S_OK;
     default:
         return S_OK;
     }
+}
+
+/* One-shot input bitstream dumper for offline replay debugging.
+ *
+ * Activates on the first ProcessInput call if the sentinel file
+ * "mft_dump.flag" exists in the working directory.  Writes a small
+ * fixed header (codec kind, width/height/framing/extradata) followed by
+ * length-prefixed AU records to "mft_input_dump.bin".  Stops appending
+ * once kDumpBytesMax (50 MB) is reached so a long playback can't fill
+ * the disk.  No-op when the sentinel is absent — zero cost on the
+ * normal playback path beyond a single fopen probe at first sample.
+ *
+ * On-disk format (little-endian; little-endian dev box matches replay
+ * targets — Linux/ARM/x86 dev boxes are all LE):
+ *
+ *   FileHeader (written once before any AU):
+ *     u32 magic         = 'P','D','K','R' (0x524B4450)  // ASCII "RKDP" reversed
+ *     u32 version       = 1
+ *     u32 codec_kind    = CodecKind (0=H264, 1=HEVC, 2=AV1, 3=VP9)
+ *     u32 length_size   = 0 for ANNEXB, 1/2/4 for AVCC{1,2,4}
+ *     u32 width
+ *     u32 height
+ *     u32 fps_num
+ *     u32 fps_den
+ *     u32 bit_depth
+ *     u32 extradata_annexb_len
+ *     u8  extradata_annexb[extradata_annexb_len]   // SPS+PPS as Annex-B
+ *
+ *   AuRecord (one per ProcessInput):
+ *     u32 magic         = 'U','A','K','R' (0x55414B52)  // ASCII "RKAU" reversed
+ *     u64 sample_no     = samples_received_ at this call (1-based)
+ *     i64 pts_hns
+ *     u32 size
+ *     u8  bytes[size]   // raw AU as received from the host (AVCC- or
+ *                       // Annex-B-framed; replay must use length_size)
+ *
+ * Caller is responsible for holding lock_; this is called from
+ * ProcessInput which already holds it. */
+void DecoderMFT::DumpAuIfActive(const uint8_t *au, size_t au_len, int64_t pts_hns) {
+    if (!dump_checked_) {
+        dump_checked_ = true;
+        FILE *probe = nullptr;
+        if (fopen_s(&probe, "mft_dump.flag", "rb") == 0 && probe) {
+            std::fclose(probe);
+            errno_t e = fopen_s(&dump_file_, "mft_input_dump.bin", "wb");
+            if (e != 0 || !dump_file_) {
+                dump_file_ = nullptr;
+            } else {
+                std::fprintf(stderr,
+                    "rkmpp MFT: dump active → mft_input_dump.bin "
+                    "(cap %zu MB)\n", kDumpBytesMax / (1024 * 1024));
+                std::fflush(stderr);
+                uint32_t magic     = 0x504B4452; /* "RKDP" little-endian */
+                uint32_t version   = 1;
+                uint32_t kind      = (uint32_t)kind_;
+                uint32_t lenSize   = (uint32_t)length_size_;
+                uint32_t w         = (uint32_t)width_;
+                uint32_t h         = (uint32_t)height_;
+                uint32_t fpsN      = (uint32_t)fps_num_;
+                uint32_t fpsD      = (uint32_t)fps_den_;
+                uint32_t bd        = (uint32_t)bit_depth_;
+                uint32_t exLen     = (uint32_t)extradata_annexb_.size();
+                std::fwrite(&magic,   4, 1, dump_file_);
+                std::fwrite(&version, 4, 1, dump_file_);
+                std::fwrite(&kind,    4, 1, dump_file_);
+                std::fwrite(&lenSize, 4, 1, dump_file_);
+                std::fwrite(&w,       4, 1, dump_file_);
+                std::fwrite(&h,       4, 1, dump_file_);
+                std::fwrite(&fpsN,    4, 1, dump_file_);
+                std::fwrite(&fpsD,    4, 1, dump_file_);
+                std::fwrite(&bd,      4, 1, dump_file_);
+                std::fwrite(&exLen,   4, 1, dump_file_);
+                if (exLen) std::fwrite(extradata_annexb_.data(), 1, exLen, dump_file_);
+                dump_bytes_ += 40 + exLen;
+                std::fflush(dump_file_);
+            }
+        }
+    }
+    if (!dump_file_)                   return;
+    if (dump_bytes_ >= kDumpBytesMax)  return;
+    if (au_len == 0)                   return;
+
+    uint32_t magic     = 0x55414B52;  /* "RKAU" little-endian */
+    uint64_t sample_no = samples_received_;
+    uint32_t size      = (uint32_t)au_len;
+    std::fwrite(&magic,     4, 1, dump_file_);
+    std::fwrite(&sample_no, 8, 1, dump_file_);
+    std::fwrite(&pts_hns,   8, 1, dump_file_);
+    std::fwrite(&size,      4, 1, dump_file_);
+    std::fwrite(au,         1, au_len, dump_file_);
+    dump_bytes_ += 24 + au_len;
+    /* Flush per-AU.  At 30 fps × a few KB per AU this is trivial cost
+     * but guarantees the tail of the dump is on disk if mpv hangs or
+     * is force-killed immediately after the wedge — without this, the
+     * last second or so of input could be lost in the OS buffer. */
+    std::fflush(dump_file_);
 }
 
 STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags*/) {
@@ -1048,6 +1170,7 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
             if (FAILED(hr)) return hr;
         }
         samples_received_++;
+        DumpAuIfActive(au.data(), au.size(), (int64_t)pts);
         { char _t[2]; bool _on = GetEnvironmentVariableA("RKMPP_AV1_TRACE", _t, 2) > 0; if (_on) {
             std::fprintf(stderr,
                 "AV1_TRACE pi#%llu pts=%lld bytes=%zu head=",
@@ -1103,6 +1226,7 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
             if (FAILED(hr)) return hr;
         }
         samples_received_++;
+        DumpAuIfActive(au.data(), au.size(), (int64_t)pts);
         const uint8_t *frames[8] = {};
         size_t         fsizes[8] = {};
         int nf = vp9::Vp9Parser_SuperframeSplit(au.data(), au.size(),
@@ -1217,6 +1341,7 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
         if (FAILED(hr)) return hr;
     }
     samples_received_++;
+    DumpAuIfActive(au.data(), au.size(), (int64_t)pts);
 
     /* Per-input trace for diagnosing duplicated/out-of-order MS source
      * reader feeds.  Gated by sentinel `mft_trace.flag` (same gate as

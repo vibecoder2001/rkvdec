@@ -695,9 +695,22 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                    "rkmpp: escalating to FullCoreReset on UID=%u (job %llu)\n",
                    pub.Uid, (unsigned long long)Job->Id);
 
-        if (iommu && iommu->MaskIrq) {
-            iommu->MaskIrq(iommu->Header.Context);
-        }
+        /* iommu->MaskIrq / UnmaskIrq disabled: calling rkiommu_vdec's
+         * WdfInterruptDisable from rkvdec's DPC reset path trips
+         * FAST_FAIL_INVALID_THREAD_REFERENCE (KERNEL_SECURITY_CHECK_FAILURE
+         * subcode 0x28) — KMDF's interrupt validator catches a
+         * cross-device deactivate while our DPC thread still holds an
+         * interrupt-subsystem reference.  See
+         * `wdf_interrupt_disable_cross_device` memory.  The mask was
+         * added defensively to prevent IOMMU fault storms during the
+         * reset window (~µs); the IOMMU rarely fires there, and if it
+         * does its ISR queues a DPC that handles the fault cleanly
+         * without bugcheck.  Re-enable via a software-only mask
+         * (flag inside rkiommu_vdec that its ISR checks) later if the
+         * fault-storm pattern actually shows up.
+         *
+         * if (iommu && iommu->MaskIrq) iommu->MaskIrq(iommu->Header.Context);
+         */
         if (iommu && iommu->Disable) {
             (void)iommu->Disable(iommu->Header.Context);
         }
@@ -719,9 +732,7 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
                 RkMppSetNeedsFullReset(Device);
             }
         }
-        if (iommu && iommu->UnmaskIrq) {
-            iommu->UnmaskIrq(iommu->Header.Context);
-        }
+        /* iommu->UnmaskIrq disabled — see paired MaskIrq note above. */
         (void)reattachOk;
         /* FullCoreReset subsumes the narrow path; clear the narrow flag
          * so the per-job assert/deassert below skips. */

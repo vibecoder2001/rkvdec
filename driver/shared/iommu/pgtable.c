@@ -280,7 +280,16 @@ _Use_decl_annotations_
 VOID RkIommuFreeIova(PRKIOMMU_DOMAIN Domain, ULONG64 Iova, ULONG PageCount)
 {
     const ULONG bitsPerWord = (ULONG)(sizeof(ULONG_PTR) * 8);
+
+    /* Defense-in-depth: ifc-layer validates Iova before reaching us, but
+     * a caller-supplied Iova >= 4 GiB or a PageCount that would walk past
+     * the bitmap end produces an OOB write here.  The IOMMU is 32-bit so
+     * any value >= (RK_IOMMU_IOVA_PAGES << 12) is structurally invalid;
+     * silently no-op rather than corrupting the bitmap. */
+    if (Iova >= ((ULONG64)RK_IOMMU_IOVA_PAGES << 12)) return;
+    if ((Iova & 0xFFFu) != 0) return;
     ULONG startPage = (ULONG)(Iova >> 12);
+    if (PageCount == 0 || startPage > RK_IOMMU_IOVA_PAGES - PageCount) return;
 
     for (ULONG i = 0; i < PageCount; i++) {
         ULONG page = startPage + i;

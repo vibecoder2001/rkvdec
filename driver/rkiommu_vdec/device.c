@@ -51,50 +51,14 @@ static VOID RkIommuSlaveOnMasterQueryRemove(_In_ PVOID ConsumerCtx);
  * Reads _UID via IRP_MN_QUERY_ID(BusQueryInstanceID) (DevicePropertyUINumber
  * is not reliably populated by acpi.sys).
  * --------------------------------------------------------------------------- */
+/* RkIommuReadAcpiId — wrapper for back-compat with existing call sites.
+ * Implementation now lives in driver/shared/acpi_uid.c. */
 static NTSTATUS
 RkIommuReadAcpiId(_In_ WDFDEVICE Device,
                   _Out_ PUINT32 Hid,
                   _Out_ PUINT32 Uid)
 {
-    PDEVICE_OBJECT pdo = WdfDeviceWdmGetPhysicalDevice(Device);
-    WCHAR buf[1024] = {0};
-    ULONG size = 0;
-
-    NTSTATUS status = IoGetDeviceProperty(pdo, DevicePropertyHardwareID,
-                                          sizeof(buf), buf, &size);
-    if (!NT_SUCCESS(status)) return status;
-
-    PCWSTR cursor = buf;
-    while (*cursor) {
-        size_t len = wcslen(cursor);
-        if (len >= 13 &&
-            cursor[0] == L'A' && cursor[1] == L'C' && cursor[2] == L'P' &&
-            cursor[3] == L'I' && cursor[4] == L'\\' &&
-            cursor[5] == L'R' && cursor[6] == L'K' && cursor[7] == L'C' &&
-            cursor[8] == L'P' && cursor[9] == L'3' && cursor[10] == L'5')
-        {
-            UINT32 hid = 0;
-            for (int i = 9; i < 13; i++) {
-                WCHAR  c = cursor[i];
-                UINT32 d;
-                if      (c >= L'0' && c <= L'9') d = (UINT32)(c - L'0');
-                else if (c >= L'a' && c <= L'f') d = 10u + (UINT32)(c - L'a');
-                else if (c >= L'A' && c <= L'F') d = 10u + (UINT32)(c - L'A');
-                else { hid = 0; break; }
-                hid = (hid << 4) | d;
-            }
-            if (hid) {
-                *Hid = hid;
-                /* IRP_MN_QUERY_ID(BusQueryInstanceID) returns the _UID for
-                 * ACPI devices.  DevicePropertyUINumber is not reliably
-                 * populated by acpi.sys, so we use the IRP path. */
-                *Uid = RkSharedQueryAcpiUid(pdo);
-                return STATUS_SUCCESS;
-            }
-        }
-        cursor += len + 1;
-    }
-    return STATUS_INVALID_DEVICE_REQUEST;
+    return RkSharedReadAcpiHidUid(Device, Hid, Uid);
 }
 
 /* ---------------------------------------------------------------------------
@@ -381,7 +345,23 @@ RkIommuSlaveOnMasterArrival(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymLink)
 {
     PRKIOMMU_DEVICE slave = (PRKIOMMU_DEVICE)Ctx;
     if (!slave->IsCodecSlave) return;   /* defensive — not a codec slave */
-    if (slave->MasterOpen) return;      /* already attached */
+
+    /* Bail without touching state if ReleaseHardware has begun teardown.
+     * Without this, a PnP-worker-thread arrival callback can race with
+     * ReleaseHardware: arrival is mid-flight in RkIommuSlaveAttach
+     * (allocating ShadowDomain, assigning Domain) while ReleaseHardware
+     * tears down — resulting in UAF on the slave's freed context.
+     *
+     * Re-check Tearing under StateLock at every commit-state point below;
+     * the early check is just a fast-path. */
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&slave->StateLock, &irql);
+        BOOLEAN tearing = slave->Tearing;
+        BOOLEAN already = slave->MasterOpen;
+        KeReleaseSpinLock(&slave->StateLock, irql);
+        if (tearing || already) return;
+    }
 
     /* Resolve symlink → device object. */
     PFILE_OBJECT fo = NULL;
@@ -434,17 +414,35 @@ RkIommuSlaveOnMasterArrival(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymLink)
                                 RkIommuSlaveOnMasterQueryRemove);
     }
 
-    /* Commit attach state. */
-    slave->MasterIfcCtx       = ifc.Header.Context;
-    slave->MasterUnregisterFn = (PVOID)ifc.UnregisterQueryRemove;
-    slave->MasterFileObj      = fo;
-    slave->MasterOpen         = TRUE;
-    slave->PtAttached         = TRUE;
+    /* Commit attach state under StateLock.  Re-check Tearing in case
+     * ReleaseHardware set it between our early-exit check and now: if
+     * teardown beat us to the lock, undo what we built and bail before
+     * publishing the file-object reference to ReleaseHardware. */
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&slave->StateLock, &irql);
+        if (slave->Tearing) {
+            KeReleaseSpinLock(&slave->StateLock, irql);
+            if (ifc.UnregisterQueryRemove) {
+                ifc.UnregisterQueryRemove(ifc.Header.Context, slave);
+            }
+            RkIommuSlaveDetach(slave);
+            if (ifc.Header.InterfaceDereference)
+                ifc.Header.InterfaceDereference(ifc.Header.Context);
+            ObDereferenceObject(fo);
+            return;
+        }
+        slave->MasterIfcCtx       = ifc.Header.Context;
+        slave->MasterUnregisterFn = (PVOID)ifc.UnregisterQueryRemove;
+        slave->MasterFileObj      = fo;
+        slave->MasterOpen         = TRUE;
+        slave->PtAttached         = TRUE;
+        KeReleaseSpinLock(&slave->StateLock, irql);
+    }
     KeSetEvent(&slave->PtAttachedEvent, IO_NO_INCREMENT, FALSE);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "rkiommu_vdec slave (UID=%u): attached to master PT 0x%08x\n",
-               slave->Uid, pdPhys);
+    RKMPP_LOG_INFO("rkiommu_vdec slave (UID=%u): attached to master PT 0x%08x\n",
+                   slave->Uid, pdPhys);
 }
 
 static VOID
@@ -506,9 +504,8 @@ RkIommuEvtDeviceQueryRemove(_In_ WDFDEVICE Device)
         }
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-               "rkiommu_vdec master (UID=%u): cascade query-remove notified %u consumer(s)\n",
-               ctx->Uid, n);
+    RKMPP_LOG_INFO("rkiommu_vdec master (UID=%u): cascade query-remove "
+                   "notified %u consumer(s)\n", ctx->Uid, n);
     return STATUS_SUCCESS;
 }
 
@@ -535,6 +532,8 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
     ctx->IsCodecSlave = RkMppIsCodecSlaveIommu(ctx->Hid, ctx->Uid);
     KeInitializeEvent(&ctx->PtAttachedEvent, NotificationEvent, FALSE);
     KeInitializeSpinLock(&ctx->ConsumersLock);
+    KeInitializeSpinLock(&ctx->StateLock);
+    ctx->Tearing       = FALSE;
     ctx->ConsumerCount = 0;
     ctx->PtAttached    = FALSE;
 
@@ -677,6 +676,20 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
      * Standalone (non-codec) IOMMUs skip this entirely — they never
      * registered a watch and never opened a master ifc. */
     if (ctx->IsCodecSlave) {
+        /* Set Tearing FIRST so an in-flight OnMasterArrival callback
+         * either bails (if it sees the flag before committing state) or
+         * has finished committing (in which case its MasterOpen=TRUE
+         * makes the teardown below take the normal detach path).  Without
+         * this, RkMppUnwatchPeer can complete while an arrival callback
+         * is still running on a different worker thread.
+         *
+         * The Tearing flag stays TRUE for the rest of ReleaseHardware —
+         * we never re-clear it because the context is being torn down. */
+        KIRQL irql;
+        KeAcquireSpinLock(&ctx->StateLock, &irql);
+        ctx->Tearing = TRUE;
+        KeReleaseSpinLock(&ctx->StateLock, irql);
+
         RkMppUnwatchPeer(&ctx->MasterWatch);
         if (ctx->MasterOpen) {
             /* Direct detach (we're going away — no need to wait for

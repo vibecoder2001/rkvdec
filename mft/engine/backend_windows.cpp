@@ -68,7 +68,8 @@ static int OpenDevice(HANDLE *out, DecodeEngineCodec codec) {
         DWORD got = 0;
         if (DeviceIoControl(h, IOCTL_RKMPP_GET_CAPS, nullptr, 0,
                             &caps, sizeof(caps), &got, nullptr) &&
-            caps.Hid == 0x3550 && (caps.SupportedCodecs & want_codec)) {
+            caps.Hid == RKMPP_HID_RKCP3550 &&
+            (caps.SupportedCodecs & want_codec)) {
             *out = h;
             SetupDiDestroyDeviceInfoList(set);
             return 0;

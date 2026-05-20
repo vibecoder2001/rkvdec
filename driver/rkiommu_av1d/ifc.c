@@ -90,11 +90,14 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
 
         /* Verify physical address fits in 32-bit IOMMU space */
         if ((phys >> 32) != 0) {
-            /* Roll back already-mapped pages */
+            /* Roll back already-mapped pages.  RkIommuFreeIova must run
+             * unconditionally — i==0 still leaves the IOVA range
+             * allocated by RkIommuAllocIova above, and skipping the free
+             * leaks IOVA-space until the bitmap is exhausted (DoS). */
             if (i > 0) {
                 RkIommuUnmapAt(dev->Domain, baseIova, i);
-                RkIommuFreeIova(dev->Domain, baseIova, pageCount);
             }
+            RkIommuFreeIova(dev->Domain, baseIova, pageCount);
             KeReleaseSpinLock(&dev->Domain->Lock, irql);
             return STATUS_INVALID_PARAMETER;
         }
@@ -137,6 +140,15 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     if (!dev) return STATUS_DEVICE_NOT_READY;
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
+
+    /* Reject Iova that can't possibly be ours before any state access:
+     * the IOMMU is 32-bit so Iova >= 4 GiB is structurally invalid, and
+     * a non-page-aligned Iova is a misuse / attack.  Without these guards
+     * the startPage / bitsPerWord index walks OOB on IovaStartBitmap. */
+    if (Iova >= ((ULONG64)RK_IOMMU_IOVA_PAGES << 12))
+        return STATUS_INVALID_PARAMETER;
+    if ((Iova & 0xFFFu) != 0)
+        return STATUS_INVALID_PARAMETER;
 
     /* See rkiommu_vdec/ifc.c for the bounded-walk rationale.  AV1D
      * domain has the same shared-bitmap-over-Domain shape and the same

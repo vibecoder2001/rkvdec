@@ -73,6 +73,13 @@ typedef struct _RKMPP_JOB {
      * for the next inter-frame's CDF seed.  Needs dc ivac before user-
      * mode read, same as OutputFrameMdl. */
     PMDL            AuxOutputMdl;
+
+    /* OrphanOnComplete — set TRUE under queue lock by a caller that has
+     * given up waiting (drainer timeout, WAIT_JOB timeout).  When the
+     * natural completion path eventually fires, RkMppJobComplete sees
+     * the flag, skips the Completed-list insert, frees the job, and
+     * returns.  Prevents per-timeout RKMPP_JOB leak on abandoned waits. */
+    BOOLEAN         OrphanOnComplete;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------

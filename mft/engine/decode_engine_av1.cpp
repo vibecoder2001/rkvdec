@@ -132,7 +132,8 @@ static int OpenAv1Device(HANDLE *out) {
         DWORD got = 0;
         if (DeviceIoControl(h, IOCTL_RKMPP_GET_CAPS, nullptr, 0,
                             &caps, sizeof(caps), &got, nullptr) &&
-            caps.Hid == 0x3560 && (caps.SupportedCodecs & RKMPP_CODEC_AV1)) {
+            caps.Hid == RKMPP_HID_RKCP3560 &&
+            (caps.SupportedCodecs & RKMPP_CODEC_AV1)) {
             *out = h;
             rc = 0;
             break;

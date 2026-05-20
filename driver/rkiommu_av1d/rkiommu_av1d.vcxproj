@@ -59,7 +59,6 @@
     <ClCompile Include="device.c" />
     <ClCompile Include="ifc.c" />
     <ClCompile Include="fault.c" />
-    <ClCompile Include="topology.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
     <ClCompile Include="..\shared\iommu\pgtable.c" />
     <Inf Include="rkiommu_av1d.inx" />

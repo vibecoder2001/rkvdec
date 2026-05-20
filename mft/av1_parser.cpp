@@ -1252,12 +1252,21 @@ static int parse_frame_hdr(BitReader &r,
                 fgd.scaling_shift = (int)br_u(r, 2) + 8;
                 fgd.ar_coeff_lag  = (int)br_u(r, 2);
                 int num_y_pos = 2 * fgd.ar_coeff_lag * (fgd.ar_coeff_lag + 1);
+                /* Defensive bound: dav1d's ar_coeffs_y[] is sized 24,
+                 * ar_coeffs_uv[2][25+3] (padding).  With ar_coeff_lag's
+                 * 2-bit range, num_y_pos is at most 24 and num_uv at
+                 * most 25 — both fit.  This assert guards against a
+                 * future widening of the field silently corrupting
+                 * adjacent struct memory.
+                 * See [[critical_av1_filmgrain_bound]]. */
+                if (num_y_pos < 0 || num_y_pos > 24) return -1;
                 if (fgd.num_y_points)
                     for (int i = 0; i < num_y_pos; i++)
                         fgd.ar_coeffs_y[i] = (int8_t)((int)br_u(r, 8) - 128);
                 for (int pl = 0; pl < 2; pl++) {
                     if (fgd.num_uv_points[pl] || fgd.chroma_scaling_from_luma) {
                         int num_uv = num_y_pos + !!fgd.num_y_points;
+                        if (num_uv < 0 || num_uv > 25) return -1;
                         for (int i = 0; i < num_uv; i++)
                             fgd.ar_coeffs_uv[pl][i] = (int8_t)((int)br_u(r, 8) - 128);
                         if (!fgd.num_y_points)

@@ -15,8 +15,9 @@
  *
  * TODO (Phase 3): When multiple clients exist, translate ClientCookie to
  *   (ClientHid, ClientUid) by walking up to the PDO and reading
- *   DevicePropertyHardwareID, then call RkIommuLookupBinding to find the
- *   correct IOMMU instance from the global g_deviceList.
+ *   DevicePropertyHardwareID, then look up the correct IOMMU instance
+ *   from the global g_deviceList directly (the dedicated topology.c
+ *   helper has been removed as unreachable dead code).
  *
  * ZAP_CACHE:
  *   After each RkIommuMapAt / RkIommuUnmapAt call we issue RK_MMU_CMD_ZAP_CACHE
@@ -134,11 +135,14 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
 
         /* Verify physical address fits in 32-bit IOMMU space */
         if ((phys >> 32) != 0) {
-            /* Roll back already-mapped pages */
+            /* Roll back already-mapped pages.  RkIommuFreeIova must run
+             * unconditionally — i==0 still leaves the IOVA range
+             * allocated by RkIommuAllocIova above, and skipping the free
+             * leaks IOVA-space until the bitmap is exhausted (DoS). */
             if (i > 0) {
                 RkIommuUnmapAt(dev->Domain, baseIova, i);
-                RkIommuFreeIova(dev->Domain, baseIova, pageCount);
             }
+            RkIommuFreeIova(dev->Domain, baseIova, pageCount);
             KeReleaseSpinLock(&dev->Domain->Lock, irql);
             return STATUS_INVALID_PARAMETER;
         }
@@ -196,6 +200,15 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     if (!dev->IsMaster) return STATUS_NOT_SUPPORTED;
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
+
+    /* Reject Iova that can't possibly be ours before any state access:
+     * the IOMMU is 32-bit so Iova >= 4 GiB is structurally invalid, and
+     * a non-page-aligned Iova is a misuse / attack.  Without these guards
+     * the startPage / bitsPerWord index walks OOB on IovaStartBitmap. */
+    if (Iova >= ((ULONG64)RK_IOMMU_IOVA_PAGES << 12))
+        return STATUS_INVALID_PARAMETER;
+    if ((Iova & 0xFFFu) != 0)
+        return STATUS_INVALID_PARAMETER;
 
     /* Determine how many pages are mapped at this IOVA.  We reconstruct
      * the original allocation size by counting consecutive set bits in

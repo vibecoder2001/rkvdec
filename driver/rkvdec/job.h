@@ -98,6 +98,16 @@ typedef struct _RKMPP_JOB {
      * decrement.  0 = local (RVD0), 1 = peer (RVD1).  Phase 1
      * default value 0 keeps single-core semantics. */
     UINT32          TargetCore;
+
+    /* OrphanOnComplete — set TRUE under queue lock by a caller that has
+     * given up waiting (drainer timeout, WAIT_JOB timeout, RunForeign
+     * timeout).  When the natural completion path (ISR/DPC, peer
+     * completion) eventually fires, RkMppJobComplete /
+     * RkMppPeerCompletion observe the flag, skip the Completed-list
+     * insert (no one will dequeue it), free the job, and return.
+     * Without this, abandoned jobs accumulate on Completed forever —
+     * a non-paged-pool DoS once IOCTL is reachable from non-admin. */
+    BOOLEAN         OrphanOnComplete;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------

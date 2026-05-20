@@ -20,6 +20,15 @@ typedef struct _RKMPP_CAPS {
     UINT32 Reserved[8];
 } RKMPP_CAPS, *PRKMPP_CAPS;
 
+/* Hardware-identifier constants for the RKMPP_CAPS.Hid field.  These
+ * match the ACPI _HID assignments for the RK3588 video subsystem.
+ * Code that opens a specific codec should test the symbolic constant
+ * instead of the bare hex literal so that a future SoC variant can
+ * be added in one place rather than across mft/, shared/, and the
+ * .INF files.  See [[rkcp35xx_hid_map]]. */
+#define RKMPP_HID_RKCP3550 0x3550u   /* rkvdec2 (H.264 / H.265 / VP9) */
+#define RKMPP_HID_RKCP3560 0x3560u   /* rkav1d  (AV1) */
+
 /* SupportedCodecs bits */
 #define RKMPP_CODEC_H264   (1u << 0)
 #define RKMPP_CODEC_HEVC   (1u << 1)

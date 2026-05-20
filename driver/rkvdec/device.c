@@ -990,52 +990,12 @@ RkMppEvtDeviceContextCleanup(_In_ WDFOBJECT Device)
  * `PRP0001` and any compatible IDs). Walk the multi-sz list and pick the
  * first one starting with "ACPI\\RKCP35".
  */
+/* RkMppReadAcpiId — wrapper for back-compat with existing call sites.
+ * Implementation now lives in driver/shared/acpi_uid.c. */
 static NTSTATUS RkMppReadAcpiId(_In_ WDFDEVICE Device,
                                 _Out_ PUINT32 Hid, _Out_ PUINT32 Uid)
 {
-    PDEVICE_OBJECT pdo = WdfDeviceWdmGetPhysicalDevice(Device);
-    WCHAR buf[1024] = {0};
-    ULONG size = 0;
-
-    NTSTATUS status = IoGetDeviceProperty(pdo, DevicePropertyHardwareID,
-                                          sizeof(buf), buf, &size);
-    if (!NT_SUCCESS(status)) return status;
-
-    /* Walk the multi-sz looking for an entry starting "ACPI\\RKCP35". */
-    PCWSTR cursor = buf;
-    while (*cursor) {
-        size_t len = wcslen(cursor);
-        if (len >= 13) {
-            if (cursor[0] == L'A' && cursor[1] == L'C' && cursor[2] == L'P' &&
-                cursor[3] == L'I' && cursor[4] == L'\\' &&
-                cursor[5] == L'R' && cursor[6] == L'K' && cursor[7] == L'C' &&
-                cursor[8] == L'P' && cursor[9] == L'3' && cursor[10] == L'5')
-            {
-                /* Last 4 hex chars from the ID. */
-                UINT32 hid = 0;
-                for (int i = 9; i < 13; i++) {
-                    WCHAR c = cursor[i];
-                    UINT32 d;
-                    if (c >= L'0' && c <= L'9') d = c - L'0';
-                    else if (c >= L'a' && c <= L'f') d = 10 + (c - L'a');
-                    else if (c >= L'A' && c <= L'F') d = 10 + (c - L'A');
-                    else { hid = 0; break; }
-                    hid = (hid << 4) | d;
-                }
-                if (hid) { *Hid = hid; goto got_hid; }
-            }
-        }
-        cursor += len + 1;
-    }
-    return STATUS_INVALID_DEVICE_REQUEST;
-
-got_hid:;
-    /* Read _UID via IRP_MN_QUERY_ID (BusQueryInstanceID).  For ACPI bus the
-     * instance ID is the _UID formatted as a decimal string (e.g. "0", "9").
-     * acpi.sys does NOT populate DEVICE_CAPABILITIES.UINumber from _UID
-     * reliably, so DevicePropertyUINumber returns 0 for every device. */
-    *Uid = RkSharedQueryAcpiUid(pdo);
-    return STATUS_SUCCESS;
+    return RkSharedReadAcpiHidUid(Device, Hid, Uid);
 }
 
 /* EvtFileCreate is WDF_NO_EVENT_CALLBACK; the file context memory is

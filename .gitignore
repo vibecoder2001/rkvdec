@@ -39,3 +39,15 @@ tests/data/streams_h265/
 # FATE samples (downloaded — license / large binaries)
 tests/data/fate_h264/
 tests/data/fate_h265/
+
+# Build-log artifacts left at repo root by Windows build scripts
+/build_out*.txt
+/build_output.txt
+/build_all.log
+/build_rebuild.txt
+/build_verbose.txt
+# Ad-hoc helper batch scripts that aren't part of the canonical build
+/build_all_check.bat
+/build_iommu_only.bat
+# Stray colon-escape-encoded artifact (cannot delete via tools; ignore)
+/C*Usersvibecoderrkvdecbuild_out.txt

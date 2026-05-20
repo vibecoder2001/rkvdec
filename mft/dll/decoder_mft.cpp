@@ -315,6 +315,19 @@ STDMETHODIMP DecoderMFT::SetInputType(DWORD id, IMFMediaType *type, DWORD flags)
     UINT32 w = 0, h = 0;
     if (FAILED(MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h)) || !w || !h)
         return MF_E_INVALIDMEDIATYPE;
+    /* Bound dimensions before they flow into allocation math.  The
+     * rkvdec hardware accepts up to 8192x8192 (well, less in practice
+     * but 8K-wide is the silicon ceiling); reject anything larger so
+     * `width_ * height_ * 3 / 2 * bytes_per_sample` (decoder_mft.cpp
+     * ~line 606) cannot overflow uint32 with attacker-influenced
+     * MF_MT_FRAME_SIZE values.  Also reject odd dimensions — D3D11
+     * NV12/P010 textures require even width and height; without this
+     * check, an odd-height type passes here and the UpdateSubresource
+     * upload writes past the texture's UV plane (height/2 rows).
+     * See [[critical_mft_dim_overflow]]. */
+    constexpr UINT32 kMaxDim = 8192u;
+    if (w > kMaxDim || h > kMaxDim) return MF_E_INVALIDMEDIATYPE;
+    if ((w | h) & 1u)               return MF_E_INVALIDMEDIATYPE;
 
     UINT32 fn = 30, fd = 1;
     /* Framerate is informational; don't fail if absent. */
@@ -1067,16 +1080,37 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
 void DecoderMFT::DumpAuIfActive(const uint8_t *au, size_t au_len, int64_t pts_hns) {
     if (!dump_checked_) {
         dump_checked_ = true;
-        FILE *probe = nullptr;
-        if (fopen_s(&probe, "mft_dump.flag", "rb") == 0 && probe) {
-            std::fclose(probe);
-            errno_t e = fopen_s(&dump_file_, "mft_input_dump.bin", "wb");
+        /* The dump mechanism writes the raw bitstream — including any
+         * DRM-decrypted content delivered to us — to a path the host
+         * implicitly trusts.  Require an explicit absolute path via
+         * env var RKMPP_DUMP_PATH; ignore the legacy sentinel-in-CWD
+         * pattern so a malicious or hostile host can't activate it.
+         * See [[critical_mft_dump_unsanitized]]. */
+        char dumpPath[1024] = {0};
+        DWORD got = GetEnvironmentVariableA("RKMPP_DUMP_PATH",
+                                            dumpPath, sizeof(dumpPath));
+        if (got == 0 || got >= sizeof(dumpPath)) return;   /* dump disabled */
+        /* Require an absolute path (drive-letter prefix or UNC).  Reject
+         * relative paths so a process-launch CWD can't redirect us. */
+        bool absoluteOk = false;
+        if (got >= 3 &&
+            ((dumpPath[0] >= 'A' && dumpPath[0] <= 'Z') ||
+             (dumpPath[0] >= 'a' && dumpPath[0] <= 'z')) &&
+            dumpPath[1] == ':' &&
+            (dumpPath[2] == '\\' || dumpPath[2] == '/')) {
+            absoluteOk = true;
+        } else if (got >= 2 && dumpPath[0] == '\\' && dumpPath[1] == '\\') {
+            absoluteOk = true;
+        }
+        if (!absoluteOk) return;
+        {
+            errno_t e = fopen_s(&dump_file_, dumpPath, "wb");
             if (e != 0 || !dump_file_) {
                 dump_file_ = nullptr;
             } else {
                 std::fprintf(stderr,
-                    "rkmpp MFT: dump active → mft_input_dump.bin "
-                    "(cap %zu MB)\n", kDumpBytesMax / (1024 * 1024));
+                    "rkmpp MFT: dump active → %s "
+                    "(cap %zu MB)\n", dumpPath, kDumpBytesMax / (1024 * 1024));
                 std::fflush(stderr);
                 uint32_t magic     = 0x504B4452; /* "RKDP" little-endian */
                 uint32_t version   = 1;
@@ -1163,6 +1197,15 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
             BYTE *p = nullptr; DWORD cur = 0, max = 0;
             hr = buf->Lock(&p, &max, &cur);
             if (SUCCEEDED(hr)) {
+                /* MF buffer contract says cur <= max; a buggy/hostile
+                 * source can violate it.  Without this check, the
+                 * insert reads `cur` bytes past the locked region.
+                 * See [[critical_mft_buf_len_unchecked]]. */
+                if (cur > max) {
+                    buf->Unlock();
+                    buf->Release();
+                    return MF_E_INVALID_STREAM_DATA;
+                }
                 au.insert(au.end(), p, p + cur);
                 buf->Unlock();
             }
@@ -1219,6 +1262,11 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
             BYTE *p = nullptr; DWORD cur = 0, max = 0;
             hr = mfb->Lock(&p, &max, &cur);
             if (SUCCEEDED(hr)) {
+                if (cur > max) {
+                    mfb->Unlock();
+                    mfb->Release();
+                    return MF_E_INVALID_STREAM_DATA;
+                }
                 au.insert(au.end(), p, p + cur);
                 mfb->Unlock();
             }
@@ -1334,6 +1382,11 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
         BYTE *p = nullptr; DWORD cur = 0, max = 0;
         hr = buf->Lock(&p, &max, &cur);
         if (SUCCEEDED(hr)) {
+            if (cur > max) {
+                buf->Unlock();
+                buf->Release();
+                return MF_E_INVALID_STREAM_DATA;
+            }
             au.insert(au.end(), p, p + cur);
             buf->Unlock();
         }

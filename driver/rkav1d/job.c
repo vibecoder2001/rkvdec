@@ -305,26 +305,21 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
             *InFlightTimedOut = TRUE;
             RKMPP_LOG_WARN(
                        "rkav1d: file-cleanup in-flight wait timed out\n");
-            /* Sever the in-flight job's references to the buffer-pool
-             * MDLs before the caller (EvtFileCleanup) runs BufFreeAll.
-             * The poller is still alive and will eventually call
-             * JobComplete, which dereferences these MDLs in
-             * KeFlushIoBuffers.  JobComplete already null-checks each
-             * field; q->Lock serializes against its acquisition of the
-             * same lock around the flushes. */
+            /* Sever MDL refs AND mark orphan so the eventual natural
+             * completion (poller-driven JobComplete) frees the job
+             * memory instead of inserting it into Completed where it
+             * would leak indefinitely.  Without OrphanOnComplete every
+             * abandoned drain leaked one RKMPP_JOB — a DoS vector once
+             * IOCTL is non-admin.  See [[critical_drainer_leak]]. */
             KeAcquireSpinLock(&q->Lock, &old);
             if (q->InFlight == inFlight && inFlight->Owner == File) {
                 inFlight->OutputFrameMdl    = NULL;
                 inFlight->InternalOutputMdl = NULL;
                 inFlight->AuxOutputMdl      = NULL;
+                inFlight->OrphanOnComplete  = TRUE;
             }
             KeReleaseSpinLock(&q->Lock, old);
-            /* Don't free the in-flight job here — the poller still owns
-             * it and will eventually move it to Completed.  Leaking the
-             * struct is acceptable; the alternative (freeing while the
-             * poller holds a pointer) is a use-after-free.  In practice
-             * the next decode session triggers a core reset which
-             * unblocks the wedged poll. */
+            RkMppSetNeedsCoreReset(Device);
         } else {
             /* In-flight completed cleanly.  It's now on the Completed
              * list — pull it off so it doesn't leak waiting for a
@@ -890,7 +885,7 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
 
     /* BSP parity: only request a reset when an error/timeout was observed.
      * Plus we treat NTSTATUS failure as an error. */
-    if (!NT_SUCCESS(Result) || (HardwareStatus & 0xF0u)) {
+    if (!NT_SUCCESS(Result) || (HardwareStatus & g_ops.IntErrorMask)) {
         RkMppSetNeedsCoreReset(Device);
 
         /* Charge the error to the file-object that submitted this job so
@@ -927,9 +922,16 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
                          /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
     }
 
-    /* Move from InFlight to Completed. */
+    /* Orphan check — caller has abandoned this job (drainer/wait
+     * timeout).  Skip Completed-list insert and arrange to free after
+     * the lock release; without this, abandoned jobs leak forever. */
+    BOOLEAN orphan = job->OrphanOnComplete;
+
+    /* Move from InFlight to Completed (unless orphan). */
     q->InFlight = NULL;
-    InsertTailList(&q->Completed, &job->Link);
+    if (!orphan) {
+        InsertTailList(&q->Completed, &job->Link);
+    }
 
     /* Signal the waiter before we potentially start the next job. */
     KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
@@ -958,6 +960,11 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     if (next) {
         RkMppJobStart(Device, next);
     }
+
+    /* Free orphan job after kicking the next one. */
+    if (orphan) {
+        ExFreePoolWithTag(job, 'JppM');
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -974,6 +981,26 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     if (In->RegWriteCount > RKMPP_MAX_REG_WRITES ||
         In->BufRefCount   > RKMPP_MAX_BUF_REFS) {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Reject submissions lacking the codec's kick bit (test/peek-only
+     * pattern).  Such jobs synchronously complete inside JobKickInner
+     * → JobComplete → next-promote → JobKickInner — unbounded if the
+     * caller queues many.  Kernel stack overflow vector.  Legitimate
+     * AV1 decode always has the kick bit set on KickRegOffset; "peek
+     * post-mortem reg state" is what PEEK is for.
+     * See [[critical_kick_recursion]]. */
+    {
+        BOOLEAN hasKick = FALSE;
+        for (UINT32 i = 0; i < In->RegWriteCount; i++) {
+            const RKMPP_REG_WRITE *w = &In->Writes[i];
+            if (w->Offset == AV1D_REG_KICK_OFFSET &&
+                (w->Value & AV1D_REG_KICK_BIT)) {
+                hasKick = TRUE;
+                break;
+            }
+        }
+        if (!hasKick) return STATUS_INVALID_PARAMETER;
     }
 
     /* Allocate the job from NonPagedPool — it must be accessible at
@@ -1364,6 +1391,10 @@ RkMppJobWait(_In_ WDFDEVICE Device,
                            "rkav1d: WAIT_JOB timeout on InFlight job %llu — "
                            "leaving attached for poller completion\n",
                            (unsigned long long)job->Id);
+                /* Mark orphan so the poller-driven completion frees the
+                 * job instead of moving it to Completed (caller has
+                 * given up the JobId). */
+                job->OrphanOnComplete = TRUE;
             }
             KeReleaseSpinLock(&q->Lock, oldIrql);
 

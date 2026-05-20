@@ -17,13 +17,24 @@ struct BitReader {
     const uint8_t *data;
     size_t         len;     /* in bytes */
     size_t         bit_pos; /* current absolute bit offset */
+    /* Sticky error flag — set by any read that detected an EOF, an
+     * Exp-Golomb leading-zero run >= 32, or other malformed input.
+     * Callers should check br_failed(br) after a parse routine and
+     * reject the unit; without this, br_ue's silent clamp-to-0 lets
+     * the parser sail past malformed inputs with a poisoned-zero
+     * value that the regbuilder then trusts.
+     * See [[parser_eg_error_propagation]]. */
+    bool           failed;
 };
 
 static void br_init(BitReader *br, const uint8_t *data, size_t len) {
     br->data = data;
     br->len  = len;
     br->bit_pos = 0;
+    br->failed = false;
 }
+
+static inline bool br_failed(const BitReader *br) { return br->failed; }
 
 static int br_eof(const BitReader *br) {
     return br->bit_pos >= br->len * 8;
@@ -69,11 +80,14 @@ static uint32_t br_u(BitReader *br, int n) {
 
 static int br_u1(BitReader *br) { return (int)br_u(br, 1); }
 
-/* Unsigned Exp-Golomb. */
+/* Unsigned Exp-Golomb.  On malformed input (EOF mid-prefix or
+ * leading-zero run >= 32), latches br->failed and returns 0 — callers
+ * that have already checked failed don't re-set on every return. */
 static uint32_t br_ue(BitReader *br) {
     int zeros = 0;
     while (!br_eof(br) && br_u1(br) == 0) zeros++;
-    if (zeros >= 32) return 0;          /* malformed; clamp */
+    if (br_eof(br) && zeros > 0) { br->failed = true; return 0; }
+    if (zeros >= 32) { br->failed = true; return 0; }
     uint32_t suffix = br_u(br, zeros);
     return ((1u << zeros) - 1) + suffix;
 }
@@ -389,8 +403,22 @@ static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps,
     }
     sps->max_num_ref_frames = (uint8_t)br_ue(br);
     if (br_u1(br)) sps->flags |= V4L2_H264_SPS_FLAG_GAPS_IN_FRAME_NUM_VALUE_ALLOWED;
-    sps->pic_width_in_mbs_minus1        = (uint16_t)br_ue(br);
-    sps->pic_height_in_map_units_minus1 = (uint16_t)br_ue(br);
+    {
+        /* Bound width/height before silent uint16 truncation.  Without
+         * this gate, an SPS with `pic_width_in_mbs_minus1 = 0x10000`
+         * truncates to 0, the regbuilder computes a tiny stride yet the
+         * codec is told the actual stream is bigger, and the kernel's
+         * iova-substitution writes attacker-controlled MMIO values.
+         * Reject any resolution beyond hardware capability (8192x8192;
+         * mbs are 16 luma samples → 512x512 mbs).  See
+         * [[critical_h264_dim_bound]]. */
+        uint32_t w_mbs = br_ue(br);
+        uint32_t h_mbs = br_ue(br);
+        constexpr uint32_t kMaxMbs = 512u - 1u;
+        if (w_mbs > kMaxMbs || h_mbs > kMaxMbs) return H264_PARSE_INVALID;
+        sps->pic_width_in_mbs_minus1        = (uint16_t)w_mbs;
+        sps->pic_height_in_map_units_minus1 = (uint16_t)h_mbs;
+    }
     int frame_mbs_only = br_u1(br);
     if (frame_mbs_only) sps->flags |= V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY;
     if (!frame_mbs_only) {
@@ -419,6 +447,10 @@ static H264ParseStatus parse_sps(BitReader *br, struct v4l2_ctrl_h264_sps *sps,
                              out_vui_colour);
     }
 
+    /* Surface any latched malformed-bitstream condition from br_ue's
+     * silent-clamp path so the caller doesn't trust a poisoned-zero
+     * field that flows into the regbuilder. */
+    if (br_failed(br)) return H264_PARSE_INVALID;
     return H264_PARSE_OK;
 }
 
@@ -523,6 +555,7 @@ static H264ParseStatus parse_pps(BitReader *br, struct v4l2_ctrl_h264_pps *pps,
     } else {
         pps->second_chroma_qp_index_offset = pps->chroma_qp_index_offset;
     }
+    if (br_failed(br)) return H264_PARSE_INVALID;
     return H264_PARSE_OK;
 }
 

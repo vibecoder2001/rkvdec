@@ -349,30 +349,28 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
             *InFlightTimedOut = TRUE;
             RKMPP_LOG_WARN(
                        "rkmpp: file-cleanup in-flight wait timed out\n");
-            /* Sever all in-flight jobs' references to the buffer-pool MDLs
-             * before the caller (EvtFileCleanup) runs BufFreeAll.  The
-             * poller is still alive and will eventually call JobComplete,
-             * which dereferences OutputFrameMdl / ColmvCurMdl in
-             * KeFlushIoBuffers.  Without this clear, those flushes hit
-             * freed MDL memory → bugcheck.  JobComplete already null-checks
-             * both fields and skips the flush; taking q->Lock here
-             * serializes against its acquisition of the same lock around
-             * the flushes. */
+            /* Sever in-flight jobs' MDL refs AND mark them orphan so the
+             * eventual natural completion (poller-driven JobComplete or
+             * peer completion DPC) frees the job memory rather than
+             * inserting it into the Completed list where it would leak
+             * indefinitely.  Without OrphanOnComplete, every abandoned
+             * drain accumulated an RKMPP_JOB (~5 KB) of non-paged pool
+             * that nothing ever dequeued — a DoS vector once the IOCTL
+             * surface is non-admin.  See [[critical_drainer_leak]]. */
             KeAcquireSpinLock(&q->Lock, &old);
             for (ULONG c = 0; c < q->CoreCount; c++) {
                 RKMPP_JOB *jf = q->InFlightPerCore[c];
                 if (jf && jf->Owner == File) {
-                    jf->OutputFrameMdl = NULL;
-                    jf->ColmvCurMdl    = NULL;
+                    jf->OutputFrameMdl   = NULL;
+                    jf->ColmvCurMdl      = NULL;
+                    jf->OrphanOnComplete = TRUE;
                 }
             }
             KeReleaseSpinLock(&q->Lock, old);
-            /* Don't free the in-flight jobs here — the poller still owns
-             * them and will eventually move them to Completed.  Leaking the
-             * structs is acceptable; the alternative (freeing while the
-             * poller holds a pointer) is a use-after-free.  In practice
-             * the next decode session triggers a core reset which
-             * unblocks the wedged poll. */
+            /* Escalate to a wide reset on the next idle window so the
+             * wedged hardware unblocks the poller (which then runs
+             * JobComplete, sees OrphanOnComplete, and frees). */
+            RkMppSetNeedsFullReset(Device);
             break;   /* Stop looping after timeout; caller handles force-reset. */
         }
 
@@ -1027,26 +1025,49 @@ NTSTATUS RkMppJobRunForeign(_In_ WDFDEVICE Device,
 
     JobKickLocalInner(Device, job);
 
-    /* Wait for completion.  Codec watchdog will eventually fire if
-     * something goes wrong, surfacing as STATUS_IO_TIMEOUT in
-     * job->Result.  No additional timeout here. */
-    KeWaitForSingleObject(&job->Done, Executive, KernelMode, FALSE, NULL);
+    /* Wait for completion with a bounded timeout (5 s) — long enough
+     * that real decode latencies never trip it, short enough that a
+     * silently-wedged codec doesn't pin the system worker thread
+     * forever.  Without a timeout, a stale-cookie peer-completion
+     * scenario can leave this thread blocked indefinitely, exhausting
+     * IoAllocateWorkItem slots and starving the system.  See
+     * [[critical_foreign_infinite_wait]]. */
+    LARGE_INTEGER fto;
+    fto.QuadPart = -((LONGLONG)5000 * 10000LL);   /* 5 s, relative */
+    NTSTATUS w = KeWaitForSingleObject(
+        &job->Done, Executive, KernelMode, FALSE, &fto);
 
-    NTSTATUS res = job->Result;
-    UINT32   hw  = job->HardwareStatus;
+    NTSTATUS res;
+    UINT32   hw;
+    BOOLEAN  freedHere;
 
-    /* RkMppJobComplete moved job to Completed list and set job->Done.
-     * Remove it from Completed before freeing — it was inserted there
-     * by RkMppJobComplete and no WaitJob caller will ever dequeue it
-     * (foreign jobs have no Owner to wait on them). */
     KeAcquireSpinLock(&q->Lock, &irql);
-    RemoveEntryList(&job->Link);
-    KeReleaseSpinLock(&q->Lock, irql);
+    if (w == STATUS_TIMEOUT) {
+        /* Hardware never signalled.  Mark orphan so that if a stale
+         * completion DPC finally fires it frees the job instead of
+         * accessing freed memory.  We do NOT free here — JobComplete
+         * still owns the Done event reference until the DPC runs.
+         * Escalate to FullCoreReset so the next idle window unwedges
+         * the codec.  Synthesize a failure result for the caller. */
+        job->OrphanOnComplete = TRUE;
+        res = (NTSTATUS)0xC0000507L;   /* STATUS_IO_TIMEOUT */
+        hw  = 0;
+        freedHere = FALSE;
+        KeReleaseSpinLock(&q->Lock, irql);
+        RkMppSetNeedsFullReset(Device);
+    } else {
+        res = job->Result;
+        hw  = job->HardwareStatus;
+        /* JobComplete moved job to Completed.  Remove + free. */
+        RemoveEntryList(&job->Link);
+        KeReleaseSpinLock(&q->Lock, irql);
+        freedHere = TRUE;
+    }
 
-    ExFreePoolWithTag(job, 'gFKR');
+    if (freedHere) ExFreePoolWithTag(job, 'gFKR');
 
     if (Cb) Cb(CbCtx, CompletionCookie, res, hw);
-    return STATUS_SUCCESS;
+    return (w == STATUS_TIMEOUT) ? (NTSTATUS)0xC0000507L : STATUS_SUCCESS;
 }
 
 /* -----------------------------------------------------------------------
@@ -1294,7 +1315,7 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     /* BSP parity: only request a reset when an error/timeout was observed.
      * RKVDEC_INT_ERROR_MASK = COLMV_REF_ERR | BUF_EMPTY | TIMEOUT | ERROR_STA
      * = bits 4,5,6,7.  Plus we treat NTSTATUS failure as an error. */
-    BOOLEAN failed = (!NT_SUCCESS(Result) || (HardwareStatus & 0xF0u));
+    BOOLEAN failed = (!NT_SUCCESS(Result) || (HardwareStatus & g_ops.IntErrorMask));
     if (failed) {
         /* 2-tier escalation, BSP-aligned:
          *
@@ -1363,8 +1384,16 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
         KeFlushIoBuffers(job->ColmvCurMdl,
                          /*ReadOperation*/ TRUE, /*DmaOperation*/ TRUE);
     }
-    /* Move from InFlight to Completed. */
-    InsertTailList(&q->Completed, &job->Link);
+    /* Orphan check — caller has abandoned this job (drainer/wait/foreign
+     * timeout).  Skip Completed-list insert (nobody will dequeue it) and
+     * arrange to free it after we release the lock.  Done is still set
+     * for any waiter that happens to hold a reference via the queue. */
+    BOOLEAN orphan = job->OrphanOnComplete;
+
+    if (!orphan) {
+        /* Move from InFlight to Completed. */
+        InsertTailList(&q->Completed, &job->Link);
+    }
 
     /* Signal the waiter before we potentially start the next job. */
     KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
@@ -1403,6 +1432,12 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
                 ccu->GateRvdec1LeafClocks(ccu->Header.Context);
             }
         }
+    }
+
+    /* Free orphan job out-of-lock (DISPATCH-safe).  Done before promote
+     * dispatch so a back-to-back completion doesn't pile up references. */
+    if (orphan) {
+        ExFreePoolWithTag(job, 'JppM');
     }
 
     KickPromotions(Device, q, promos, nPromos);
@@ -1449,7 +1484,7 @@ VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
 
     /* Charge errors to Owner for FileCleanup escalation, mirroring
      * RkMppJobComplete's error-attribution logic. */
-    BOOLEAN failed = (!NT_SUCCESS(JobStatus) || (HardwareStatus & 0xF0u));
+    BOOLEAN failed = (!NT_SUCCESS(JobStatus) || (HardwareStatus & g_ops.IntErrorMask));
     if (failed && job->Owner) {
         PRKMPP_FILE_CTX fctx = RkMppFileGet(job->Owner);
         if (fctx) InterlockedIncrement(&fctx->ErrorCount);
@@ -1518,6 +1553,18 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
 {
     if (In->IovaSlotCount > RKMPP_MAX_DENSE_IOVA_SLOTS ||
         In->BufRefCount   > RKMPP_MAX_BUF_REFS) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Reject submissions that don't set the codec's kick bit.  A "no-kick"
+     * job completes synchronously inside JobKickLocalInner → JobComplete,
+     * which re-enters PromoteUntilFull → KickPromotions → JobKickLocalInner
+     * with no recursion bound.  A user-mode queue of all-zero-kick jobs
+     * could blow the kernel stack (STACK_OVERFLOW bugcheck).  Legitimate
+     * decode always asserts the codec's kick bit; the "test/peek-only"
+     * semantic that the inner-kick comment alludes to belongs on
+     * PEEK_DENSE_JOB, not SUBMIT.  See [[critical_kick_recursion]]. */
+    if ((In->KickValue & RKVDEC2_REG_DEC_E_BIT) == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1978,6 +2025,10 @@ RkMppJobWait(_In_ WDFDEVICE Device,
                                "rkmpp: WAIT_JOB timeout on InFlight job %llu — "
                                "leaving attached for poller completion\n",
                                (unsigned long long)job->Id);
+                    /* Mark orphan so the poller-driven completion frees
+                     * the job instead of moving it to Completed where it
+                     * would leak (caller has given up the JobId). */
+                    job->OrphanOnComplete = TRUE;
                 }
             }
             KeReleaseSpinLock(&q->Lock, oldIrql);

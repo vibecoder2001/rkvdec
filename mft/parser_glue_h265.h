@@ -334,6 +334,17 @@ typedef struct H265ParseResult {
      * Lifetime: valid until the next H265ParseAccessUnit call. */
     const uint8_t   *slice_data;
     size_t           slice_data_size;
+
+    /* Per-result POC continuity state (H.265 8.3.1 PrevTid0Pic).
+     * Previously two `static int32_t` locals inside H265ParseAccessUnit
+     * — fine for a single-stream parser but a hazard once the just-
+     * landed multi-core dispatch lets two H.265 sessions parse in
+     * parallel from different threads (each clobbered the other's
+     * MSB/LSB across the unprotected statics, producing nonsense POCs
+     * after the first wrap).  Per-instance now.  Reset by
+     * H265ParseResultInit. */
+    int32_t          prev_poc_msb_tid0;
+    int32_t          prev_poc_lsb_tid0;
 } H265ParseResult;
 
 /* Initialise a result struct (zero everything, mark all PS slots empty).

@@ -62,6 +62,17 @@ typedef struct _RKIOMMU_DEVICE {
     BOOLEAN              IsCodecSlave;
     BOOLEAN              PtAttached;
     KEVENT               PtAttachedEvent;
+    /* StateLock + Tearing — guard transitions of {MasterOpen, Domain,
+     * ShadowDomain, MasterFileObj, MasterIfcCtx, PtAttached} on the
+     * slave path against the master-PnP arrival callback racing
+     * EvtReleaseHardware.  Without this, arrival running on a worker
+     * thread can be midway through RkIommuSlaveAttach while
+     * ReleaseHardware tears the context down → UAF on ShadowDomain
+     * or the slave context itself.  Tearing is set TRUE under
+     * StateLock by ReleaseHardware before any teardown; arrival checks
+     * it under the lock and bails. */
+    KSPIN_LOCK           StateLock;
+    BOOLEAN              Tearing;
     KSPIN_LOCK           ConsumersLock;
     struct {
         PVOID                                ConsumerCtx;

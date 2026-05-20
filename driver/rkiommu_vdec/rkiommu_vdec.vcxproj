@@ -58,7 +58,6 @@
     <ClCompile Include="driver.c" />
     <ClCompile Include="device.c" />
     <ClCompile Include="ifc.c" />
-    <ClCompile Include="topology.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
     <ClCompile Include="..\shared\rkmpp\ifc_client.c" />
     <ClCompile Include="..\shared\rkmpp\peer_attach.c" />

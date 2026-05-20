@@ -18,45 +18,12 @@ EVT_WDF_DEVICE_PREPARE_HARDWARE  RkIommuEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE  RkIommuEvtReleaseHardware;
 extern NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device);
 
+/* RkIommuReadAcpiId — wrapper for back-compat with existing call sites.
+ * Implementation now lives in driver/shared/acpi_uid.c. */
 static NTSTATUS
 RkIommuReadAcpiId(_In_ WDFDEVICE Device, _Out_ PUINT32 Hid, _Out_ PUINT32 Uid)
 {
-    PDEVICE_OBJECT pdo = WdfDeviceWdmGetPhysicalDevice(Device);
-    WCHAR buf[1024] = {0};
-    ULONG size = 0;
-
-    NTSTATUS status = IoGetDeviceProperty(pdo, DevicePropertyHardwareID,
-                                          sizeof(buf), buf, &size);
-    if (!NT_SUCCESS(status)) return status;
-
-    PCWSTR cursor = buf;
-    while (*cursor) {
-        size_t len = wcslen(cursor);
-        if (len >= 13 &&
-            cursor[0] == L'A' && cursor[1] == L'C' && cursor[2] == L'P' &&
-            cursor[3] == L'I' && cursor[4] == L'\\' &&
-            cursor[5] == L'R' && cursor[6] == L'K' && cursor[7] == L'C' &&
-            cursor[8] == L'P' && cursor[9] == L'3' && cursor[10] == L'5')
-        {
-            UINT32 hid = 0;
-            for (int i = 9; i < 13; i++) {
-                WCHAR  c = cursor[i];
-                UINT32 d;
-                if      (c >= L'0' && c <= L'9') d = (UINT32)(c - L'0');
-                else if (c >= L'a' && c <= L'f') d = 10u + (UINT32)(c - L'a');
-                else if (c >= L'A' && c <= L'F') d = 10u + (UINT32)(c - L'A');
-                else { hid = 0; break; }
-                hid = (hid << 4) | d;
-            }
-            if (hid) {
-                *Hid = hid;
-                *Uid = RkSharedQueryAcpiUid(pdo);
-                return STATUS_SUCCESS;
-            }
-        }
-        cursor += len + 1;
-    }
-    return STATUS_INVALID_DEVICE_REQUEST;
+    return RkSharedReadAcpiHidUid(Device, Hid, Uid);
 }
 
 _Use_decl_annotations_

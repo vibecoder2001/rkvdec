@@ -25,13 +25,22 @@ struct BitReader {
     const uint8_t *data;
     size_t         len;     /* bytes */
     size_t         bit_pos;
+    /* Sticky error flag — set by any read that hit EOF mid-prefix or
+     * an Exp-Golomb leading-zero run >= 32.  Callers check
+     * br_failed(br) at unit-parse boundaries to reject malformed
+     * input rather than silently using clamped-zero values that flow
+     * into the regbuilder.  See [[parser_eg_error_propagation]]. */
+    bool           failed;
 };
 
 static void br_init(BitReader *br, const uint8_t *data, size_t len) {
     br->data = data;
     br->len  = len;
     br->bit_pos = 0;
+    br->failed = false;
 }
+
+static inline bool br_failed(const BitReader *br) { return br->failed; }
 
 static int br_eof(const BitReader *br) {
     return br->bit_pos >= br->len * 8;
@@ -54,12 +63,14 @@ static uint32_t br_u(BitReader *br, int n) {
 static int br_u1(BitReader *br) { return (int)br_u(br, 1); }
 
 /* H.265 9.2.2 — unsigned Exp-Golomb code (ue(v)).  Identical algorithm
- * to H.264's ue(v); the spec text is shared.  Clamp at 32 zeros to
- * avoid pathological inputs spinning forever. */
+ * to H.264's ue(v); the spec text is shared.  On malformed input
+ * (EOF mid-prefix or >= 32 leading zeros) latches br->failed and
+ * returns 0 so callers can reject the unit at the parse boundary. */
 static uint32_t br_ue(BitReader *br) {
     int zeros = 0;
     while (!br_eof(br) && br_u1(br) == 0) zeros++;
-    if (zeros >= 32) return 0;
+    if (br_eof(br) && zeros > 0) { br->failed = true; return 0; }
+    if (zeros >= 32) { br->failed = true; return 0; }
     uint32_t suffix = br_u(br, zeros);
     return ((1u << zeros) - 1) + suffix;
 }
@@ -500,6 +511,18 @@ static H265ParseStatus parse_sps(BitReader *br, H265ParseResult *out) {
 
     tmp.pic_width_in_luma_samples  = br_ue(br);
     tmp.pic_height_in_luma_samples = br_ue(br);
+    /* Bound the dimensions before they feed `pic_width_in_ctbs *
+     * pic_height_in_ctbs` (used as a bit-width for slice_segment_address
+     * at line ~732).  Without this, an adversarial SPS at 2^31 wraps the
+     * uint32 product to a small value and `ceil_log2` reads an
+     * attacker-controlled bit count.  rkvdec2 silicon cap is 8192×8192;
+     * reject above that.  See [[critical_h265_dim_bound]]. */
+    if (tmp.pic_width_in_luma_samples  == 0 ||
+        tmp.pic_width_in_luma_samples  > 8192u ||
+        tmp.pic_height_in_luma_samples == 0 ||
+        tmp.pic_height_in_luma_samples > 8192u) {
+        return H265_PARSE_INVALID;
+    }
 
     tmp.conformance_window_flag = (uint8_t)br_u1(br);
     if (tmp.conformance_window_flag) {
@@ -599,6 +622,9 @@ static H265ParseStatus parse_sps(BitReader *br, H265ParseResult *out) {
     tmp.pic_width_in_ctbs_y  = (tmp.pic_width_in_luma_samples  + ctb_unit - 1) >> log2_ctb;
     tmp.pic_height_in_ctbs_y = (tmp.pic_height_in_luma_samples + ctb_unit - 1) >> log2_ctb;
 
+    /* Surface any latched malformed-bitstream condition from
+     * br_ue/br_se before committing the parsed SPS. */
+    if (br_failed(br)) return H265_PARSE_INVALID;
     tmp.valid = 1;
     out->sps[tmp.sps_id] = tmp;
     out->active_sps_id   = (int8_t)tmp.sps_id;
@@ -685,6 +711,7 @@ static H265ParseStatus parse_pps(BitReader *br, H265ParseResult *out) {
     /* pps_extension_flag and the range/SCC extensions follow — we
      * don't consume them. */
 
+    if (br_failed(br)) return H265_PARSE_INVALID;
     tmp.valid = 1;
     out->pps[tmp.pps_id] = tmp;
     out->active_pps_id   = (int8_t)tmp.pps_id;
@@ -974,9 +1001,9 @@ H265ParseStatus H265ParseAccessUnit(const uint8_t *buf, size_t len,
 {
     if (!buf || !out || !scratch) return H265_PARSE_INVALID;
 
-    /* Persistent across calls for POC resolution. */
-    static int32_t s_prev_poc_msb_tid0 = 0;
-    static int32_t s_prev_poc_lsb_tid0 = 0;
+    /* POC continuity carried across calls on the per-instance state in
+     * H265ParseResult — concurrent streams keep separate state, where
+     * the previous statics let parallel parsers stomp each other. */
 
     /* Reset per-AU state; keep VPS/SPS/PPS arrays sticky. */
     memset(&out->slice, 0, sizeof(out->slice));
@@ -1066,14 +1093,14 @@ H265ParseStatus H265ParseAccessUnit(const uint8_t *buf, size_t len,
             int32_t poc;
             if (out->is_idr) {
                 poc = 0;
-                s_prev_poc_msb_tid0 = 0;
-                s_prev_poc_lsb_tid0 = 0;
+                out->prev_poc_msb_tid0 = 0;
+                out->prev_poc_lsb_tid0 = 0;
             } else {
                 const H265Sps *sps = &out->sps[out->active_sps_id];
                 int max_lsb = 1 << (sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
                 int32_t lsb = out->slice.slice_pic_order_cnt_lsb;
-                int32_t prev_lsb = s_prev_poc_lsb_tid0;
-                int32_t prev_msb = s_prev_poc_msb_tid0;
+                int32_t prev_lsb = out->prev_poc_lsb_tid0;
+                int32_t prev_msb = out->prev_poc_msb_tid0;
                 int32_t msb;
                 if (lsb < prev_lsb && (prev_lsb - lsb) >= max_lsb / 2)
                     msb = prev_msb + max_lsb;
@@ -1100,9 +1127,9 @@ H265ParseStatus H265ParseAccessUnit(const uint8_t *buf, size_t len,
                     max_lsb = 1 << (sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
                 }
                 if (max_lsb) {
-                    s_prev_poc_lsb_tid0 = poc % max_lsb;
-                    if (s_prev_poc_lsb_tid0 < 0) s_prev_poc_lsb_tid0 += max_lsb;
-                    s_prev_poc_msb_tid0 = poc - s_prev_poc_lsb_tid0;
+                    out->prev_poc_lsb_tid0 = poc % max_lsb;
+                    if (out->prev_poc_lsb_tid0 < 0) out->prev_poc_lsb_tid0 += max_lsb;
+                    out->prev_poc_msb_tid0 = poc - out->prev_poc_lsb_tid0;
                 }
             }
 

@@ -1497,26 +1497,43 @@ VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
     RtlZeroMemory(promos, sizeof(promos));
     ULONG nPromos = PromoteUntilFull(q, promos);
 
-    BOOLEAN idleAfter = (q->CoreIdle == ((1u << q->CoreCount) - 1)) &&
-                        IsListEmpty(&q->Pending);
-
     KeReleaseSpinLock(&q->Lock, irql);
 
     KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
 
-    if (idleAfter) {
-        RKMPP_DEVICE_PUBLIC pub;
-        RkMppGetPublic(Device, &pub);
-        PRKMPP_CCU_INTERFACE ccu = RkMppGetCcuIfc(Device);
-        if (ccu) {
-            /* This is RVD0's device.  Gate its own clocks (UID 0).
-             * RVD1's clocks are gated by RVD1's own JobComplete path
-             * when its foreign-job completion finalizes locally. */
-            if (pub.Uid == 0 && ccu->GateRvdec0LeafClocks) {
-                ccu->GateRvdec0LeafClocks(ccu->Header.Context);
-            }
-        }
-    }
+    /* DO NOT gate RVD0's leaf clocks here.
+     *
+     * An earlier version of this branch fired GateRvdec0LeafClocks when
+     * idleAfter was TRUE — making RVD0's clocks subject to TWO gate
+     * paths: RVD0's own JobComplete idleAfter branch AND this peer-side
+     * one.  RVD1, by contrast, has a single gate site (its own
+     * JobComplete, CoreCount=1 so idleAfter is trivially true).  That
+     * asymmetry was the source of an RVD0-only multistream codec
+     * timeout that reproduced only in release builds:
+     *
+     *   - This DPC runs on whichever CPU serviced RVD1's IRQ chain —
+     *     typically not the same CPU as RVD0's own DPCs.
+     *   - The gate call happens AFTER the spinlock is released, so it
+     *     can race against a concurrent SubmitDense → JobKickIfIdle →
+     *     JobKickLocalInner → UngateRvdec0LeafClocks → MMIO writes on
+     *     a different CPU.
+     *   - In release builds the race window collapses (DBG INFO logs
+     *     are __noop'd, optimizer hoists / inlines) and the stale gate
+     *     can land mid-kick, gating RVD0's CABAC/core leaf clocks while
+     *     the codec is actively decoding.  Codec engine wedges and
+     *     fires DEC_TIMEOUT_STA ~5 s later.
+     *   - Confirmed in instrumented release builds: IOMMU snapshot at
+     *     the timeout shows healthy translation (DTE valid, no fault,
+     *     MMU idle) — the codec engine itself stalled.  Removing this
+     *     branch eliminates the cascade.
+     *
+     * RVD0's clocks are now managed solely by RVD0's own JobComplete
+     * idleAfter branch (the "right" one, racing only with its own
+     * device's submissions).  Symmetric with RVD1.  Cost: when RVD1's
+     * foreign completion arrives while RVD0's local InFlight is empty,
+     * RVD0's leaf clocks stay on briefly until RVD0's next local
+     * completion ticks; that's fine — leaf clocks are codec-internal
+     * (CABAC / HEVC CABAC / core), no peer consumer. */
 
     KickPromotions(Device, q, promos, nPromos);
 }

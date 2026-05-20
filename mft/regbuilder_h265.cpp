@@ -461,12 +461,24 @@ H265RegBuildStatus H265BuildDenseRegs(const H265ParseResult *parsed,
         EMIT_P(RKVDEC2_REG_H265_POC_HIGHBIT_FIRST + 3 * 4, 0u);   /* refs 24..31 */
     }
 
-    /* reg204 — current pic high bit.  Bit 32 of a 33-bit signed POC;
-     * for our 32-bit POC range we extract bit 31 (the sign bit) into
-     * the 4-bit nibble.  When wrap-around POC support is needed task
-     * 5b will widen the parser's POC field to 33 bits. */
+    /* reg204 — current pic high bit.  The codec's POC field is 36-bit
+     * (32-bit low half from reg174 + 4-bit high nibble here), so the
+     * nibble holds POC[35:32].  Our parser stores POC as int32_t, so
+     * we only have one sign bit to encode into a 4-bit nibble — for a
+     * POC in range [-2^31, 2^31) the high nibble equals the sign bit
+     * replicated across all 4 positions (sign-extension of int32 to
+     * 36-bit), which simplifies to: 0 if POC>=0, 0xF if POC<0.
+     *
+     * Long-running stream risk (Review parser #18): a single decode
+     * session that accumulates more than ~2^31 POC values overflows
+     * our int32_t poc.  At 60 fps that's >414 days continuous; not a
+     * practical concern, but if it ever matters the fix is to widen
+     * the parser's poc field to int64_t and emit the actual top-4
+     * bits here.  The V4L2 ABI's top/bottom_field_order_cnt fields
+     * cap H.264 at int32_t already, so HEVC is the only codec where
+     * the widening is purely internal. */
     {
-        uint32_t cur_high = ((uint32_t)parsed->poc >> 31) & 0xF;
+        uint32_t cur_high = (parsed->poc < 0) ? 0xFu : 0u;
         EMIT_P(RKVDEC2_REG_H265_CUR_POC_HIGHBIT, cur_high);
     }
 

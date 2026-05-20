@@ -57,6 +57,20 @@ static bool MftTimingEnabled() {
     }
     return cached != 0;
 }
+/* Detect a "D3D device is gone" error from a CreateTexture2D or other
+ * D3D11 call.  DXGI surfaces these as DEVICE_REMOVED / DEVICE_RESET
+ * (e.g. GPU TDR, host put the adapter to sleep, EVR swapped its DXGI
+ * device).  MF's manager surfaces the same condition as
+ * MF_E_DXGI_NEW_VIDEO_DEVICE on the next CloseDeviceHandle.  When any
+ * of those fire we must drop our cached d3d_device_ / d3d_context_ so
+ * the next ProcessOutput re-acquires from the manager.  Review MFT #6.
+ */
+static inline bool D3dDeviceLost(HRESULT hr) {
+    return hr == DXGI_ERROR_DEVICE_REMOVED
+        || hr == DXGI_ERROR_DEVICE_RESET
+        || hr == DXGI_ERROR_DEVICE_HUNG
+        || hr == MF_E_DXGI_NEW_VIDEO_DEVICE;
+}
 static int64_t MftQpcNow() {
     LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart;
 }
@@ -168,12 +182,20 @@ HRESULT DecoderMFT::EnsureAttributes() {
     if (FAILED(hr)) return hr;
     /* Advertise as a D3D11-aware decoder so MF hosts route us through
      * the DXGI device manager handshake.  Bind flags match what the EVR
-     * and the standard MF NV12 sample allocator expect. */
-    (void)attributes_->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
-    (void)attributes_->SetUINT32(MF_SA_D3D11_BINDFLAGS,
+     * and the standard MF NV12 sample allocator expect.  Track each
+     * SetUINT32 — a partial-attributes object would mislead the host
+     * about our capabilities (and EVR has been observed to dereference
+     * MF_SA_D3D11_AWARE without checking GetUINT32's HRESULT).  Review
+     * MFT #8. */
+    HRESULT h1 = attributes_->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
+    HRESULT h2 = attributes_->SetUINT32(MF_SA_D3D11_BINDFLAGS,
                                  D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE);
-    /* Hint: we are an in-place transform with sync output. */
-    (void)attributes_->SetUINT32(MF_TRANSFORM_ASYNC, FALSE);
+    HRESULT h3 = attributes_->SetUINT32(MF_TRANSFORM_ASYNC, FALSE);
+    if (FAILED(h1) || FAILED(h2) || FAILED(h3)) {
+        attributes_->Release();
+        attributes_ = nullptr;
+        return FAILED(h1) ? h1 : (FAILED(h2) ? h2 : h3);
+    }
     return S_OK;
 }
 
@@ -1285,6 +1307,11 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
         int rc = Av1DecodeEngine_Submit(eng, au.data(), au.size(),
                                         (int64_t)pts);
         if (rc != 0) decode_errors_++;
+        /* Drop the failed AU but keep returning S_OK — same rationale as
+         * the H.264/HEVC submit at line ~1540 below.  Hosts treat
+         * ProcessInput failure as fatal; a transient bitstream error
+         * (corrupted AU mid-stream, parser rejection) should attrit at
+         * the engine layer and let the next AU recover.  Review MFT #10. */
         /* Refresh bit_depth_ from the engine's cached sequence header.
          * AV1 has no separate container extradata — seq_hdr arrives in
          * the bitstream itself, so bit-depth is only knowable after the
@@ -1607,7 +1634,14 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
             if (FAILED(hr)) {
                 td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
                 hr = d3d_device_->CreateTexture2D(&td, nullptr, &texture);
-                if (FAILED(hr)) { Av1DecodeEngine_ReleaseFrame(eng, &frame); return hr; }
+                if (FAILED(hr)) {
+                    /* If the device is gone, drop our cached handles so the
+                     * next ProcessOutput re-acquires from dxgi_manager_.
+                     * Without this we'd keep failing every frame. */
+                    if (D3dDeviceLost(hr)) ReleaseD3DManager();
+                    Av1DecodeEngine_ReleaseFrame(eng, &frame);
+                    return hr;
+                }
             }
             const UINT row_pitch = width_;
             d3d_context_->UpdateSubresource(texture, 0, nullptr,
@@ -1866,7 +1900,10 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
             if (FAILED(hr)) {
                 td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
                 hr = d3d_device_->CreateTexture2D(&td, nullptr, &texture);
-                if (FAILED(hr)) return hr;
+                if (FAILED(hr)) {
+                    if (D3dDeviceLost(hr)) ReleaseD3DManager();
+                    return hr;
+                }
             }
             const UINT row_pitch = row_bytes;
             d3d_context_->UpdateSubresource(texture, 0, nullptr,
@@ -2094,7 +2131,10 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
              * unsupported. */
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             hr = d3d_device_->CreateTexture2D(&td, nullptr, &texture);
-            if (FAILED(hr)) return hr;
+            if (FAILED(hr)) {
+                if (D3dDeviceLost(hr)) ReleaseD3DManager();
+                return hr;
+            }
         }
 
         /* Stage upload via UpdateSubresource.  NV12/P010 in D3D11 has

@@ -1113,7 +1113,14 @@ static int32_t current_poc(const DecodeEngine *e) {
 }
 
 static void bump_lowest(DecodeEngine *e) {
-    /* Find lowest-POC entry in reorder_q and move it to ready_q. */
+    /* Find lowest-POC entry in reorder_q and move it to ready_q.
+     *
+     * Repeated calls (the OnDecodeComplete bump loop, or Flush's drain)
+     * are O(N) per call, O(N²) for full drain.  Kept naïve because N is
+     * capped at kMaxReorderPics=32 (spec ceiling, see
+     * DecodeEngine_OnDecodeComplete) — a min-heap would add LOC for
+     * negligible gain on a 32-entry array that stays L1-hot.  Review
+     * MFT #17. */
     if (e->reorder_q.empty()) return;
     size_t best = 0;
     for (size_t i = 1; i < e->reorder_q.size(); i++) {
@@ -1157,6 +1164,19 @@ void DecodeEngine_OnDecodeComplete(DecodeEngine *e,
                                    uint32_t max_num_reorder_pics,
                                    bool is_idr_h264_boundary)
 {
+    /* Cap the bitstream-derived max_num_reorder_pics.  Real-world ceilings:
+     *   H.264: max_num_ref_frames per level ≤ 16; reorder ≤ 16.
+     *   H.265: sps_max_num_reorder_pics ≤ 16 per spec A.4.
+     *   AV1:   REFS_PER_FRAME = 7; effectively smaller.
+     *   VP9:   no reorder.
+     * A bitstream that claims a much larger value would keep reorder_q
+     * growing unboundedly until OOM.  32 is generous; clamp.  Review
+     * MFT #20. */
+    constexpr uint32_t kMaxReorderPics = 32;
+    if (max_num_reorder_pics > kMaxReorderPics) {
+        max_num_reorder_pics = kMaxReorderPics;
+    }
+
     if (is_idr_h264_boundary) {
         while (!e->reorder_q.empty()) bump_lowest(e);
     }

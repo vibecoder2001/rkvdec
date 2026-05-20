@@ -188,7 +188,12 @@ NTSTATUS RkIommuDomainCreateVdec(_Out_ PRKIOMMU_DOMAIN *Domain);
  * Sets Domain->IsAv1d = TRUE; allocates PTA level above the DT. */
 NTSTATUS RkIommuDomainCreateAv1d(_Out_ PRKIOMMU_DOMAIN *Domain);
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+/* PASSIVE_LEVEL only — MmFreeContiguousMemory + ExFreePoolWithTag
+ * paths reach back to PASSIVE-only kernel services.  Previously
+ * annotated DISPATCH_LEVEL which was wrong; the only existing caller
+ * (ReleaseHardware) is PASSIVE so it worked, but would mislead a
+ * future DISPATCH-level caller into a BSOD.  Review IOMMU #4. */
+_IRQL_requires_(PASSIVE_LEVEL)
 VOID RkIommuDomainDestroy(_In_ PRKIOMMU_DOMAIN Domain);
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

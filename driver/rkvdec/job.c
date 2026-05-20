@@ -347,8 +347,14 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
                                            FALSE, &timeout);
         if (w == STATUS_TIMEOUT) {
             *InFlightTimedOut = TRUE;
-            RKMPP_LOG_WARN(
-                       "rkmpp: file-cleanup in-flight wait timed out\n");
+            {
+                RKMPP_DEVICE_PUBLIC dpub;
+                RkMppGetPublic(Device, &dpub);
+                RKMPP_LOG_WARN(
+                       "rkmpp: RVD%u file-cleanup in-flight wait timed out "
+                       "(stalled on core %u)\n",
+                       dpub.Uid, inFlight->TargetCore);
+            }
             /* Sever in-flight jobs' MDL refs AND mark them orphan so the
              * eventual natural completion (poller-driven JobComplete or
              * peer completion DPC) frees the job memory rather than
@@ -560,10 +566,17 @@ RkMppEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
 
     if (job) {
         if (hwStatus & g_ops.IntErrorMask) {
+            /* Local DPC always fires for this device's own core — the
+             * device UID is the physical core identity (RVD0=0, RVD1=1).
+             * Useful when multistream playback wedges and we need to
+             * tell which physical engine produced the err_mask. */
+            RKMPP_DEVICE_PUBLIC pub;
+            RkMppGetPublic(device, &pub);
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkvdec: DPC INT=0x%08x err_mask=0x%08x "
+                       "rkvdec: RVD%u DPC INT=0x%08x err_mask=0x%08x "
                        "(TIMEOUT=%d ERROR=%d BUF_EMPTY=%d COLMV_REF_ERR=%d) "
                        "job=%llu\n",
+                       pub.Uid,
                        hwStatus, hwStatus & g_ops.IntErrorMask,
                        (hwStatus & RKVDEC2_INT_DEC_TIMEOUT_STA) ? 1 : 0,
                        (hwStatus & RKVDEC2_INT_DEC_ERROR_STA)   ? 1 : 0,
@@ -619,9 +632,11 @@ JobKickLocalInner(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
     Job->StartQpc = KeQueryPerformanceCounter(NULL);
 
     if (!mmio || mmioLen == 0) {
+        RKMPP_DEVICE_PUBLIC pub;
+        RkMppGetPublic(Device, &pub);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkmpp: JobStart with no MmioBase — failing job %llu\n",
-                   (unsigned long long)Job->Id);
+                   "rkmpp: RVD%u JobStart with no MmioBase — failing job %llu\n",
+                   pub.Uid, (unsigned long long)Job->Id);
         RkMppJobComplete(Device, STATUS_DEVICE_NOT_READY, 0);
         return;
     }
@@ -723,6 +738,19 @@ JobKickLocalInner(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
          *
          * if (iommu && iommu->MaskIrq) iommu->MaskIrq(iommu->Header.Context);
          */
+        /* TODO (review I6): Disable/Enable here race with a concurrent
+         * peer-File MapMdl on the same iommu — ~10 µs paging-OFF
+         * window vs in-flight PT updates.  Memory
+         * `iommu_reattach_mid_peer_dma_unsafe` flagged the same
+         * pattern at FileCleanup; we mitigated there by skipping
+         * Reattach when a peer is active.  Doing the equivalent here
+         * requires either deferring the reset block to a work item
+         * (so we can take a FAST_MUTEX shared with MapMdl) or adding
+         * a per-iommu "ResetGuard" spinlock that MapMdl/UnmapMdl
+         * also take — both non-trivial.  Today the race is rare
+         * (multistream stress + concurrent buffer alloc on the same
+         * core's iommu); plan B-grade refactor before non-admin
+         * IOCTL exposure. */
         if (iommu && iommu->Disable) {
             (void)iommu->Disable(iommu->Header.Context);
         }
@@ -739,8 +767,8 @@ JobKickLocalInner(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
             if (!NT_SUCCESS(rs)) {
                 reattachOk = FALSE;
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                           "rkmpp: post-FullReset IOMMU Enable failed 0x%08x; "
-                           "re-flagging for next kick\n", rs);
+                           "rkmpp: RVD%u post-FullReset IOMMU Enable failed "
+                           "0x%08x; re-flagging for next kick\n", pub.Uid, rs);
                 RkMppSetNeedsFullReset(Device);
             }
         }
@@ -883,10 +911,12 @@ JobKickLocalInner(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         const ULONG firstByte = banks[b].firstIdx * 4u + swregBase;
         const ULONG lastByte  = firstByte + banks[b].count * 4u;
         if (lastByte > mmioLen) {
+            RKMPP_DEVICE_PUBLIC dbgPub;
+            RkMppGetPublic(Device, &dbgPub);
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                       "rkvdec: dense job %llu bank %d (idx %lu..%lu) "
+                       "rkvdec: RVD%u dense job %llu bank %d (idx %lu..%lu) "
                        "out of MMIO range (len 0x%x)\n",
-                       (unsigned long long)Job->Id, b,
+                       dbgPub.Uid, (unsigned long long)Job->Id, b,
                        banks[b].firstIdx,
                        banks[b].firstIdx + banks[b].count - 1,
                        mmioLen);
@@ -1472,7 +1502,7 @@ VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
         /* Stale completion (peer-reset or cancellation race).  Drop. */
         KeReleaseSpinLock(&q->Lock, irql);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "rkvdec: peer completion cookie=%llu doesn't match "
+                   "rkvdec: RVD1 peer completion cookie=%llu doesn't match "
                    "InFlightPerCore[1]=%p — stale, ignoring\n",
                    (unsigned long long)CompletionCookie, job);
         return;
@@ -1483,11 +1513,26 @@ VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
     job->HardwareStatus = HardwareStatus;
 
     /* Charge errors to Owner for FileCleanup escalation, mirroring
-     * RkMppJobComplete's error-attribution logic. */
+     * RkMppJobComplete's error-attribution logic.  Symmetric ERROR
+     * log here too so a wedge on RVD1 is as visible in the trace as
+     * one on RVD0 — peer completions previously failed silently
+     * (only RVD0's local DPC error path printed err_mask details). */
     BOOLEAN failed = (!NT_SUCCESS(JobStatus) || (HardwareStatus & g_ops.IntErrorMask));
-    if (failed && job->Owner) {
-        PRKMPP_FILE_CTX fctx = RkMppFileGet(job->Owner);
-        if (fctx) InterlockedIncrement(&fctx->ErrorCount);
+    if (failed) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "rkvdec: RVD1 peer-completion INT=0x%08x err_mask=0x%08x "
+                   "(TIMEOUT=%d ERROR=%d BUF_EMPTY=%d COLMV_REF_ERR=%d) "
+                   "job=%llu status=0x%08x\n",
+                   HardwareStatus, HardwareStatus & g_ops.IntErrorMask,
+                   (HardwareStatus & RKVDEC2_INT_DEC_TIMEOUT_STA) ? 1 : 0,
+                   (HardwareStatus & RKVDEC2_INT_DEC_ERROR_STA)   ? 1 : 0,
+                   (HardwareStatus & RKVDEC2_INT_BUF_EMPTY_STA)   ? 1 : 0,
+                   (HardwareStatus & RKVDEC2_INT_COLMV_REF_ERROR) ? 1 : 0,
+                   (unsigned long long)job->Id, JobStatus);
+        if (job->Owner) {
+            PRKMPP_FILE_CTX fctx = RkMppFileGet(job->Owner);
+            if (fctx) InterlockedIncrement(&fctx->ErrorCount);
+        }
     }
 
     /* Cache invalidate the codec's output buffers — same logic as
@@ -2021,10 +2066,14 @@ RkMppJobWait(_In_ WDFDEVICE Device,
                     if (q->InFlightPerCore[c] == job) { inFlight = TRUE; break; }
                 }
                 if (inFlight) {
+                    RKMPP_DEVICE_PUBLIC wpub;
+                    RkMppGetPublic(Device, &wpub);
                     RKMPP_LOG_WARN(
-                               "rkmpp: WAIT_JOB timeout on InFlight job %llu — "
-                               "leaving attached for poller completion\n",
-                               (unsigned long long)job->Id);
+                               "rkmpp: RVD%u WAIT_JOB timeout on InFlight "
+                               "job %llu (core %u) — leaving attached for "
+                               "poller completion\n",
+                               wpub.Uid, (unsigned long long)job->Id,
+                               job->TargetCore);
                     /* Mark orphan so the poller-driven completion frees
                      * the job instead of moving it to Completed where it
                      * would leak (caller has given up the JobId). */

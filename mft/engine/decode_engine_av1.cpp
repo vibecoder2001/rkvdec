@@ -178,35 +178,11 @@ static void FreeHwBuf(HANDLE dev, Av1DecodeEngine::HwBuf *b) {
 
 /* ----- Hardware kick path ---------------------------------------- */
 
-/* One coded-frame OBU within a TU.  The clean-room parser produces one
- * picture per OBU_FRAME (type 6) or OBU_FRAME_HEADER (type 3); we walk
- * the TU at Submit time, push one record per picture-producing OBU, and
- * process them in DrainPictures so each picture knows which slice of the
- * TU to memcpy + the tile_group entropy offset within that slice. */
-struct AV1ObuRecord {
-    /* Bitstream slice the codec reads on this kick. For the FIRST picture-
-     * producing OBU in a TU, the slice starts at byte 0 of the TU so the
-     * codec sees the leading non-FRAME OBUs (OBU_TEMPORAL_DELIMITER,
-     * OBU_SEQUENCE_HEADER, metadata). For subsequent OBUs in the same TU
-     * the slice starts at the OBU header itself. Matches BSP's per-kick
-     * bitstream window. */
-    uint32_t slice_start;      /* byte offset of slice start within the TU    */
-    uint32_t slice_size;       /* slice length: obu_end - slice_start         */
-    uint32_t frame_tag_off;    /* tile_group offset relative to slice_start
-                                  (= obu_offset - slice_start + hdr + size_leb;
-                                  caller adds frame_hdr_obu_size_bytes for
-                                  OBU_FRAME) */
-    uint8_t  obu_type;         /* 3 = OBU_FRAME_HEADER, 6 = OBU_FRAME         */
-    bool     show_existing;    /* MSB of payload[0] when seq.reduced=0        */
-};
-
-/* Per-Submit OBU walk results, consumed picture-by-picture in DrainPictures.
- * Thread-local because Submit/DrainPictures execute on the caller's thread
- * and the engine is not concurrent. */
-static thread_local const uint8_t *g_av1_tu_ptr = nullptr;
-static thread_local size_t         g_av1_tu_len = 0;
-static thread_local std::vector<AV1ObuRecord> g_av1_tu_obus;
-static thread_local size_t         g_av1_tu_obu_idx = 0;
+/* AV1ObuRecord moved to decode_engine_av1.h so Av1DecodeEngine can
+ * hold a per-instance std::vector — previously these four pieces of
+ * per-Submit state were static thread_locals, which served fine on a
+ * single thread but raced once MF cross-thread-dispatches ProcessInput
+ * and ProcessOutput.  See [[mft_av1_tu_state_per_instance]]. */
 
 
 /* AV1 swreg indices that hold *_lsb DMA addresses.  Sourced from BSP
@@ -442,7 +418,7 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
      * producing OBU the slice starts at TU byte 0 (carrying TD / sequence
      * header / metadata along); subsequent OBUs slice from their own
      * header. Matches BSP per-kick stream windows. */
-    const uint8_t *obu_ptr = g_av1_tu_ptr + rec->slice_start;
+    const uint8_t *obu_ptr = e->tu_ptr + rec->slice_start;
     const size_t   obu_len = rec->slice_size;
 
     /* 1. Run the regbuilder to fill VdpuAv1dRegSet. */
@@ -1149,8 +1125,8 @@ static void Av1ResolveMaxReorder(Av1DecodeEngine *e) {
  * update the parser saved-state and dpb_to_pool tables. */
 static int DrainPictures(Av1DecodeEngine *e, int64_t pts_hns) {
     /* Walk each OBU record the Submit-time Av1WalkObus produced. */
-    for (; g_av1_tu_obu_idx < g_av1_tu_obus.size(); g_av1_tu_obu_idx++) {
-        const AV1ObuRecord &rec = g_av1_tu_obus[g_av1_tu_obu_idx];
+    for (; e->tu_obu_idx < e->tu_obus.size(); e->tu_obu_idx++) {
+        const AV1ObuRecord &rec = e->tu_obus[e->tu_obu_idx];
 
         if (!e->seq_hdr_valid) {
             std::fprintf(stderr, "av1_engine: no sequence header yet, dropping OBU\n");
@@ -1162,7 +1138,7 @@ static int DrainPictures(Av1DecodeEngine *e, int64_t pts_hns) {
          * OBU payload begins at slice_start + frame_tag_off for both
          * OBU_FRAME_HEADER (type 3) and OBU_FRAME (type 6).  The payload
          * length is slice_size - frame_tag_off. */
-        const uint8_t *obu_payload = g_av1_tu_ptr + rec.slice_start + rec.frame_tag_off;
+        const uint8_t *obu_payload = e->tu_ptr + rec.slice_start + rec.frame_tag_off;
         const size_t   obu_payload_len = rec.slice_size > rec.frame_tag_off
                                          ? (rec.slice_size - rec.frame_tag_off) : 0;
 
@@ -1508,15 +1484,16 @@ int Av1DecodeEngine_Submit(Av1DecodeEngine *e,
                            const uint8_t *obu, size_t len,
                            int64_t pts_hns)
 {
-    /* Stash TU bytes for the HW kick memcpy path. */
-    g_av1_tu_ptr = obu;
-    g_av1_tu_len = len;
+    /* Stash TU bytes for the HW kick memcpy path.  Per-instance state
+     * — was static thread_local globals before the MFT-#14 fix. */
+    e->tu_ptr = obu;
+    e->tu_len = len;
 
     /* Walk OBUs: populate picture-producing records AND scan for any
      * OBU_SEQUENCE_HEADER (type 1) in this TU so cached_seq_hdr is
      * up-to-date before DrainPictures parses frame headers. */
-    Av1WalkObus(obu, len, g_av1_tu_obus);
-    g_av1_tu_obu_idx = 0;
+    Av1WalkObus(obu, len, e->tu_obus);
+    e->tu_obu_idx = 0;
 
     /* Second linear scan for OBU_SEQUENCE_HEADER (type 1).
      * Av1WalkObus only records picture-producing OBUs (types 3 and 6),

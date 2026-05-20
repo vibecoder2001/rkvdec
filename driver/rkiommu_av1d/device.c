@@ -210,9 +210,17 @@ RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
                                 WDF_NO_OBJECT_ATTRIBUTES,
                                 &ctx->Interrupt);
     if (!NT_SUCCESS(status)) {
+        /* Treat InterruptCreate failure as fatal on AV1D.  Unlike the
+         * vdec topology where UID 9/10 can survive on master-handles-irq
+         * mode, AV1D is the sole instance in its own topology — without
+         * its ISR a page fault stalls AXI forever with no diagnostic
+         * surface.  A silent codec hang at decode time is far worse than
+         * a visible driver load failure here.  Review IOMMU #9. */
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkiommu_av1d: WdfInterruptCreate failed (0x%08x) — non-fatal\n",
+                   "rkiommu_av1d: WdfInterruptCreate failed (0x%08x) — "
+                   "fatal (no ISR means HW hangs on first fault)\n",
                    status);
+        return status;
     }
 
     return RkIommuRegisterIfc(device);

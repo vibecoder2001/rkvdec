@@ -376,6 +376,14 @@ NTSTATUS RkIommuMapAt(PRKIOMMU_DOMAIN Domain, ULONG64 Iova,
         Domain->Pts[pdi][pti] = pte;
     }
 
+    /* Memory barrier so the IOMMU walker (reading RAM directly via
+     * its AXI path) sees fully-committed PTE stores once the caller
+     * issues the follow-up ZAP_CACHE / kick MMIO write.  PT pages
+     * are PAGE_NOCACHE so there's no CPU-cacheline writeback to
+     * worry about, but ARM64 is weakly ordered — without an explicit
+     * barrier the device's first translation after Map can read a
+     * stale PTE.  Review IOMMU #5. */
+    KeMemoryBarrier();
     return STATUS_SUCCESS;
 }
 

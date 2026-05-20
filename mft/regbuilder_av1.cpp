@@ -15,6 +15,7 @@
  * SPDX-License-Identifier: BSD-2-Clause-Patent
  */
 #include "regbuilder_av1.h"
+#include "rkmpp_resolution.h"
 
 #include <cstdio>
 #include <cstring>
@@ -192,6 +193,15 @@ RkmppAv1Status rkmpp_av1_build_regs(
         return RKMPP_AV1_ERR_UNSUPPORTED;
     if (seq->monochrome != 0)     return RKMPP_AV1_ERR_UNSUPPORTED;
     if (hdr->frame_type == DAV1D_FRAME_TYPE_INTRA && hdr->show_existing_frame)
+        return RKMPP_AV1_ERR_UNSUPPORTED;
+
+    /* Trust-boundary gate: hdr->width[1] is the post-superres
+     * upscaled width that drives output-buffer sizing; hdr->height
+     * is the coded height.  Kernel doesn't re-validate, so a
+     * malformed seq/hdr from a hostile bitstream must be caught
+     * before MMIO programming. */
+    if (!RkmppValidateResolution((uint32_t)hdr->width[1],
+                                 (uint32_t)hdr->height))
         return RKMPP_AV1_ERR_UNSUPPORTED;
 
     /* ====================================================================

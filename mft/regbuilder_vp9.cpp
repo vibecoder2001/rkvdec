@@ -13,6 +13,7 @@
  */
 #include "regbuilder_vp9.h"
 #include "rkvdec2_vp9_regs.h"
+#include "rkmpp_resolution.h"
 #include "vp9_kf_probs.h"
 
 #include <stdint.h>
@@ -72,6 +73,12 @@ RegBuildStatus Vp9Regbuilder_Fill(const RegbuildInputs &in,
     const PicParams &pp  = *in.pp;
     const DpbCtx    &dpb = *in.dpb;
     int rc = 0;
+
+    /* Trust-boundary gate: catch overflow on `pp.height * aligned_pitch`
+     * below, where a 10-bit 8K+ frame approaches 2^32.  Kernel does NOT
+     * re-validate dimensions. */
+    if (!RkmppValidateResolution(pp.width, pp.height))
+        return RegBuildStatus::BadInput;
 
     /* Determine whether this is an intra-type frame (used by both the
      * common error-mode register and the codec_params bank). */

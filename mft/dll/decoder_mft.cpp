@@ -98,37 +98,57 @@ DecoderMFT::DecoderMFT(CodecKind kind)
 }
 
 DecoderMFT::~DecoderMFT() {
-    if (input_type_)  input_type_->Release();
-    if (output_type_) output_type_->Release();
-    if (engine_) {
-        auto *eng = static_cast<DecodeEngine *>(engine_);
-        DecodeEngine_Shutdown(eng);
-        delete eng;
-        engine_ = nullptr;
+    /* COM Release-to-zero invariant guarantees no other caller is in any
+     * method on this object — destruction happens after the final
+     * Release() drops refs to zero, and Release() is called by exactly
+     * the last holder.  But a buggy host re-entering during shutdown
+     * (or a future async path) would race teardown.  Take lock_
+     * defensively so engine/output_type/dxgi state is mutated under
+     * the same discipline as the rest of the class.  Review MFT #12. */
+    {
+        std::lock_guard<std::mutex> g(lock_);
+        if (input_type_)  { input_type_->Release();  input_type_  = nullptr; }
+        if (output_type_) { output_type_->Release(); output_type_ = nullptr; }
+        if (engine_) {
+            auto *eng = static_cast<DecodeEngine *>(engine_);
+            DecodeEngine_Shutdown(eng);
+            delete eng;
+            engine_ = nullptr;
+        }
+        if (engine_av1_) {
+            auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
+            Av1DecodeEngine_Shutdown(eng);
+            delete eng;
+            engine_av1_ = nullptr;
+        }
+        if (engine_vp9_) {
+            auto *eng = static_cast<Vp9DecodeEngine *>(engine_vp9_);
+            Vp9DecodeEngine_Shutdown(eng);
+            delete eng;
+            engine_vp9_ = nullptr;
+        }
+        ReleaseD3DManager();
+        if (dump_file_) { std::fclose(dump_file_); dump_file_ = nullptr; }
+        if (attributes_) { attributes_->Release(); attributes_ = nullptr; }
     }
-    if (engine_av1_) {
-        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
-        Av1DecodeEngine_Shutdown(eng);
-        delete eng;
-        engine_av1_ = nullptr;
-    }
-    if (engine_vp9_) {
-        auto *eng = static_cast<Vp9DecodeEngine *>(engine_vp9_);
-        Vp9DecodeEngine_Shutdown(eng);
-        delete eng;
-        engine_vp9_ = nullptr;
-    }
-    ReleaseD3DManager();
-    if (dump_file_) { std::fclose(dump_file_); dump_file_ = nullptr; }
-    if (attributes_) { attributes_->Release(); attributes_ = nullptr; }
     DllRelease();
 }
 
 void DecoderMFT::ReleaseD3DManager() {
+    /* Drop the D3D11 device+context handles first so any subsequent
+     * GetVideoService cycle re-acquires fresh ones bound to whatever
+     * device the manager currently advertises. */
     if (d3d_context_) { d3d_context_->Release(); d3d_context_ = nullptr; }
     if (d3d_device_)  { d3d_device_->Release();  d3d_device_  = nullptr; }
     if (dxgi_manager_ && dxgi_device_h_) {
-        dxgi_manager_->CloseDeviceHandle(dxgi_device_h_);
+        /* CloseDeviceHandle can return MF_E_DXGI_NEW_VIDEO_DEVICE when
+         * EVR has reset its DXGI device since the handle was opened.
+         * The MF spec says the manager has already invalidated our
+         * handle in that case — we still want to NULL our copy so we
+         * don't pass a stale value to a future Open / GetVideoService.
+         * Ignore the return (informational only); the manager's
+         * Release below tears down what's left.  Review MFT #6. */
+        (void)dxgi_manager_->CloseDeviceHandle(dxgi_device_h_);
         dxgi_device_h_ = nullptr;
     }
     if (dxgi_manager_) { dxgi_manager_->Release(); dxgi_manager_ = nullptr; }
@@ -242,18 +262,28 @@ STDMETHODIMP DecoderMFT::AddInputStreams(DWORD, DWORD *)               { return 
 STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
     if (id != 0) return MF_E_INVALIDSTREAMNUMBER;
     if (!flags) return E_POINTER;
-    std::lock_guard<std::mutex> g(lock_);
+    /* Intentionally lock-free.  MF's quality manager polls
+     * GetInputStatus / GetOutputStatus from worker threads under
+     * sustained load; holding `lock_` here would stall those polls
+     * for the entire duration of any in-flight ProcessInput, which
+     * can block up to ~1 s on the kernel WAIT_JOB IOCTL.  EVR
+     * (synchronous host) would then deadlock its topology rebuild.
+     *
+     * Engine pointers are stable for the MFT's lifetime — assigned
+     * once in BEGIN_STREAMING, freed in ~DecoderMFT.  Since this
+     * method is on the call stack while we read them, COM's
+     * Release-to-zero invariant guarantees no concurrent destructor.
+     * QueueDepth itself reads `reorder_q.size() + ready_q.size()`
+     * without locks — a slightly-stale value here is acceptable for
+     * an advisory "can I accept more?" signal. */
+    Av1DecodeEngine *av1 = static_cast<Av1DecodeEngine *>(engine_av1_);
+    DecodeEngine    *gen = static_cast<DecodeEngine *>(engine_);
     *flags = 0;
-    /* AV1 cap matches ProcessInput's cap (16) so it can hold the
-     * 8-frame reorder buffer plus working margin for hierarchical
-     * streams.  H.264/HEVC keep the smaller cap they were tuned for. */
-    if (engine_av1_) {
-        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
-        if (Av1DecodeEngine_QueueDepth(eng) < 24)
+    if (av1) {
+        if (Av1DecodeEngine_QueueDepth(av1) < 24)
             *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
-    } else if (engine_) {
-        auto *eng = static_cast<DecodeEngine *>(engine_);
-        if (DecodeEngine_QueueDepth(eng) < DecodeEngine_InputQueueCapacity(eng))
+    } else if (gen) {
+        if (DecodeEngine_QueueDepth(gen) < DecodeEngine_InputQueueCapacity(gen))
             *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
     } else {
         *flags = MFT_INPUT_STATUS_ACCEPT_DATA;
@@ -262,15 +292,17 @@ STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
 }
 STDMETHODIMP DecoderMFT::GetOutputStatus(DWORD *flags) {
     if (!flags) return E_POINTER;
-    std::lock_guard<std::mutex> g(lock_);
+    /* Lock-free for the same reason as GetInputStatus; see comment
+     * there.  Polling these from MF's worker pool must not stall on
+     * a ProcessInput holding `lock_` across the kernel WAIT_JOB. */
+    Av1DecodeEngine *av1 = static_cast<Av1DecodeEngine *>(engine_av1_);
+    DecodeEngine    *gen = static_cast<DecodeEngine *>(engine_);
     *flags = 0;
-    if (engine_av1_) {
-        auto *eng = static_cast<Av1DecodeEngine *>(engine_av1_);
-        if (Av1DecodeEngine_QueueDepth(eng) > 0)
+    if (av1) {
+        if (Av1DecodeEngine_QueueDepth(av1) > 0)
             *flags = MFT_OUTPUT_STATUS_SAMPLE_READY;
-    } else if (engine_) {
-        auto *eng = static_cast<DecodeEngine *>(engine_);
-        if (DecodeEngine_QueueDepth(eng) > 0)
+    } else if (gen) {
+        if (DecodeEngine_QueueDepth(gen) > 0)
             *flags = MFT_OUTPUT_STATUS_SAMPLE_READY;
     }
     return S_OK;
@@ -475,11 +507,18 @@ STDMETHODIMP DecoderMFT::SetInputType(DWORD id, IMFMediaType *type, DWORD flags)
             }
 
             /* Form (b): raw OBU sequence_header.  Skip OBU header byte
-             * + leb128 size, then call the existing parser. */
+             * + optional extension byte + leb128 size, then call the
+             * existing parser.  The extension byte (obu_extension_flag,
+             * bit 2 of the header) is rare but legal — without
+             * accounting for it the leb128 offset is wrong and we
+             * misparse bit-depth, locking NV12 on a 10-bit stream.
+             * Review issue MFT #13. */
             uint8_t obu_type = (uint8_t)((blob[0] >> 3) & 0xF);
+            bool    has_ext  = (blob[0] & 0x04) != 0;
             bool    has_size = (blob[0] & 0x02) != 0;
             if (obu_type == 1 /* OBU_SEQUENCE_HEADER */) {
                 size_t off = 1;
+                if (has_ext && off < blob.size()) off++;
                 if (has_size) {
                     /* leb128 — at most 8 bytes; the seq_hdr is short. */
                     size_t leb = 0;
@@ -1206,6 +1245,17 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
                     buf->Release();
                     return MF_E_INVALID_STREAM_DATA;
                 }
+                /* AU size cap (16 MiB).  Legitimate AVC/HEVC/AV1 ATU
+                 * sizes are well under 1 MB even at 4K; a multi-MB AU
+                 * is either pathological or a DoS attempt.  Without
+                 * this cap a hostile source can drive `au.size()`
+                 * into multi-GB territory, dominating process memory
+                 * + vector-reallocation cost.  Review MFT #11. */
+                if (au.size() + (size_t)cur > (size_t)(16u << 20)) {
+                    buf->Unlock();
+                    buf->Release();
+                    return MF_E_INVALID_STREAM_DATA;
+                }
                 au.insert(au.end(), p, p + cur);
                 buf->Unlock();
             }
@@ -1267,6 +1317,12 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
                     mfb->Release();
                     return MF_E_INVALID_STREAM_DATA;
                 }
+                /* AU size cap — see AV1 path comment.  Review MFT #11. */
+                if (au.size() + (size_t)cur > (size_t)(16u << 20)) {
+                    mfb->Unlock();
+                    mfb->Release();
+                    return MF_E_INVALID_STREAM_DATA;
+                }
                 au.insert(au.end(), p, p + cur);
                 mfb->Unlock();
             }
@@ -1282,6 +1338,12 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
         std::fprintf(stderr,
             "rkmpp MFT(vp9): PI au_bytes=%zu nf=%d\n", au.size(), nf);
         if (nf <= 0) { decode_errors_++; std::fflush(stderr); return S_OK; }
+        /* Defense-in-depth: spec maxes at 8 subframes per superframe,
+         * which matches our `max_frames` arg above, but if the parser
+         * ever miscounts (or a future spec rev permits more) the for
+         * loop below would walk past frames[]/fsizes[].  Clamp here.
+         * Review MFT #15. */
+        if (nf > 8) nf = 8;
         /* Eager profile peek — drives BuildOutputType's NV12-vs-P010
          * choice before the first ProcessOutput.  WebM/MKV containers
          * don't surface a VPCC-style extradata via MF, so the only way
@@ -1383,6 +1445,12 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
         hr = buf->Lock(&p, &max, &cur);
         if (SUCCEEDED(hr)) {
             if (cur > max) {
+                buf->Unlock();
+                buf->Release();
+                return MF_E_INVALID_STREAM_DATA;
+            }
+            /* AU size cap — see AV1 path comment.  Review MFT #11. */
+            if (au.size() + (size_t)cur > (size_t)(16u << 20)) {
                 buf->Unlock();
                 buf->Release();
                 return MF_E_INVALID_STREAM_DATA;

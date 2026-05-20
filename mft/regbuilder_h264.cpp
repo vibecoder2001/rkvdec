@@ -7,6 +7,7 @@
  */
 #include "regbuilder_h264.h"
 #include "rkvdec2_h264_regs.h"
+#include "rkmpp_resolution.h"
 
 #include <string.h>
 
@@ -103,6 +104,13 @@ H264RegBuildStatus H264BuildDenseRegs(const H264ParseResult *parsed,
 
     uint32_t width_px, height_px;
     frame_dims(&sps, &width_px, &height_px);
+    /* Trust-boundary gate: reject any resolution the silicon can't
+     * actually handle.  The parser caps SPS mb-dim values, but a
+     * defensive gate at every regbuilder entry is the cross-cutting
+     * fix from the 2026-05-19 review (single arbiter of "what can
+     * the kernel be programmed with"). */
+    if (!RkmppValidateResolution(width_px, height_px))
+        return H264_REGBUILD_UNSUPPORTED;
     uint32_t mb_w     = (width_px  + 15) / 16;
     uint32_t mb_h     = (height_px + 15) / 16;
     /* NV12 (8-bit) or NV15 (10-bit packed: 4 samples in 5 bytes) horiz stride.

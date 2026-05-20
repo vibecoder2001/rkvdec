@@ -9,6 +9,7 @@
  */
 #include "regbuilder_h265.h"
 #include "rkvdec2_h265_regs.h"
+#include "rkmpp_resolution.h"
 
 #include <string.h>
 
@@ -105,6 +106,9 @@ H265RegBuildStatus H265BuildDenseRegs(const H265ParseResult *parsed,
      * match or the SAO write fabric corrupts adjacent rows. */
     uint32_t width_px      = sps->pic_width_in_luma_samples;
     uint32_t height_px     = sps->pic_height_in_luma_samples;
+    /* Trust-boundary gate — kernel doesn't re-validate dimensions. */
+    if (!RkmppValidateResolution(width_px, height_px))
+        return H265_REGBUILD_UNSUPPORTED;
     const uint32_t bpp_num = (sps->bit_depth_luma_minus8 == 2) ? 10u : 8u;
     uint32_t coded_w_px    = (width_px + 15u) & ~15u;
     uint32_t luma_stride   = ((coded_w_px * bpp_num + 7u) / 8u + 15u) & ~15u;

@@ -222,6 +222,15 @@ RkIommuSnapshot(_In_ PVOID ProviderContext,
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
 
+    /* Zero the entire snapshot before populating the AV1D-relevant
+     * fields.  AV1D is a single-MMU IOMMU and doesn't have the
+     * Status1/IntRawStat1/IntStatus1/PageFaultAddr1/DteAddr1 second-
+     * instance fields the vdec path uses — without this zero a
+     * codec diagnostic consumer that compares `Status1 != 0` to
+     * detect a "two-MMU fault" sees uninitialised stack residue.
+     * Review IOMMU issue #10. */
+    RtlZeroMemory(Out, sizeof(*Out));
+
     Out->Status        = READ_REGISTER_ULONG(
         (volatile ULONG*)(dev->MmioBase + AV1_MMU_STATUS_AV1));
     Out->IntRawStat    = Out->Status;

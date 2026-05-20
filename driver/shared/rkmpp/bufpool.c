@@ -141,12 +141,30 @@ RkMppBufFileCtxInit(_In_ WDFFILEOBJECT File, _In_ WDFDEVICE Device)
 static VOID
 RkMppBufFreeOne(_In_ PRKMPP_BUFFER Buf, _In_ WDFDEVICE Device)
 {
-    /* 1. Unmap user VA — must be in the owner process context. */
+    /* 1. Unmap user VA — must be in the owner process context.
+     *
+     * Skip the attach/unmap entirely when the owner process has
+     * begun teardown: KeStackAttachProcess to a "zombie" EPROCESS
+     * lands in a context whose page tables may already have been
+     * reclaimed, and MmUnmapLockedPages then writes user-mode
+     * VA backed by no valid VAD → BSOD (BAD_POOL_CALLER or
+     * PAGE_FAULT_IN_NONPAGED_AREA).  Process-level address-space
+     * teardown reclaims the mapping for us, so dropping the
+     * explicit unmap on this path is safe.  PsGetProcessExitStatus
+     * returns STATUS_PENDING while the process is live; anything
+     * else (STATUS_SUCCESS / exit code) means PspExitThread has
+     * begun the teardown.
+     *
+     * Code-review issue I3.  See [[bufpool_process_exit_race]]. */
     if (Buf->UserVa && Buf->Mdl && Buf->OwnerProcess) {
-        KAPC_STATE apcState;
-        KeStackAttachProcess(Buf->OwnerProcess, &apcState);
-        MmUnmapLockedPages(Buf->UserVa, Buf->Mdl);
-        KeUnstackDetachProcess(&apcState);
+        if (PsGetProcessExitStatus(Buf->OwnerProcess) == STATUS_PENDING) {
+            KAPC_STATE apcState;
+            KeStackAttachProcess(Buf->OwnerProcess, &apcState);
+            MmUnmapLockedPages(Buf->UserVa, Buf->Mdl);
+            KeUnstackDetachProcess(&apcState);
+        }
+        /* else: process teardown already in progress; address-space
+         * reclaim handles the VA mapping. */
         Buf->UserVa = NULL;
     }
 

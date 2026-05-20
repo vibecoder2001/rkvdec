@@ -142,22 +142,30 @@ static uint32_t br_leb128(BitReader &r)
 }
 
 /* uvlc (AV1 spec §4.10.3): reads unsigned variable-length code.
- * Returns UINT32_MAX on overflow. */
+ * On excessive leading-zero run (>= 32) sets r.error AND returns
+ * UINT32_MAX — older call sites that check for UINT32_MAX keep
+ * working, but new code can rely on the sticky error flag like the
+ * H.264/H.265 br_failed pattern.  Without the sticky flag a parser
+ * that sailed past a malformed uvlc would commit a poisoned value
+ * to the regbuilder (which the kernel doesn't re-validate). */
 static uint32_t br_uvlc(BitReader &r)
 {
     int leading = 0;
     while (!br_bit(r)) {
-        if (++leading == 32) return UINT32_MAX;
+        if (++leading == 32) { r.error = true; return UINT32_MAX; }
     }
     if (leading == 0) return 0;
     return ((1u << leading) - 1) + br_u(r, leading);
 }
 
 /* uniform(n) — spec §4.10.7: reads a value in [0, n-1] using the
- * minimum number of bits. */
+ * minimum number of bits.  Callers must ensure n > 1; the prior
+ * `assert` evaporated under -DNDEBUG.  Release-safe fail-closed
+ * path latches r.error and returns 0 so a malformed caller can't
+ * UB the shift below. */
 static uint32_t br_uniform(BitReader &r, uint32_t n)
 {
-    assert(n > 1);
+    if (n <= 1) { r.error = true; return 0; }
     /* floor(log2(n)) */
     int l = 0;
     for (uint32_t tmp = n; tmp > 1; tmp >>= 1) l++;

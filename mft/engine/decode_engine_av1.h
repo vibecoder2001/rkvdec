@@ -52,6 +52,19 @@ struct Av1DecodedFrame {
     bool      has_film_grain  = false;
 };
 
+/* One coded-frame OBU within a TU.  Public so Av1DecodeEngine can
+ * hold a std::vector of these as per-instance state (was a static
+ * thread_local global — race hazard once MF cross-thread-dispatches).
+ * Definition kept compact; field semantics documented at the use
+ * site in decode_engine_av1.cpp. */
+struct AV1ObuRecord {
+    uint32_t slice_start;
+    uint32_t slice_size;
+    uint32_t frame_tag_off;
+    uint8_t  obu_type;
+    bool     show_existing;
+};
+
 struct Av1DecodeEngine {
     Av1EngineMode mode = Av1EngineMode::Software;
 
@@ -107,6 +120,16 @@ struct Av1DecodeEngine {
 
     uint32_t frame_width  = 0;
     uint32_t frame_height = 0;
+
+    /* Per-Submit OBU walk results, consumed by DrainPictures.  Previously
+     * `static thread_local` globals — fine for a single engine instance
+     * on one thread, but a footgun: MF can call ProcessInput on a
+     * different thread from ProcessOutput for sync MFTs.  Moved to
+     * per-instance state.  Review MFT #14. */
+    const uint8_t           *tu_ptr     = nullptr;
+    size_t                   tu_len     = 0;
+    std::vector<AV1ObuRecord> tu_obus;
+    size_t                   tu_obu_idx = 0;
 
     /* Filter column buffer sub-offsets within filter_mem (bytes).
      * Computed per-kick from frame dims + bit depth; match

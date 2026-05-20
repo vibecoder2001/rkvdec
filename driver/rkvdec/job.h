@@ -192,14 +192,10 @@ typedef struct _RKMPP_JOB_QUEUE {
     PFILE_OBJECT                PeerFileObj;
     RKMPP_PEER_WATCH            PeerWatch;
 
-    /* Polling-completion thread.  WdfInterruptCreate currently fails for
-     * rkmpp instances (STATUS_WDF_INVALID_INTERRUPT_CONFIG), so we run a
-     * per-device kernel thread that polls INT_STATUS after each kick.
-     * RkMppJobStart signals KickEvent; the thread polls + completes.
-     * On teardown, ExitEvent shuts the thread down. */
-    KEVENT          KickEvent;      /* signalled after register list written */
-    KEVENT          ExitEvent;      /* signalled to terminate poller */
-    PETHREAD        PollerThread;   /* referenced; ObDereferenced on teardown */
+    /* Completion is interrupt-driven (ISR → DPC → RkMppJobComplete).
+     * The vestigial polling thread + KickEvent/ExitEvent that
+     * preceded Task 3's interrupt path were removed in the I14
+     * cleanup. */
 } RKMPP_JOB_QUEUE, *PRKMPP_JOB_QUEUE;
 
 /* -----------------------------------------------------------------------

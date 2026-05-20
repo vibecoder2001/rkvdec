@@ -261,6 +261,29 @@ bus_idled:;
 
     /* Step 2: set pwr-off bit (hi-word-mask write with value=mask). */
     PmuHiwordWrite(D->PwrOffset, D->PwrBit, D->PwrBit);
+
+    /* Step 3: poll until the PD reports !IsOn (Linux mirrors this in
+     * rockchip_pmu_set_power_state).  Without the poll a fast
+     * Drop→Raise cycle (driver reinstall + FullCoreReset path) can
+     * issue PowerOn before hardware acknowledged the previous PowerOff,
+     * leaving the PMU FSM in an inconsistent half-state — the next
+     * Raise then wedges the codec until a reboot.  Symptom matches
+     * memory rk3588_pmu_idle_reset_ordering.  Domains without a
+     * StatusBit/RepairStatusBit (the "no status mechanism" path of
+     * PmuDomainIsOn that returns TRUE) fall through quickly because
+     * IsOn never returns FALSE — they get a small fixed delay below.
+     * Review I4. */
+    for (ULONG i = 0; i < 10000; i++) {
+        if (!PmuDomainIsOn(D)) {
+            return STATUS_SUCCESS;
+        }
+        KeStallExecutionProcessor(1);
+    }
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+               "rkmpp_ccu: power-off status timeout (PD pwrBit=0x%x) — "
+               "proceeding anyway\n", D->PwrBit);
+    /* Non-fatal — the bit was written, and on domains without status
+     * the FSM is content; only flag for diagnostics. */
     return STATUS_SUCCESS;
 }
 

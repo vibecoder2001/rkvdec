@@ -496,6 +496,24 @@ RkIommuIfcIsPtAttached(_In_ PVOID ProviderContext)
     return dev->PtAttached;
 }
 
+/* WaitPtAttached — block until PtAttachedEvent fires (or TimeoutMs).
+ * Master returns SUCCESS immediately (always attached); slave waits
+ * on the event signalled by RkIommuSlaveOnMasterArrival.  Replaces
+ * the 100 ms × 10 poll loop the codec driver used to do in
+ * RkMppPeerOnRvd0Connected.  PASSIVE_LEVEL only. */
+static NTSTATUS
+RkIommuIfcWaitPtAttached(_In_ PVOID ProviderContext, _In_ ULONG TimeoutMs)
+{
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev) return STATUS_DEVICE_NOT_READY;
+    if (!dev->IsCodecSlave) return STATUS_SUCCESS;  /* master / standalone */
+    if (dev->PtAttached)    return STATUS_SUCCESS;  /* fast path */
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000LL);
+    return KeWaitForSingleObject(&dev->PtAttachedEvent,
+                                 Executive, KernelMode, FALSE, &timeout);
+}
+
 /* ---------------------------------------------------------------------------
  * RkIommuRegisterIfc — called from device.c after WdfDeviceCreate
  * --------------------------------------------------------------------------- */
@@ -537,6 +555,7 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.MaskIrq                  = RkIommuMaskIrq;
     ifc.UnmaskIrq                = RkIommuUnmaskIrq;
     ifc.IsPtAttached             = RkIommuIfcIsPtAttached;
+    ifc.WaitPtAttached           = RkIommuIfcWaitPtAttached;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

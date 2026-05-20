@@ -26,6 +26,13 @@
  * (VCD, CACHE, AFBC) at 64 KB-spaced base addresses with un-allocated
  * phys in between, so they CANNOT be merged: we map each independently
  * and look them up via index. */
+/* rkvdec2 (link+regs are contiguous in ACPI _CRS so we merge to one
+ * MmioBase) — N=1.  Symmetry with rkav1d/device.c (which uses N=3)
+ * keeps the device-context shape consistent; the array machinery
+ * compiles to a single addressable entry and is no overhead.
+ * Review I5: documented as intentional design symmetry rather
+ * than removed; review comment suggested dead code but the cost is
+ * zero and it makes the two device.c files line-for-line parallel. */
 #define RKMPP_MAX_MMIO_WINDOWS 1
 
 typedef struct _RKMPP_MMIO_WINDOW {
@@ -920,9 +927,16 @@ VOID RkMppPeerOnRvd0Connected(_In_ WDFDEVICE Device)
     PRKMPP_DEVICE ctx = RkMppDeviceGet(Device);
     if (!ctx) return;
 
-    /* Slave PT might still be propagating.  Brief poll (1s).  In the
-     * common case IsPtAttached is TRUE on the first check. */
-    if (ctx->Ifcs.Iommu.IsPtAttached) {
+    /* Slave PT might still be propagating.  Event-driven wait via
+     * the v8 ifc — blocks on the slave's PtAttachedEvent (signalled
+     * by RkIommuSlaveOnMasterArrival) up to 1 s.  Replaces the
+     * 100 ms × 10 KeDelayExecutionThread loop.  Common case wakes
+     * immediately if PtAttached was already true.  Review I7. */
+    if (ctx->Ifcs.Iommu.WaitPtAttached) {
+        (void)ctx->Ifcs.Iommu.WaitPtAttached(
+            ctx->Ifcs.Iommu.Header.Context, 1000);
+    } else if (ctx->Ifcs.Iommu.IsPtAttached) {
+        /* Older ifc (pre-v8) — fall back to the original poll. */
         for (ULONG i = 0; i < 10; i++) {
             if (ctx->Ifcs.Iommu.IsPtAttached(ctx->Ifcs.Iommu.Header.Context))
                 break;

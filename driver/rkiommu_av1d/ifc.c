@@ -359,6 +359,17 @@ RkIommuAv1dIfcIsPtAttached(_In_ PVOID ProviderContext)
     return (dev->Domain != NULL) ? TRUE : FALSE;
 }
 
+/* WaitPtAttached — AV1D has no slave; readiness is decided at
+ * PrepareHardware.  Return immediately. */
+static NTSTATUS
+RkIommuAv1dIfcWaitPtAttached(_In_ PVOID ProviderContext, _In_ ULONG TimeoutMs)
+{
+    UNREFERENCED_PARAMETER(TimeoutMs);
+    PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
+    if (!dev) return STATUS_DEVICE_NOT_READY;
+    return (dev->Domain != NULL) ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY;
+}
+
 /* ---------------------------------------------------------------------------
  * RkIommuRegisterIfc — called from device.c after WdfDeviceCreate
  * --------------------------------------------------------------------------- */
@@ -393,6 +404,7 @@ NTSTATUS RkIommuRegisterIfc(_In_ WDFDEVICE Device)
     ifc.MaskIrq                  = RkIommuMaskIrq;
     ifc.UnmaskIrq                = RkIommuUnmaskIrq;
     ifc.IsPtAttached             = RkIommuAv1dIfcIsPtAttached;
+    ifc.WaitPtAttached           = RkIommuAv1dIfcWaitPtAttached;
 
     WDF_QUERY_INTERFACE_CONFIG cfg;
     WDF_QUERY_INTERFACE_CONFIG_INIT(&cfg,

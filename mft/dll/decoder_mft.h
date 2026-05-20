@@ -175,6 +175,12 @@ private:
     bool        dump_checked_    = false;     /* sentinel probed once */
     size_t      dump_bytes_      = 0;
     static constexpr size_t kDumpBytesMax = 50ULL * 1024ULL * 1024ULL;
+    /* Per-instance "output mode banner already logged" flag — previously
+     * file-scope `static bool logged_av1/_h264/_hevc/_vp9`, which was
+     * stale across instances (an H.264 ProcessOutput later in the same
+     * process wouldn't print its banner because the AV1 path had
+     * already flipped the flag).  Review MFT #25. */
+    bool        output_mode_logged_ = false;
 
     /* Write one input AU to the dumper if active.  No-op on first call
      * if sentinel "mft_dump.flag" is absent, or once the cap is hit.

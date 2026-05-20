@@ -40,23 +40,31 @@ static HRESULT WriteClsidRegistry(REFGUID clsid,
     LONG s = RegCreateKeyExW(HKEY_CLASSES_ROOT, key_path, 0, nullptr,
                              0, KEY_WRITE, nullptr, &root, nullptr);
     if (s != ERROR_SUCCESS) return HRESULT_FROM_WIN32(s);
-    RegSetValueExW(root, nullptr, 0, REG_SZ,
+    LONG sFriendly = RegSetValueExW(root, nullptr, 0, REG_SZ,
                    (const BYTE*)friendly,
                    (DWORD)((wcslen(friendly) + 1) * sizeof(wchar_t)));
 
     HKEY srv;
-    s = RegCreateKeyExW(root, L"InprocServer32", 0, nullptr,
+    LONG sSrv = RegCreateKeyExW(root, L"InprocServer32", 0, nullptr,
                        0, KEY_WRITE, nullptr, &srv, nullptr);
-    if (s == ERROR_SUCCESS) {
-        RegSetValueExW(srv, nullptr, 0, REG_SZ,
+    LONG sPath = ERROR_SUCCESS, sThread = ERROR_SUCCESS;
+    if (sSrv == ERROR_SUCCESS) {
+        sPath = RegSetValueExW(srv, nullptr, 0, REG_SZ,
                        (const BYTE*)dll_path,
                        (DWORD)((wcslen(dll_path) + 1) * sizeof(wchar_t)));
         const wchar_t *both = L"Both";
-        RegSetValueExW(srv, L"ThreadingModel", 0, REG_SZ,
+        sThread = RegSetValueExW(srv, L"ThreadingModel", 0, REG_SZ,
                        (const BYTE*)both, (DWORD)(5 * sizeof(wchar_t)));
         RegCloseKey(srv);
     }
     RegCloseKey(root);
+    /* Surface the first partial-registration failure so DllRegisterServer
+     * doesn't silently return SUCCESS with an incomplete registry state
+     * (which produces an unactivatable CLSID later). */
+    if (sFriendly != ERROR_SUCCESS) return HRESULT_FROM_WIN32(sFriendly);
+    if (sSrv      != ERROR_SUCCESS) return HRESULT_FROM_WIN32(sSrv);
+    if (sPath     != ERROR_SUCCESS) return HRESULT_FROM_WIN32(sPath);
+    if (sThread   != ERROR_SUCCESS) return HRESULT_FROM_WIN32(sThread);
     return S_OK;
 }
 

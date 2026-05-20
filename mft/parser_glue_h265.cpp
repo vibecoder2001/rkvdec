@@ -232,8 +232,17 @@ static H265ParseStatus parse_scaling_list_data(BitReader *br, H265ScalingList *s
                 /* Copy from another matrix. */
                 uint32_t delta = br_ue(br);
                 if (delta) {
+                    /* Compare BEFORE the multiply.  br_ue can return
+                     * values up to ~2^32 (then sets br->failed); the
+                     * `delta *= mat_step` (mat_step <= 3) can wrap u32
+                     * to a small value and make the bound check below
+                     * spuriously pass.  Reject by checking the
+                     * multiplied value against u64 first.  Review
+                     * parser Important #19. */
+                    if ((uint64_t)delta * (uint64_t)mat_step >
+                        (uint64_t)mat_id)
+                        return H265_PARSE_INVALID;
                     delta *= mat_step;
-                    if ((uint32_t)mat_id < delta) return H265_PARSE_INVALID;
                     int from = mat_id - (int)delta;
                     int n = (sz_id == 0) ? 16 : 64;
                     uint8_t *dst, *src;
@@ -475,9 +484,17 @@ static H265ParseStatus parse_vps(BitReader *br, H265ParseResult *out) {
          * the bitreader past EOF safely. */
         uint32_t nh = br_ue(br);
         if (nh) {
-            /* Best-effort skip: there is no fixed bit count here so
-             * the only safe action is to ignore the rest of the VPS. */
-            (void)br_eof(br);
+            /* Cannot recover the bitreader position past a variable-
+             * length HRD body without a full parser.  Reject the VPS
+             * instead of silently leaving the reader at the wrong
+             * offset — without this trap, a future maintainer who
+             * adds vps_extension parsing further down would read
+             * from a bit position that doesn't match the bitstream
+             * boundary, with no detectable error.  No real-world
+             * stream we've seen uses vps_num_hrd_parameters != 0;
+             * if one does, implement parse_hrd_parameters() and
+             * lift the rejection.  Review parser Important #15. */
+            return H265_PARSE_UNSUPPORTED;
         }
     }
 
@@ -675,9 +692,22 @@ static H265ParseStatus parse_pps(BitReader *br, H265ParseResult *out) {
     if (tmp.tiles_enabled_flag) {
         /* Capture the count + uniform flag.  We don't store the
          * per-column / per-row width tables — the regbuilder author
-         * who ships tile support will need to extend H265Pps. */
-        tmp.num_tile_columns_minus1 = (uint8_t)br_ue(br);
-        tmp.num_tile_rows_minus1    = (uint8_t)br_ue(br);
+         * who ships tile support will need to extend H265Pps.
+         *
+         * Bound num_tile_columns_minus1 / _rows_minus1 BEFORE the
+         * uint8 truncation that previously hid huge values.  HEVC
+         * spec caps each at 20-1 / 22-1 respectively (Table A-1);
+         * h265_packed_tables.cpp uses a 20/22 loop bound when it
+         * packs the PPS register, so anything larger silently
+         * truncates there too.  Reject loudly at parse instead of
+         * silently corrupting state.  Review parser Important #14. */
+        {
+            uint32_t ncols = br_ue(br);
+            uint32_t nrows = br_ue(br);
+            if (ncols >= 20 || nrows >= 22) return H265_PARSE_INVALID;
+            tmp.num_tile_columns_minus1 = (uint8_t)ncols;
+            tmp.num_tile_rows_minus1    = (uint8_t)nrows;
+        }
         tmp.uniform_spacing_flag    = (uint8_t)br_u1(br);
         if (!tmp.uniform_spacing_flag) {
             for (int i = 0; i < tmp.num_tile_columns_minus1; i++)

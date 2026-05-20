@@ -27,9 +27,21 @@
  * format as BSP MPP captures (one 32-bit word per line, %08x).  Lets
  * us byte-diff our buffers against tests/data/av1/av1capture/ to find
  * where chroma config diverges. */
+/* Cache RKMPP_AV1_DUMP_DIR once on first call.  Previously every
+ * Av1DumpBuffer/Av1DumpRaw/Av1DumpTileOut call hit getenv() per kick;
+ * getenv on Windows can walk the registry-derived environment block
+ * which dominates per-kick driver overhead at 4K.  Review MFT #30. */
+static const char *Av1DumpDir() {
+    static const char *cached = (const char *)(intptr_t)-1;
+    if (cached == (const char *)(intptr_t)-1) {
+        cached = std::getenv("RKMPP_AV1_DUMP_DIR");
+    }
+    return cached;
+}
+
 static void Av1DumpBuffer(const char *kind, uint32_t kick,
                           const void *data, size_t size_bytes) {
-    const char *dir = std::getenv("RKMPP_AV1_DUMP_DIR");
+    const char *dir = Av1DumpDir();
     if (!dir || !data || !size_bytes) return;
     char path[512];
     std::snprintf(path, sizeof(path), "%s/%s_%u.txt", dir, kind, kick);
@@ -43,7 +55,7 @@ static void Av1DumpBuffer(const char *kind, uint32_t kick,
 
 static void Av1DumpRaw(const char *kind, uint32_t kick,
                        const void *data, size_t size_bytes) {
-    const char *dir = std::getenv("RKMPP_AV1_DUMP_DIR");
+    const char *dir = Av1DumpDir();
     if (!dir || !data || !size_bytes) return;
     char path[512];
     std::snprintf(path, sizeof(path), "%s/%s_%u.txt", dir, kind, kick);
@@ -66,7 +78,7 @@ static void Av1DumpTileOut(uint32_t kick, uint32_t w, uint32_t h,
 
     /* Always print region stats to stderr (gated on dump-dir presence so
      * normal runs are quiet; remove the gate if you want stats always). */
-    const char *dir = std::getenv("RKMPP_AV1_DUMP_DIR");
+    const char *dir = Av1DumpDir();
     if (dir) {
         /* Count non-zero bytes in Y and UV regions. */
         size_t y_nz = 0, uv_nz = 0;
@@ -965,7 +977,7 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
          * integers on Linux (meaningless here) or zero (msb).  All
          * other non-zero regs are compared against av1capture/reg_N_in.txt
          * to find control-register divergences between our output and BSP. */
-        const char *ddir = std::getenv("RKMPP_AV1_DUMP_DIR");
+        const char *ddir = Av1DumpDir();
         if (ddir) {
             char rpath[512];
             std::snprintf(rpath, sizeof(rpath), "%s/reg_%u_in.txt", ddir, k);
@@ -1020,7 +1032,7 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
     /* Dump pool_output raw (full allocated size) to expose codec-side
      * stride.  Filename encodes configured frame_w/h; consumer can
      * ffmpeg-probe at coded vs display widths to find the real stride. */
-    if (const char *dir = std::getenv("RKMPP_AV1_DUMP_DIR")) {
+    if (const char *dir = Av1DumpDir()) {
         const Av1DecodeEngine::HwBuf &po = e->pool_output[slot_idx];
         if (po.user_va && po.size) {
             char path[512];

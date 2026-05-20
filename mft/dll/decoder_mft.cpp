@@ -43,9 +43,17 @@ static ::Codec ToEngineCodec(CodecKind k) {
 static bool MftTimingEnabled() {
     static int cached = -1;
     if (cached < 0) {
-        char buf[8] = {};
+        /* "any non-empty value other than literal '0' or 'false'
+         * enables timing" — the buf only needs to read enough bytes
+         * to distinguish those.  Previously 8 bytes which was fine
+         * but underdocumented (env value "enabled" still works
+         * because the first byte 'e' isn't '0').  Document and
+         * tighten the buffer. */
+        char buf[16] = {};
         DWORD n = GetEnvironmentVariableA("RKMPP_TIMING", buf, sizeof(buf));
-        cached = (n > 0 && buf[0] != '0') ? 1 : 0;
+        bool on = (n > 0) && (buf[0] != '0') &&
+                  !(buf[0] == 'f' && buf[1] == 'a');   /* "false" */
+        cached = on ? 1 : 0;
     }
     return cached != 0;
 }
@@ -1574,18 +1582,15 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
         HRESULT hr = S_OK;
 
         ID3D11Device *use_d3d = d3d_device_;
-        {
-            static bool logged_av1 = false;
-            if (!logged_av1) {
-                if (use_d3d && width_ && height_)
-                    std::fprintf(stderr, "rkmpp MFT(av1): output mode = D3D11_SURFACE_BUFFER\n");
-                else if (dxgi_manager_)
-                    std::fprintf(stderr, "rkmpp MFT(av1): output mode = 2D_MEDIA_BUFFER\n");
-                else
-                    std::fprintf(stderr, "rkmpp MFT(av1): output mode = SYSMEM_1D_BUFFER\n");
-                std::fflush(stderr);
-                logged_av1 = true;
-            }
+        if (!output_mode_logged_) {
+            if (use_d3d && width_ && height_)
+                std::fprintf(stderr, "rkmpp MFT(av1): output mode = D3D11_SURFACE_BUFFER\n");
+            else if (dxgi_manager_)
+                std::fprintf(stderr, "rkmpp MFT(av1): output mode = 2D_MEDIA_BUFFER\n");
+            else
+                std::fprintf(stderr, "rkmpp MFT(av1): output mode = SYSMEM_1D_BUFFER\n");
+            std::fflush(stderr);
+            output_mode_logged_ = true;
         }
 
         if (use_d3d && width_ && height_) {
@@ -2034,25 +2039,22 @@ STDMETHODIMP DecoderMFT::ProcessOutput(DWORD /*flags*/, DWORD c,
      *   - "QI/GVS failed"      — manager was sent but didn't expose
      *     ID3D11Device or even IMFDXGIDeviceManager.
      *   - file consumer        — non-EVR path (mft_decode → file). */
-    {
-        static bool logged = false;
-        if (!logged) {
-            if (use_d3d && width_ && height_) {
-                std::fprintf(stderr,
-                    "rkmpp MFT: output mode = D3D11_SURFACE_BUFFER\n");
-            } else if (dxgi_manager_) {
-                std::fprintf(stderr,
-                    "rkmpp MFT: output mode = 2D_MEDIA_BUFFER (EVR, "
-                    "D3D9-backed manager — no D3D11 device available)\n");
-            } else {
-                std::fprintf(stderr,
-                    "rkmpp MFT: output mode = SYSMEM_1D_BUFFER "
-                    "(no SET_D3D_MANAGER from host — EVR's GPU upload "
-                    "still happens but in EVR-internal sysmem path)\n");
-            }
-            std::fflush(stderr);
-            logged = true;
+    if (!output_mode_logged_) {
+        if (use_d3d && width_ && height_) {
+            std::fprintf(stderr,
+                "rkmpp MFT: output mode = D3D11_SURFACE_BUFFER\n");
+        } else if (dxgi_manager_) {
+            std::fprintf(stderr,
+                "rkmpp MFT: output mode = 2D_MEDIA_BUFFER (EVR, "
+                "D3D9-backed manager — no D3D11 device available)\n");
+        } else {
+            std::fprintf(stderr,
+                "rkmpp MFT: output mode = SYSMEM_1D_BUFFER "
+                "(no SET_D3D_MANAGER from host — EVR's GPU upload "
+                "still happens but in EVR-internal sysmem path)\n");
         }
+        std::fflush(stderr);
+        output_mode_logged_ = true;
     }
 
     /* P010 doubles row pitch + sample size vs NV12; subresource layout

@@ -22,10 +22,16 @@ typedef struct _RKMPP_FILE_CTX {
     WDFDEVICE     Device;     /* back-pointer so cleanup can reach the ifcs */
     UINT64        AllocatedBytes; /* rounded bytes currently charged to file */
     UINT32        BufferCount;    /* buffers currently charged to file */
-    volatile LONG ErrorCount; /* count of error-flagged jobs this session;
-                                 read by EvtFileCleanup to decide whether
-                                 to invoke the soft-tier IOMMU force-reset
-                                 for session isolation */
+    volatile LONG ErrorCount; /* session-cumulative count of error-flagged
+                                 jobs.  Read by EvtFileCleanup to decide
+                                 whether to invoke the soft-tier IOMMU
+                                 force-reset for session isolation; reset
+                                 to zero only there (on session end).
+                                 INTENTIONALLY does not decrement on a
+                                 subsequent successful kick — the value is
+                                 a "did this file ever produce a hardware
+                                 error?" signal, not a current-fault
+                                 count.  Review I9. */
 } RKMPP_FILE_CTX, *PRKMPP_FILE_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(RKMPP_FILE_CTX, RkMppFileGet);

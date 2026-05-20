@@ -108,14 +108,8 @@ typedef struct _RKMPP_JOB_QUEUE {
      * between the write and the DPC's read. */
     volatile UINT32 LastIsrHwStatus;
 
-    /* Polling-completion thread.  WdfInterruptCreate currently fails for
-     * rkmpp instances (STATUS_WDF_INVALID_INTERRUPT_CONFIG), so we run a
-     * per-device kernel thread that polls INT_STATUS after each kick.
-     * RkMppJobStart signals KickEvent; the thread polls + completes.
-     * On teardown, ExitEvent shuts the thread down. */
-    KEVENT          KickEvent;      /* signalled after register list written */
-    KEVENT          ExitEvent;      /* signalled to terminate poller */
-    PETHREAD        PollerThread;   /* referenced; ObDereferenced on teardown */
+    /* Completion is interrupt-driven (ISR → DPC → RkMppJobComplete).
+     * Vestigial PollerThread/KickEvent/ExitEvent removed in I14. */
 
     /* Per-bit mask of register indices [0..511] that were nonzero in
      * the most recent kick.  Used to skip MMIO writes for regs that

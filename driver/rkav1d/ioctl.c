@@ -83,8 +83,12 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                                (PVOID*)&in, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        if (in->StructSize < sizeof(*in)) {
-            status = STATUS_INVALID_PARAMETER;
+        /* Upper-bound StructSize too — see rkvdec/ioctl.c for the
+         * rationale.  Review I1. */
+        if (in->StructSize < sizeof(*in) || in->StructSize > sizeof(*in)) {
+            status = (in->StructSize > sizeof(*in))
+                     ? STATUS_REVISION_MISMATCH
+                     : STATUS_INVALID_PARAMETER;
             break;
         }
 
@@ -117,6 +121,12 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         if (!fctx->Device) {
             /* No buffers ever allocated on this file handle. */
             status = STATUS_NOT_FOUND;
+            break;
+        }
+
+        /* Reject cookie 0 sentinel.  Review I10. */
+        if (in->BufferHandle == 0) {
+            status = STATUS_INVALID_PARAMETER;
             break;
         }
 

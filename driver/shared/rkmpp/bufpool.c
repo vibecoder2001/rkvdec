@@ -37,10 +37,39 @@ extern PRKIOMMU_INTERFACE RkMppGetIommuIfc(_In_ WDFDEVICE Device);
 
 /* -----------------------------------------------------------------------
  * Cookie counter — one global, starts at 1, never wraps in practice
+ *
+ * Cookies are sequential UINT64 values vended to user-mode and
+ * round-tripped via Submit/Wait IOCTLs.  The counter is NOT reset on
+ * PnP cycle: a survivor user-mode process from a previous cycle that
+ * remembers an old handle would hit RkMppBufLookupIova's per-file
+ * walk, find no match (we cleared the list on PnP teardown), and get
+ * STATUS_NOT_FOUND — safe by construction.
+ *
+ * Cross-file confusion is similarly prevented by per-file lookup —
+ * file A guessing file B's sequential cookies cannot reach B's iovas
+ * because RkMppBufLookupIova walks only the caller's own file ctx
+ * (driver/rkvdec/job.c::RkMppBufLookupIova).  Adding a per-file salt
+ * would buy nothing today; documented as future-proofing.
+ * Review I2.
  * --------------------------------------------------------------------- */
 static volatile LONG64 g_nextCookie = 1;
 static volatile LONG64 g_totalAllocatedBytes = 0;
 
+/* Buffer-size caps.  These three values interact:
+ *   - RKMPP_MAX_BUFFER_BYTES bounds a single buffer (128 MiB).
+ *   - RKMPP_MAX_FILE_BYTES bounds aggregate bytes per file (2 GiB).
+ *   - RKMPP_MAX_GLOBAL_BYTES bounds aggregate bytes across all files
+ *     in the driver (4 GiB).
+ *   - RKMPP_MAX_FILE_BUFFER_COUNT bounds buffer count per file (128).
+ *
+ * Note RKMPP_MAX_FILE_BUFFER_COUNT × RKMPP_MAX_BUFFER_BYTES = 16 GiB,
+ * which exceeds RKMPP_MAX_FILE_BYTES.  This is intentional: 2 GiB
+ * per file allows at most 16 max-size buffers, but a file with many
+ * small buffers can still reach 128.  Two caps interact: byte cap
+ * dominates for large buffers, count cap dominates for small ones.
+ * Once IOCTL surface is non-admin, audit whether 4 GiB global is
+ * still appropriate (a single process can spawn 100 file handles to
+ * reach the global cap).  Review I11. */
 static const ULONG  RKMPP_MAX_BUFFER_BYTES = 128u * 1024u * 1024u;
 static const UINT64 RKMPP_MAX_FILE_BYTES   = 2ull * 1024ull * 1024ull * 1024ull;
 static const LONG64 RKMPP_MAX_GLOBAL_BYTES = 4ll * 1024ll * 1024ll * 1024ll;

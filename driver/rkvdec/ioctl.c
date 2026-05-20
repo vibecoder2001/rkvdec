@@ -100,8 +100,15 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                                (PVOID*)&in, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        if (in->StructSize < sizeof(*in)) {
-            status = STATUS_INVALID_PARAMETER;
+        /* Reject both undersized (older caller using a smaller struct
+         * that won't carry expected fields) and oversized (a caller
+         * built against a never-shipped extension we don't recognise)
+         * StructSize values.  Without the upper bound we silently
+         * accept attacker-shaped versions in the future.  Review I1. */
+        if (in->StructSize < sizeof(*in) || in->StructSize > sizeof(*in)) {
+            status = (in->StructSize > sizeof(*in))
+                     ? STATUS_REVISION_MISMATCH
+                     : STATUS_INVALID_PARAMETER;
             break;
         }
 
@@ -134,6 +141,18 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
         if (!fctx->Device) {
             /* No buffers ever allocated on this file handle. */
             status = STATUS_NOT_FOUND;
+            break;
+        }
+
+        /* Cookie 0 is reserved as the "no buffer" sentinel — reject
+         * explicitly at the IOCTL boundary so a caller that erroneously
+         * passes 0 doesn't reach RkMppBufFree's NOT_FOUND walk (and
+         * doesn't accidentally race a freshly-allocated cookie 0 if
+         * the global counter were ever reset post-PnP-cycle).  The
+         * counter is never reused but a defensive reject is cheap.
+         * Review I10. */
+        if (in->BufferHandle == 0) {
+            status = STATUS_INVALID_PARAMETER;
             break;
         }
 

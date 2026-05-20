@@ -126,7 +126,6 @@ static VOID RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job);
 static VOID RkMppJobComplete(_In_ WDFDEVICE Device,
                              _In_ NTSTATUS Result,
                              _In_ UINT32 HardwareStatus);
-static KSTART_ROUTINE RkMppPollerThread;
 
 static BOOLEAN
 RkMppJobReferencesBuffer(_In_ const RKMPP_JOB *Job,
@@ -171,41 +170,14 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     Queue->Interrupt = NULL;
     RtlZeroMemory(Queue->PrevNonzeroMask, sizeof(Queue->PrevNonzeroMask));
     Queue->Draining = 0;
-
-    /* Auto-reset kick: each Set wakes the poller exactly once. */
-    KeInitializeEvent(&Queue->KickEvent, SynchronizationEvent, FALSE);
-    /* Notification exit: stays signalled so the poller's wait returns
-     * even if KickEvent was just set racing with teardown. */
-    KeInitializeEvent(&Queue->ExitEvent, NotificationEvent, FALSE);
-    Queue->PollerThread = NULL;
-
-    HANDLE threadHandle = NULL;
-    OBJECT_ATTRIBUTES oa;
-    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-    NTSTATUS status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS,
-                                           &oa, NULL, NULL,
-                                           RkMppPollerThread, Queue);
-    if (NT_SUCCESS(status)) {
-        ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS,
-                                  *PsThreadType, KernelMode,
-                                  (PVOID*)&Queue->PollerThread, NULL);
-        ZwClose(threadHandle);
-    } else {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "rkav1d: poller thread create failed 0x%08x\n", status);
-    }
+    /* Vestigial PollerThread/KickEvent/ExitEvent removed in the
+     * I14 cleanup — completion is interrupt-driven. */
 }
 
 VOID
 RkMppJobQueueTeardown(_Inout_ RKMPP_JOB_QUEUE *Queue)
 {
-    if (Queue->PollerThread) {
-        KeSetEvent(&Queue->ExitEvent, IO_NO_INCREMENT, FALSE);
-        KeWaitForSingleObject(Queue->PollerThread, Executive, KernelMode,
-                              FALSE, NULL);
-        ObDereferenceObject(Queue->PollerThread);
-        Queue->PollerThread = NULL;
-    }
+    UNREFERENCED_PARAMETER(Queue);
 }
 
 /* -----------------------------------------------------------------------
@@ -447,43 +419,6 @@ RkMppJobQueueResume(_In_ WDFDEVICE Device,
     if (next) {
         RkMppJobStart(Device, next);
     }
-}
-
-/* -----------------------------------------------------------------------
- * RkMppPollerThread — vestigial.  Completion is interrupt-driven
- * exclusively (RkMppDeviceCreate makes WdfInterruptCreate failure fatal
- * at PnP load); RkMppEvtIsr → RkMppEvtDpc → RkMppJobComplete handles
- * every kick.  This thread now just consumes KickEvent signals and
- * waits for ExitEvent at teardown; the prior INT_STATUS poll loop
- * (Phase A 50µs busy-wait + Phase B 1ms sleep, with on-done AXI drain
- * and on-timeout diagnostic dump) has been removed.
- *
- * If we re-enable cached buffers the AXI drain (PERF_WORKING_CNT
- * settle + 1500µs stall) will need to live somewhere — either in the
- * DPC (DISPATCH_LEVEL, would spin) or here as a drain-only thread
- * that the DPC defers to.  Likewise the timeout diagnostic dump
- * previously fired from this thread; under ISR-driven completion the
- * DPC could dump on err_mask hits if we want that signal back.
- *
- * The thread + KickEvent/ExitEvent infrastructure stays in place so
- * re-enabling polling for triage is a small revert rather than a
- * rebuild of the kernel-thread plumbing.
- * --------------------------------------------------------------------- */
-
-static VOID
-RkMppPollerThread(_In_ PVOID Context)
-{
-    RKMPP_JOB_QUEUE *q = (RKMPP_JOB_QUEUE *)Context;
-    PVOID waitObjects[2] = { &q->ExitEvent, &q->KickEvent };
-
-    for (;;) {
-        NTSTATUS w = KeWaitForMultipleObjects(2, waitObjects, WaitAny,
-                                              Executive, KernelMode,
-                                              FALSE, NULL, NULL);
-        if (w == STATUS_WAIT_0) break;     /* ExitEvent — teardown */
-        /* KickEvent: nothing to do — ISR/DPC handles completion. */
-    }
-    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 /* -----------------------------------------------------------------------
@@ -845,14 +780,15 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         }
     }
 
-    if (hasKick) {
-        /* Real decode — engage the poller to watch INT_STATUS. */
-        KeSetEvent(&q->KickEvent, IO_NO_INCREMENT, FALSE);
-    } else {
-        /* Test-only register write set (smoke tests, peek-only).
-         * Complete the job immediately without waiting for hardware. */
+    if (!hasKick) {
+        /* Submissions lacking the kick bit are rejected at the IOCTL
+         * boundary (commit 1), so this branch is unreachable from
+         * user-mode.  Kept as a defensive trip for any future internal
+         * caller — completes synchronously without going through the
+         * ISR/DPC chain. */
         RkMppJobComplete(Device, STATUS_SUCCESS, 0);
     }
+    /* Real kicks complete via the ISR → DPC chain. */
 }
 
 /* -----------------------------------------------------------------------

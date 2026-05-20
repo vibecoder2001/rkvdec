@@ -195,11 +195,19 @@ static void read_frame_size_with_refs(BitReader &r, const ParserState &st,
         uint32_t use_ref = br_bit(r);
         if (use_ref) {
             uint8_t slot = pp_partial.frame_refs[i].index;
+            /* Only mark `found` when we actually copied dimensions
+             * from a VALID DPB slot.  Previously `found` was set on
+             * `use_ref == 1` regardless of slot validity — an
+             * adversarial stream with use_ref=1 pointing at an
+             * invalid slot left pp.width/pp.height at the
+             * memset-zero initial value, and downstream
+             * vp9_scale_factor and pp.width-driven stride math
+             * blew up.  Review parser Important #5. */
             if (slot < kNumRefFrames && st.valid[slot]) {
                 pp.width  = st.ref_state[slot].width;
                 pp.height = st.ref_state[slot].height;
+                found = true;
             }
-            found = true;
             break;
         }
     }
@@ -987,6 +995,15 @@ int Vp9Parser_SuperframeSplit(const uint8_t *buf, size_t len,
         for (int b = 0; b < bytes_per_sz; b++)
             sz |= (uint32_t)(*p++) << (b * 8);
 
+        /* `sz` accumulates up to 4 bytes (bytes_per_sz <= 4) of
+         * stream-supplied size into uint32; on 64-bit `remain` is
+         * size_t, so the comparison promotes `sz` to size_t and
+         * works correctly across the full uint32 range.  Documented
+         * for the 32-bit-size_t case where the comparison would
+         * still work (both sides uint32) but the per-frame
+         * `remain -= sz` below safely underflows nowhere because
+         * we've validated `sz <= remain` first.  Review parser
+         * Important #16. */
         if (sz > remain) return -1;
         frames[i] = data;
         sizes[i]  = sz;

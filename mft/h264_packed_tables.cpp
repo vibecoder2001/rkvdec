@@ -206,9 +206,20 @@ void H264PackFrameRps(uint8_t out[RKH264_RPS_SIZE],
         } else if (d.flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM) {
             wrap = (uint16_t)d.frame_num;
         } else {
-            wrap = (d.frame_num > frame_num)
-                 ? (uint16_t)((int32_t)d.frame_num - (int32_t)max_frame_num)
-                 : (uint16_t)d.frame_num;
+            /* Defense-in-depth: clamp the per-dpb-entry frame_num
+             * into the [0, max_frame_num) range before the signed
+             * cast.  In real H.264 streams `frame_num` is at most
+             * log2_max_frame_num_minus4 + 4 = 16 bits wide so this
+             * is a no-op, but a V4L2-control consumer that handed us
+             * a wider value would hit implementation-defined behaviour
+             * in the signed cast.  Review parser Important #17. */
+            uint32_t df = (max_frame_num > 0)
+                        ? (d.frame_num % max_frame_num) : d.frame_num;
+            uint32_t cf = (max_frame_num > 0)
+                        ? (frame_num   % max_frame_num) : frame_num;
+            wrap = (df > cf)
+                 ? (uint16_t)((int32_t)df - (int32_t)max_frame_num)
+                 : (uint16_t)df;
         }
         bp.put(wrap, 16);
     }

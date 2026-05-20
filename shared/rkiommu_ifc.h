@@ -73,7 +73,14 @@ DEFINE_GUID(GUID_DEVINTERFACE_RKIOMMU,
  * the master's PdPhys.  Codec drivers paired with the slave (RVD1)
  * must wait on this before issuing any IOCTL that hits the iommu.
  * Master always returns TRUE; slave returns its PtAttached field. */
-#define RKIOMMU_IFC_VERSION 7u
+/* v8: add WaitPtAttached for event-driven slave readiness.  The
+ * slave's PtAttachedEvent is signalled when OnMasterArrival
+ * completes; consumers can KeWait on it via this method instead of
+ * polling IsPtAttached in a delay loop.  Master returns
+ * STATUS_SUCCESS immediately (always attached).  Slave waits up to
+ * TimeoutMs; returns STATUS_TIMEOUT if the event isn't set in
+ * time.  Caller MUST be at PASSIVE_LEVEL.  Review I7. */
+#define RKIOMMU_IFC_VERSION 8u
 
 typedef NTSTATUS (*RKIOMMU_QUERY_VERSION)(_Out_ PUINT32);
 
@@ -149,6 +156,12 @@ typedef NTSTATUS (*RKIOMMU_UNMASK_IRQ)(_In_ PVOID ProviderContext);
 
 typedef BOOLEAN (*RKIOMMU_IS_PT_ATTACHED)(_In_ PVOID ProviderContext);
 
+/* v8: blocks until the slave's PtAttachedEvent fires (or TimeoutMs
+ * elapses).  PASSIVE_LEVEL only.  Master returns STATUS_SUCCESS
+ * immediately.  Slave returns STATUS_TIMEOUT on expiry. */
+typedef NTSTATUS (*RKIOMMU_WAIT_PT_ATTACHED)(_In_ PVOID ProviderContext,
+                                             _In_ ULONG TimeoutMs);
+
 typedef struct _RKIOMMU_INTERFACE {
     INTERFACE                Header;
     UINT32                   Hid;     /* e.g. 0x3570 / 0x3571 */
@@ -166,4 +179,5 @@ typedef struct _RKIOMMU_INTERFACE {
     RKIOMMU_MASK_IRQ         MaskIrq;
     RKIOMMU_UNMASK_IRQ       UnmaskIrq;
     RKIOMMU_IS_PT_ATTACHED   IsPtAttached;    /* v7 */
+    RKIOMMU_WAIT_PT_ATTACHED WaitPtAttached;  /* v8 */
 } RKIOMMU_INTERFACE, *PRKIOMMU_INTERFACE;

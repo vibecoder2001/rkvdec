@@ -792,7 +792,17 @@ static int parse_frame_hdr(BitReader &r,
                             if (hint >= lo) { lo = hint; ridx = i; }
                         }
                     }
-                    if (ridx < 0) ridx = earliest_ref >= 0 ? earliest_ref : 0;
+                    /* Previously: if nothing was available we fell back
+                     * to slot 0 regardless of whether prev[0] was valid.
+                     * That hands the codec a refidx pointing at an
+                     * uninitialised DPB slot.  Now: if even earliest_ref
+                     * is -1 (no valid prev[] entry at all), fail the
+                     * parse instead of poisoning state.  Review parser
+                     * Important #6. */
+                    if (ridx < 0) {
+                        if (earliest_ref < 0) return -1;
+                        ridx = earliest_ref;
+                    }
                     h->refidx[k] = (int8_t)ridx;
                     if (ridx >= 0) frame_offs[ridx] = INT_MIN;
                 }
@@ -899,12 +909,21 @@ static int parse_frame_hdr(BitReader &r,
         h->tiling.log2_rows = (uint8_t)tile_log2(1, h->tiling.rows);
     }
 
+    /* Sentinel writes at index tiling.cols / tiling.rows are safe:
+     * dav1d sizes col_start_sb[DAV1D_MAX_TILE_COLS + 1] and
+     * row_start_sb[DAV1D_MAX_TILE_ROWS + 1] precisely for this
+     * post-loop entry.  Review parser Important #7. */
     h->tiling.col_start_sb[h->tiling.cols] = (uint16_t)sbw;
     h->tiling.row_start_sb[h->tiling.rows] = (uint16_t)sbh;
 
     if (h->tiling.log2_cols || h->tiling.log2_rows) {
         h->tiling.update = (uint16_t)br_u(r, h->tiling.log2_cols + h->tiling.log2_rows);
-        if (h->tiling.update >= (uint16_t)(h->tiling.cols * h->tiling.rows))
+        /* Use unsigned multiply (not uint16 truncation) so a future
+         * relaxation of tile-count caps doesn't silently mask the
+         * comparison.  Today max is DAV1D_MAX_TILE_COLS * _ROWS = 4096,
+         * fits trivially in u32.  Review parser Important #8. */
+        if ((unsigned)h->tiling.update >=
+            (unsigned)h->tiling.cols * (unsigned)h->tiling.rows)
             return -1;
         h->tiling.n_bytes = (uint8_t)(br_u(r, 2) + 1);
     }

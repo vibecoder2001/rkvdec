@@ -142,7 +142,14 @@ PmuHiwordWrite(_In_ ULONG offset, _In_ ULONG mask, _In_ ULONG value)
     WRITE_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + offset), word);
 }
 
-/* Returns TRUE when the domain is currently on. */
+/* Returns TRUE when the domain is currently on.
+ *
+ * For domains with neither RepairStatusBit nor StatusBit the function
+ * has no observable status to report and conservatively returns TRUE
+ * (the Linux PMU driver does the same — it falls through to a
+ * non-status-based idleness check).  Callers that poll for is-OFF
+ * must NOT spin forever on this case — see the early-break in
+ * RkMppPmuPowerOff. */
 static BOOLEAN PmuDomainIsOn(_In_ const RKMPP_PMU_DOMAIN *D)
 {
     if (D->RepairStatusBit) {
@@ -156,6 +163,15 @@ static BOOLEAN PmuDomainIsOn(_In_ const RKMPP_PMU_DOMAIN *D)
         return (val & D->StatusBit) == 0;  /* 0 = on */
     }
     return TRUE;  /* no status mechanism — assume on */
+}
+
+/* TRUE iff this domain exposes a meaningful is-on status path.
+ * Used by RkMppPmuPowerOff to avoid the full 10-ms spin on domains
+ * where PmuDomainIsOn unconditionally returns TRUE — those would
+ * otherwise wait the entire poll budget on every PowerOff. */
+static FORCEINLINE BOOLEAN PmuDomainHasStatusPath(_In_ const RKMPP_PMU_DOMAIN *D)
+{
+    return (D->RepairStatusBit != 0) || (D->StatusBit != 0);
 }
 
 NTSTATUS RkMppPmuPowerOn(_In_ const RKMPP_PMU_DOMAIN *D)
@@ -224,12 +240,12 @@ powered_on:
      * The CRU map lives in ccu.c — pmu.c only sees g_pmu_mmio, so we dump
      * just PMU state here and let the caller log CRU. */
     {
-        ULONG req = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x10C));
-        ULONG ack = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x118));
-        ULONG ist = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x120));
-        ULONG pwr = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x14C));
-        ULONG sta = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x180));
-        ULONG rep = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x290));
+        ULONG req = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_BUS_IDLE_REQ));
+        ULONG ack = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_BUS_IDLE_ACK));
+        ULONG ist = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_BUS_IDLE_ST));
+        ULONG pwr = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_PWR_GATE_CON));
+        ULONG sta = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_PWR_GATE_STATUS));
+        ULONG rep = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_PWR_REPAIR_STATUS));
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: bus-idle-ack timeout (PD pwrBit=0x%x) "
                    "REQ=0x%08x ACK=0x%08x IST=0x%08x PWR=0x%08x STA=0x%08x REP=0x%08x\n",
@@ -268,11 +284,18 @@ bus_idled:;
      * issue PowerOn before hardware acknowledged the previous PowerOff,
      * leaving the PMU FSM in an inconsistent half-state — the next
      * Raise then wedges the codec until a reboot.  Symptom matches
-     * memory rk3588_pmu_idle_reset_ordering.  Domains without a
-     * StatusBit/RepairStatusBit (the "no status mechanism" path of
-     * PmuDomainIsOn that returns TRUE) fall through quickly because
-     * IsOn never returns FALSE — they get a small fixed delay below.
-     * Review I4. */
+     * memory rk3588_pmu_idle_reset_ordering.
+     *
+     * Review finding #5: domains without a StatusBit/RepairStatusBit
+     * (PmuDomainIsOn returns TRUE unconditionally) would otherwise
+     * spin the full 10 ms before timing out — pure dead time.  Skip
+     * the poll for those, give the FSM one short stall instead.
+     * Today all codec PDs have status bits so this branch is
+     * defensive, but it costs nothing. */
+    if (!PmuDomainHasStatusPath(D)) {
+        KeStallExecutionProcessor(5);
+        return STATUS_SUCCESS;
+    }
     for (ULONG i = 0; i < 10000; i++) {
         if (!PmuDomainIsOn(D)) {
             return STATUS_SUCCESS;

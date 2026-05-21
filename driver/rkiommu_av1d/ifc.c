@@ -119,14 +119,20 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
         iova += RK_IOMMU_PAGE_SIZE;
     }
 
-    /* Flush TLB inside the locked region — see rkiommu_vdec ifc.c
-     * MapMdl for the multi-File race rationale (review #2). */
-    if (dev->PagingEnabled && dev->MmioBase) {
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), AV1_MMU_FLUSH_BIT);
-        WRITE_REGISTER_ULONG(
-            (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), 0u);
-    }
+    /* NO TLB flush on Map for av1d.
+     *
+     * The rkvdec analogue flushes on Map to defend against a peer codec
+     * (RVD0/RVD1 share the master domain via the cascade) holding a
+     * stale TLB entry at the just-allocated iova range.  AV1 has no such
+     * peer — exactly one codec uses each rkiommu_av1d instance — so the
+     * map-side flush has no addressable race to fix.  It DOES disrupt
+     * in-flight AV1 codec DMA when a peer File allocates a buffer
+     * mid-decode (the AV1_MMU_FLUSH pulse invalidates the codec's
+     * MMU walk cache and a tile-decode that was about to fetch via TLB
+     * has to re-walk, occasionally producing visible cross-stream
+     * corruption).  The UnmapMdl flush below stays — it's the original
+     * behaviour (now under the lock) and is the moment we actually
+     * need TLB invalidation. */
 
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 

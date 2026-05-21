@@ -1399,11 +1399,16 @@ int Av1DecodeEngine_Init(Av1DecodeEngine *e, Av1EngineMode mode,
          * LR + SR + DB column buffers.  At 720p num_tile_cols=1 it's
          * ~104 KB per the BSP filtermem_alloc formula; allocate 4 MiB
          * for headroom up to 4K.
-         * Known: frame 0 (keyframe) has a residual chroma artifact at
-         * x=1152..1279, y=616..629 (128×14 px, SB cols 18-19, rows 40-53
-         * within SB row 9).  Y is pixel-perfect; only Cb/Cr differ
-         * (~100 units from the dav1d SW reference). The 0x00 initial state
-         * (kernel zero-init) is marginally better than 0x80 fill. */
+         *
+         * Resolved 2026-05-21: the historical "frame 0 (keyframe)
+         * residual chroma artifact at x=1152..1279, y=616..629" was
+         * NOT a filter_mem initial-state issue — it was the
+         * driver/rkav1d/job.c cache-config block reading bit-depth
+         * from sw_pp_in_format instead of sw_pp_out_format.  Fix
+         * verified bit-exact against dav1d on test2_av1.mkv frame 0
+         * (1080p 10-bit AV1).  The 0x80-vs-0x00 fill experiments on
+         * filter_mem changed nothing observable because they weren't
+         * the root cause; kernel zero-init stays as the default. */
         if (AllocHwBuf(e->device, 4 * 1024 * 1024, RkMppBufferUsageScratch,
                        &e->filter_mem) != 0)
             return 1;

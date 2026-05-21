@@ -681,8 +681,30 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
         if (cacheBase && cacheLen >= 0x300 && haveOut && !tile16) {
             const ULONG width  = (reg4 >> 19) * 8;
             const ULONG height = ((reg4 >> 6) & 0x1fff) * 8;
-            const ULONG pp_in_format = (reg322 >> 27) & 0x1F;
-            const ULONG pixel_width  = (pp_in_format == 1) ? 8 : 16;
+            /* Bit-depth derives from sw_pp_out_format (bits 18..22 of
+             * reg322) — what PP actually writes — NOT sw_pp_in_format
+             * (bits 27..31) which the prior code mistakenly read.
+             * For our regbuilder sw_pp_in_format = 0 always, so the
+             * old read produced pixel_width=16 unconditionally,
+             * giving a cache line_size sized for P010 (1920*16/8 =
+             * 3840 bytes) when we actually write NV15 at stride 2400.
+             * That mismatch left the cache mis-configured for the
+             * write fabric and surfaced as bottom-right corner
+             * corruption on 10-bit AV1 (rows ~1020..1079 truncated at
+             * the right edge in pool_output).
+             *
+             * sw_pp_out_format mapping (matches regbuilder_av1.cpp):
+             *   1  = P010   (16 bits/sample, 10 valid in upper 10)
+             *   3  = NV12   (8 bits/sample)
+             *   10 = NV15   (10 bits/sample, 4 samples per 5 bytes) */
+            const ULONG pp_out_format = (reg322 >> 18) & 0x1F;
+            ULONG pixel_width;
+            switch (pp_out_format) {
+                case 1:  pixel_width = 16; break;
+                case 3:  pixel_width = 8;  break;
+                case 10: pixel_width = 10; break;
+                default: pixel_width = 8;  break;
+            }
             const ULONG pre_fetch_height = 136;
 
             /* MPP_ALIGN(MPP_ALIGN(width * pixel_width, 8) / 8, 16) */

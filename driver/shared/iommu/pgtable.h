@@ -157,24 +157,34 @@ typedef struct _RKIOMMU_DOMAIN {
      * Bit 0 is reserved (NULL guard).  Non-paged pool.  */
     ULONG_PTR       *IovaBitmap;    /* 128 KiB bitmap, non-paged pool */
 
-    /* IOVA allocation-start bitmap (128 KiB).  Set at the first page of
-     * every range returned by RkIommuAllocIova plus the static reservations
-     * placed at domain-create (page 0, RCB-SRAM at 0xFFF00000).  Cleared
-     * by RkIommuFreeIova.  Read by UnmapMdl to bound the page-count
-     * recovery walk: scanning forward in IovaBitmap stops at the next set
-     * start-bit (the boundary of the adjacent allocation) or the first
-     * clear interior bit (the end of the contiguous run).  Without this
-     * boundary, an UnmapMdl walks past its own range into a peer File's
-     * adjacent allocation and over-unmaps PTEs the peer's HW is still
-     * DMA'ing through → IOMMU page fault on the peer session. */
+    /* IOVA allocation-start bitmap.  Set at the first page of every range
+     * returned by RkIommuAllocIova plus the static reservations placed at
+     * domain-create (page 0, RCB-SRAM at 0xFFF00000).  Cleared by
+     * RkIommuFreeIova.  Used by UnmapMdl to validate the caller's iova
+     * starts an allocation we issued (defense against double-unmap / stray
+     * pointers). */
     ULONG_PTR       *IovaStartBitmap; /* 128 KiB bitmap, non-paged pool */
 
-    KSPIN_LOCK       Lock;          /* serializes PT writes + bitmap alloc */
+    /* IOVA allocation-end bitmap.  Set at index (base + PageCount) — one
+     * past the last page of every allocation — by RkIommuAllocIova; cleared
+     * at the same position by RkIommuFreeIova.  UnmapMdl scans FORWARD
+     * from (startPage + 1) until it hits an end-marker; the distance is
+     * the allocation's PageCount.
+     *
+     * Rationale: the allocator is top-down (a new allocation gets a LOWER
+     * base than older neighbours).  IovaStartBitmap alone is insufficient
+     * because the OLDER allocation's start-bit is ABOVE the new one — an
+     * upward IovaBitmap scan from the new base would never hit it before
+     * running straight through the older allocation's contiguous bits and
+     * over-unmapping into a peer File's PTEs that the peer's HW is still
+     * DMA'ing through.  The end-marker is anchored at the allocation's
+     * upper boundary so the unmap walk stops exactly at our own range.
+     *
+     * Bitmap is sized to (RK_IOMMU_IOVA_PAGES + 1) bits — an allocation
+     * ending at the final page legitimately sets bit RK_IOMMU_IOVA_PAGES. */
+    ULONG_PTR       *IovaEndBitmap;   /* (1M+1)/8 bytes, non-paged pool */
 
-    /* Iova page 0 scratch — phantom-read sink for the codec's speculative
-     * low-iova accesses.  4 KiB zero-filled, freed with domain. */
-    volatile ULONG  *Page0Scratch;
-    ULONG            Page0Phys;
+    KSPIN_LOCK       Lock;          /* serializes PT writes + bitmap alloc */
 } RKIOMMU_DOMAIN, *PRKIOMMU_DOMAIN;
 
 /* ---------------------------------------------------------------------------
@@ -196,7 +206,11 @@ NTSTATUS RkIommuDomainCreateAv1d(_Out_ PRKIOMMU_DOMAIN *Domain);
 _IRQL_requires_(PASSIVE_LEVEL)
 VOID RkIommuDomainDestroy(_In_ PRKIOMMU_DOMAIN Domain);
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+/* PASSIVE_LEVEL only — MapAt may need to allocate a new page-table page
+ * via MmAllocateContiguousNodeMemory (PASSIVE-only).  Previously annotated
+ * DISPATCH_LEVEL, which would have BSOD'd on the first miss; all current
+ * callers (MapMdl from WDF IOCTL handlers) run at PASSIVE.  Review #6. */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS RkIommuMapAt(
     _In_  PRKIOMMU_DOMAIN Domain,
     _In_  ULONG64 Iova,

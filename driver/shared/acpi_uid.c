@@ -72,8 +72,17 @@ NTSTATUS RkSharedReadAcpiHidUid(_In_ WDFDEVICE Device,
                                           sizeof(buf), buf, &size);
     if (!NT_SUCCESS(status)) return status;
 
+    /* Defensive multi-sz termination.  If acpi.sys exactly fills the
+     * stack buffer (size == sizeof(buf)) and the last entry wasn't NUL-
+     * terminated, wcslen(cursor) walks off the end into kernel stack
+     * residue.  Force the last two WCHARs to NUL so any walk we do
+     * terminates inside our buffer regardless of acpi.sys's behavior. */
+    buf[ARRAYSIZE(buf) - 2] = L'\0';
+    buf[ARRAYSIZE(buf) - 1] = L'\0';
+
     PCWSTR cursor = buf;
-    while (*cursor) {
+    PCWSTR cend   = buf + ARRAYSIZE(buf) - 1;  /* one before final NUL */
+    while (cursor < cend && *cursor) {
         size_t len = wcslen(cursor);
         /* Accept any four hex digits after "ACPI\RKCP".  The old
          * per-driver copies hardcoded `cursor[9]=='3' && cursor[10]=='5'`
@@ -106,6 +115,7 @@ NTSTATUS RkSharedReadAcpiHidUid(_In_ WDFDEVICE Device,
             }
         }
         cursor += len + 1;
+        if (cursor >= cend) break;
     }
     return STATUS_INVALID_DEVICE_REQUEST;
 }

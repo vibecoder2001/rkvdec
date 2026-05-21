@@ -59,6 +59,11 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
 
+    /* MDL contract: locked pages, page-aligned offset.  See rkiommu_vdec
+     * MapMdl for full rationale (review #5). */
+    NT_ASSERT(Mdl->MdlFlags & (MDL_PAGES_LOCKED | MDL_SOURCE_IS_NONPAGED_POOL));
+    NT_ASSERT(MmGetMdlByteOffset(Mdl) == 0);
+
     /* Count the pages in the MDL */
     ULONG pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
         MmGetMdlVirtualAddress(Mdl),
@@ -114,6 +119,15 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
         iova += RK_IOMMU_PAGE_SIZE;
     }
 
+    /* Flush TLB inside the locked region — see rkiommu_vdec ifc.c
+     * MapMdl for the multi-File race rationale (review #2). */
+    if (dev->PagingEnabled && dev->MmioBase) {
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), AV1_MMU_FLUSH_BIT);
+        WRITE_REGISTER_ULONG(
+            (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), 0u);
+    }
+
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
     /* Lazy-enable IOMMU paging on the first MapMdl that places real
@@ -150,9 +164,7 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     if ((Iova & 0xFFFu) != 0)
         return STATUS_INVALID_PARAMETER;
 
-    /* See rkiommu_vdec/ifc.c for the bounded-walk rationale.  AV1D
-     * domain has the same shared-bitmap-over-Domain shape and the same
-     * peer-over-unmap hazard if two AV1 sessions Shutdown adjacent. */
+    /* See rkiommu_vdec/ifc.c for the end-marker rationale. */
     ULONG startPage = (ULONG)(Iova >> 12);
     const ULONG bitsPerWord = (ULONG)(sizeof(ULONG_PTR) * 8);
     ULONG pageCount = 0;
@@ -165,14 +177,13 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
         return STATUS_INVALID_PARAMETER;
     }
 
-    for (ULONG pg = startPage; pg < RK_IOMMU_IOVA_PAGES; pg++) {
+    for (ULONG pg = startPage + 1; pg <= RK_IOMMU_IOVA_PAGES; pg++) {
         ULONG w = pg / bitsPerWord;
         ULONG b = pg % bitsPerWord;
-        if (!(dev->Domain->IovaBitmap[w] & ((ULONG_PTR)1 << b))) break;
-        if (pg != startPage &&
-            (dev->Domain->IovaStartBitmap[w] & ((ULONG_PTR)1 << b)))
+        if (dev->Domain->IovaEndBitmap[w] & ((ULONG_PTR)1 << b)) {
+            pageCount = pg - startPage;
             break;
-        pageCount++;
+        }
     }
 
     if (pageCount == 0) {
@@ -183,14 +194,17 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     RkIommuUnmapAt(dev->Domain, Iova, pageCount);
     RkIommuFreeIova(dev->Domain, Iova, pageCount);
 
-    KeReleaseSpinLock(&dev->Domain->Lock, irql);
-
+    /* Flush UNDER the lock so a concurrent kick on a peer File can't
+     * translate via a stale TLB entry pointing at our just-cleared PTEs.
+     * Review #2. */
     if (dev->PagingEnabled && dev->MmioBase) {
         WRITE_REGISTER_ULONG(
             (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), AV1_MMU_FLUSH_BIT);
         WRITE_REGISTER_ULONG(
             (volatile ULONG*)(dev->MmioBase + AV1_MMU_FLUSH), 0u);
     }
+
+    KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
     return STATUS_SUCCESS;
 }
@@ -206,8 +220,12 @@ RkIommuRegisterFaultHandler(_In_ PVOID                 ProviderContext,
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev) return STATUS_DEVICE_NOT_READY;
 
+    /* See rkiommu_vdec/ifc.c — pair-atomic install under FaultLock. */
+    KIRQL irql;
+    KeAcquireSpinLock(&dev->FaultLock, &irql);
     dev->FaultCb       = Callback;
     dev->FaultCbCookie = ConsumerContext;
+    KeReleaseSpinLock(&dev->FaultLock, irql);
     return STATUS_SUCCESS;
 }
 

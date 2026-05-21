@@ -78,8 +78,14 @@ VOID RkIommuEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
     WDFDEVICE       device = WdfInterruptGetDevice(Interrupt);
     PRKIOMMU_DEVICE ctx    = RkIommuDeviceGet(device);
 
+    /* Read the (Cb, Cookie) pair atomically under FaultLock so we can't
+     * observe a torn install from a concurrent RegisterFaultHandler.
+     * Review #9. */
+    KIRQL irql;
+    KeAcquireSpinLock(&ctx->FaultLock, &irql);
     RKIOMMU_FAULT_CALLBACK cb     = ctx->FaultCb;
     PVOID                  cookie = ctx->FaultCbCookie;
+    KeReleaseSpinLock(&ctx->FaultLock, irql);
 
     if (cb) {
         cb(cookie,

@@ -12,7 +12,8 @@
 
 LIST_ENTRY  g_deviceList;
 KSPIN_LOCK  g_deviceListLock;
-static BOOLEAN g_listInitialized = FALSE;
+/* See rkiommu_vdec/device.c — atomic init flag.  Review #11. */
+static volatile LONG g_listInitialized = 0;
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE  RkIommuEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE  RkIommuEvtReleaseHardware;
@@ -101,6 +102,8 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
         return status;
     }
 
+    KeInitializeSpinLock(&ctx->FaultLock);
+
     /* RKCP3571 always carries the three BSP _DSD flags. */
     ctx->FlagDisableMmuReset = TRUE;
     ctx->FlagEnableCmdRetry  = TRUE;
@@ -172,10 +175,14 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
 NTSTATUS
 RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
-    if (!g_listInitialized) {
+    if (InterlockedCompareExchange(&g_listInitialized, 1, 0) == 0) {
         InitializeListHead(&g_deviceList);
         KeInitializeSpinLock(&g_deviceListLock);
-        g_listInitialized = TRUE;
+        InterlockedExchange(&g_listInitialized, 2);
+    } else {
+        while (InterlockedCompareExchange(&g_listInitialized, 2, 2) != 2) {
+            YieldProcessor();
+        }
     }
 
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;

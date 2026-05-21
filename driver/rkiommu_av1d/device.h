@@ -16,6 +16,9 @@ typedef struct _RKIOMMU_DEVICE {
     BOOLEAN             FlagDisableMmuReset;
     BOOLEAN             FlagEnableCmdRetry;
     BOOLEAN             FlagShootdownEntire;
+    /* See rkiommu_vdec/device.h: (FaultCb, FaultCbCookie) is an
+     * atomic pair protected by FaultLock.  Review #9. */
+    KSPIN_LOCK             FaultLock;
     RKIOMMU_FAULT_CALLBACK FaultCb;
     PVOID                  FaultCbCookie;
     RKIOMMU_FAULT_CTX   FaultCtx;
@@ -30,8 +33,8 @@ NTSTATUS RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit);
 extern LIST_ENTRY  g_deviceList;
 extern KSPIN_LOCK  g_deviceListLock;
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS RkIommuEnableHw(_In_ PRKIOMMU_DEVICE Dev);
 
-_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS RkIommuDisableHw(_In_ PRKIOMMU_DEVICE Dev);

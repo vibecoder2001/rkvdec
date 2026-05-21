@@ -92,6 +92,15 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
     if (!dev->Domain) return STATUS_DEVICE_NOT_READY;
     KIRQL irql;
 
+    /* MDL contract: caller must have locked the pages (MmProbeAndLock or
+     * MDL-from-nonpaged-pool) before handing the MDL to us — we read PFNs
+     * directly via MmGetMdlPfnArray which is only meaningful for locked
+     * pages.  Also require page-aligned byte-offset: AllocIova returns
+     * page-aligned iovas, so a non-zero MDL offset would silently shift
+     * the codec's view of the buffer. */
+    NT_ASSERT(Mdl->MdlFlags & (MDL_PAGES_LOCKED | MDL_SOURCE_IS_NONPAGED_POOL));
+    NT_ASSERT(MmGetMdlByteOffset(Mdl) == 0);
+
     /* Count the pages in the MDL */
     ULONG pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
         MmGetMdlVirtualAddress(Mdl),
@@ -159,6 +168,22 @@ RkIommuMapMdl(_In_ PVOID ProviderContext,
         iova += RK_IOMMU_PAGE_SIZE;
     }
 
+    /* Issue ZAP_CACHE INSIDE the locked region so any peer about to walk
+     * a TLB that aliased a previously-freed PTE for this iova range sees
+     * the new mapping atomically with the PTE install.  Releasing the
+     * lock first would create a window where a peer's in-flight kick on
+     * a sibling instance (RVD0+RVD1 share the master domain) could
+     * translate using a stale TLB entry.  Skip when paging not yet on —
+     * RkIommuEnableHw below does the first ZAP itself.  Review #2. */
+    if (dev->PagingEnabled && dev->MmioBase) {
+        int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
+        for (int mi = 0; mi < n_mmu; mi++) {
+            WRITE_REGISTER_ULONG(
+                (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_COMMAND),
+                RK_MMU_CMD_ZAP_CACHE);
+        }
+    }
+
     KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
     /* Lazy-enable IOMMU paging on the first MapMdl that places real
@@ -210,13 +235,15 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     if ((Iova & 0xFFFu) != 0)
         return STATUS_INVALID_PARAMETER;
 
-    /* Determine how many pages are mapped at this IOVA.  We reconstruct
-     * the original allocation size by counting consecutive set bits in
-     * IovaBitmap, bounded by the next set bit in IovaStartBitmap.  The
-     * latter is critical for multi-File concurrency: without it the walk
-     * extends past our range into a peer File's adjacent allocation,
-     * RkIommuUnmapAt zeroes the peer's PTEs, and the peer's next DMA
-     * faults.  See [[iommu_unmap_overunmaps_peer]] for the failure mode. */
+    /* Determine the original PageCount by scanning IovaEndBitmap forward
+     * from base+1 for the first set end-marker.  AllocIova set this at
+     * (base + PageCount); the distance is the size of our own allocation
+     * regardless of what newer (lower-iova) or older (higher-iova) peers
+     * have installed.  IovaStartBitmap alone was insufficient because the
+     * top-down allocator places the older peer's start-bit ABOVE us — a
+     * forward scan would never hit it before consuming the peer's run
+     * and over-unmapping its live PTEs (the multi-File concurrency
+     * hazard from [[iommu_reattach_mid_peer_dma_unsafe]] cousin). */
     ULONG startPage = (ULONG)(Iova >> 12);
     const ULONG bitsPerWord = (ULONG)(sizeof(ULONG_PTR) * 8);
     ULONG pageCount = 0;
@@ -231,15 +258,16 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
         return STATUS_INVALID_PARAMETER;
     }
 
-    for (ULONG pg = startPage; pg < RK_IOMMU_IOVA_PAGES; pg++) {
+    /* Scan the end-bitmap.  An allocation ending at the final iova page
+     * sets the bit at index RK_IOMMU_IOVA_PAGES, hence the inclusive
+     * upper bound. */
+    for (ULONG pg = startPage + 1; pg <= RK_IOMMU_IOVA_PAGES; pg++) {
         ULONG w = pg / bitsPerWord;
         ULONG b = pg % bitsPerWord;
-        if (!(dev->Domain->IovaBitmap[w] & ((ULONG_PTR)1 << b))) break;
-        /* Stop at the next allocation's start — don't extend into a peer. */
-        if (pg != startPage &&
-            (dev->Domain->IovaStartBitmap[w] & ((ULONG_PTR)1 << b)))
+        if (dev->Domain->IovaEndBitmap[w] & ((ULONG_PTR)1 << b)) {
+            pageCount = pg - startPage;
             break;
-        pageCount++;
+        }
     }
 
     if (pageCount == 0) {
@@ -250,8 +278,10 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
     RkIommuUnmapAt(dev->Domain, Iova, pageCount);
     RkIommuFreeIova(dev->Domain, Iova, pageCount);
 
-    KeReleaseSpinLock(&dev->Domain->Lock, irql);
-
+    /* ZAP_CACHE must run UNDER the domain lock.  With RVD0+RVD1 sharing
+     * the master domain, releasing the lock before flushing the TLB lets
+     * a peer's in-flight kick on the sibling instance translate via a
+     * stale TLB entry that aliased our just-cleared PTEs.  Review #2. */
     if (dev->PagingEnabled && dev->MmioBase) {
         int n_mmu = (dev->MmioLength >= 0x80) ? 2 : 1;
         for (int mi = 0; mi < n_mmu; mi++) {
@@ -260,6 +290,8 @@ RkIommuUnmapMdl(_In_ PVOID  ProviderContext,
                 RK_MMU_CMD_ZAP_CACHE);
         }
     }
+
+    KeReleaseSpinLock(&dev->Domain->Lock, irql);
 
     return STATUS_SUCCESS;
 }
@@ -278,8 +310,15 @@ RkIommuRegisterFaultHandler(_In_ PVOID                 ProviderContext,
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev) return STATUS_DEVICE_NOT_READY;
 
+    /* Pair-atomic install under FaultLock: the DPC reads both fields
+     * inside the same lock, so it can't observe a torn (new Cb, stale
+     * Cookie) pair from another consumer's concurrent register.
+     * Review #9. */
+    KIRQL irql;
+    KeAcquireSpinLock(&dev->FaultLock, &irql);
     dev->FaultCb       = Callback;
     dev->FaultCbCookie = ConsumerContext;
+    KeReleaseSpinLock(&dev->FaultLock, irql);
     return STATUS_SUCCESS;
 }
 
@@ -292,6 +331,12 @@ RkIommuSnapshot(_In_ PVOID ProviderContext,
 {
     PRKIOMMU_DEVICE dev = DevFromContext(ProviderContext);
     if (!dev || !dev->MmioBase) return STATUS_DEVICE_NOT_READY;
+    /* Zero up front so the Status1/IntRawStat1/IntStatus1/PageFaultAddr1/
+     * DteAddr1 fields are deterministic when MmioLength < 0x80 (single-MMU
+     * instances).  Without this, a consumer reading those fields would
+     * see stack residue — an info leak across PIDs at worst.  Mirrors
+     * av1d's pattern.  Review #8. */
+    RtlZeroMemory(Out, sizeof(*Out));
     Out->Status        = READ_REGISTER_ULONG(
         (volatile ULONG*)(dev->MmioBase + RK_MMU_STATUS));
     Out->IntRawStat    = READ_REGISTER_ULONG(
@@ -398,17 +443,26 @@ RkIommuForceReset(_In_ PVOID ProviderContext)
 
     /* Poll for DTE_ADDR == 0 on all instances — BSP's
      * rk_iommu_is_reset_done.  Cap at ~100 ms (matches BSP
-     * RK_MMU_FORCE_RESET_TIMEOUT_US = 100000). */
+     * RK_MMU_FORCE_RESET_TIMEOUT_US = 100000).
+     *
+     * Use KeDelayExecutionThread between checks instead of
+     * KeStallExecutionProcessor — stalling 100ms hot-burns a CPU and
+     * blocks any thread that gets scheduled on it for the full window.
+     * ForceReset runs from EvtFileCleanup (PASSIVE_LEVEL), so blocking
+     * is fine.  Review #7. */
     NTSTATUS rs = STATUS_SUCCESS;
+    LARGE_INTEGER interval;
+    interval.QuadPart = -10000LL;   /* 1 ms in 100ns ticks (negative = relative) */
     for (int mi = 0; mi < n_mmu; mi++) {
         ULONG poll = 0;
-        for (poll = 0; poll < 100000; poll++) {
+        const ULONG kMaxPolls = 100;  /* 100 × 1ms = 100ms */
+        for (poll = 0; poll < kMaxPolls; poll++) {
             ULONG dte = READ_REGISTER_ULONG(
                 (volatile ULONG*)(dev->MmioBase + (mi * 0x40) + RK_MMU_DTE_ADDR));
             if (dte == 0) break;
-            KeStallExecutionProcessor(1);
+            KeDelayExecutionThread(KernelMode, FALSE, &interval);
         }
-        if (poll >= 100000) {
+        if (poll >= kMaxPolls) {
             RKMPP_LOG_WARN(
                        "rkiommu_vdec: ForceReset MMU#%d DTE_ADDR didn't clear\n", mi);
             rs = STATUS_TIMEOUT;

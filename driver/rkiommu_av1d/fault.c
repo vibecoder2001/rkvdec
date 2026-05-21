@@ -65,8 +65,12 @@ VOID RkIommuEvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
     WDFDEVICE       device = WdfInterruptGetDevice(Interrupt);
     PRKIOMMU_DEVICE ctx    = RkIommuDeviceGet(device);
 
+    /* Pair-atomic read under FaultLock — see rkiommu_vdec/fault.c. */
+    KIRQL irql;
+    KeAcquireSpinLock(&ctx->FaultLock, &irql);
     RKIOMMU_FAULT_CALLBACK cb     = ctx->FaultCb;
     PVOID                  cookie = ctx->FaultCbCookie;
+    KeReleaseSpinLock(&ctx->FaultLock, irql);
 
     if (cb) {
         cb(cookie,

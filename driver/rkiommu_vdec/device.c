@@ -29,7 +29,12 @@
 LIST_ENTRY  g_deviceList;
 KSPIN_LOCK  g_deviceListLock;
 
-static BOOLEAN g_listInitialized = FALSE;
+/* Tri-state init flag: 0 = uninit, 1 = in-progress, 2 = ready.  Walked
+ * via InterlockedCompareExchange to avoid the check-then-set race in
+ * the original BOOLEAN g_listInitialized (safe in practice because
+ * EvtDeviceAdd is serialized by KMDF, but the explicit CAS keeps SDV
+ * happy and is robust against future parallel init paths).  Review #11. */
+static volatile LONG g_listInitialized = 0;
 
 /* ---------------------------------------------------------------------------
  * Forward declarations
@@ -408,10 +413,25 @@ RkIommuSlaveOnMasterArrival(_In_ PVOID Ctx, _In_ PUNICODE_STRING SymLink)
     }
 
     /* Register query-remove hook so master can cascade-detach us
-     * before unloading. */
+     * before unloading.  If master's Consumers[] is full (more peers
+     * arrived than the static array can hold), we MUST fail the
+     * slave-attach: without a callback slot, master's later
+     * EvtDeviceQueryRemove cascade silently skips us and our slave
+     * MMU keeps a dangling reference to master's PdPhys after master
+     * tears down → IOMMU fault on next kick.  Review #4. */
     if (ifc.RegisterQueryRemove) {
-        ifc.RegisterQueryRemove(ifc.Header.Context, slave,
-                                RkIommuSlaveOnMasterQueryRemove);
+        NTSTATUS sr = ifc.RegisterQueryRemove(ifc.Header.Context, slave,
+                                              RkIommuSlaveOnMasterQueryRemove);
+        if (!NT_SUCCESS(sr)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkiommu_vdec slave (UID=%u): master Consumers[] "
+                       "full (0x%x) — aborting attach\n", slave->Uid, sr);
+            RkIommuSlaveDetach(slave);
+            if (ifc.Header.InterfaceDereference)
+                ifc.Header.InterfaceDereference(ifc.Header.Context);
+            ObDereferenceObject(fo);
+            return;
+        }
     }
 
     /* Commit attach state under StateLock.  Re-check Tearing in case
@@ -486,6 +506,9 @@ RkIommuEvtDeviceQueryRemove(_In_ WDFDEVICE Device)
     KeAcquireSpinLock(&ctx->ConsumersLock, &irql);
     ULONG n = ctx->ConsumerCount;
     struct { PVOID Ctx; PVOID Cb; } local[4];
+    /* Keep `local[]` sized in lock-step with ctx->Consumers[] — otherwise
+     * a future Consumers[] grow would silently drop callbacks here. */
+    C_ASSERT(ARRAYSIZE(local) == ARRAYSIZE(ctx->Consumers));
     for (ULONG i = 0; i < n && i < ARRAYSIZE(local); i++) {
         local[i].Ctx = ctx->Consumers[i].ConsumerCtx;
         local[i].Cb  = ctx->Consumers[i].Cb;
@@ -533,6 +556,7 @@ RkIommuEvtPrepareHardware(_In_ WDFDEVICE Device,
     KeInitializeEvent(&ctx->PtAttachedEvent, NotificationEvent, FALSE);
     KeInitializeSpinLock(&ctx->ConsumersLock);
     KeInitializeSpinLock(&ctx->StateLock);
+    KeInitializeSpinLock(&ctx->FaultLock);
     ctx->Tearing       = FALSE;
     ctx->ConsumerCount = 0;
     ctx->PtAttached    = FALSE;
@@ -759,11 +783,17 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
 NTSTATUS
 RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
-    /* Ensure the global list is initialized (idempotent, called once) */
-    if (!g_listInitialized) {
+    /* Ensure the global list is initialized.  CAS 0 → 1 to claim init,
+     * publish ready=2 after the InitializeList/InitializeSpinLock pair.
+     * Other threads that lost the CAS spin-wait until ready=2. */
+    if (InterlockedCompareExchange(&g_listInitialized, 1, 0) == 0) {
         InitializeListHead(&g_deviceList);
         KeInitializeSpinLock(&g_deviceListLock);
-        g_listInitialized = TRUE;
+        InterlockedExchange(&g_listInitialized, 2);
+    } else {
+        while (InterlockedCompareExchange(&g_listInitialized, 2, 2) != 2) {
+            YieldProcessor();
+        }
     }
 
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;

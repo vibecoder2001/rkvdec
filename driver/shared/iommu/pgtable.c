@@ -89,15 +89,27 @@ NTSTATUS RkIommuDomainCreateVdec(PRKIOMMU_DOMAIN *Domain)
         ExFreePoolWithTag(d, 'mDkR');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    /* End-bitmap needs one extra bit (end at the last page) — round up by
+     * adding one bitsPerWord; cheap. */
+    SIZE_T endBitmapBytes = bitmapBytes + sizeof(ULONG_PTR);
+    d->IovaEndBitmap = (ULONG_PTR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, endBitmapBytes, 'eIkR');
+    if (!d->IovaEndBitmap) {
+        ExFreePoolWithTag(d->IovaStartBitmap, 'sIkR');
+        ExFreePoolWithTag(d->IovaBitmap, 'bIkR');
+        FreePageBelow4G(d->Pd);
+        ExFreePoolWithTag(d, 'mDkR');
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(d->IovaBitmap, bitmapBytes);
     RtlZeroMemory(d->IovaStartBitmap, bitmapBytes);
+    RtlZeroMemory(d->IovaEndBitmap, endBitmapBytes);
     d->IovaBitmap[0] |= (ULONG_PTR)1;       /* reserve iova page 0 */
     d->IovaStartBitmap[0] |= (ULONG_PTR)1;  /* mark page 0 as a boundary */
+    d->IovaEndBitmap[0] |= (ULONG_PTR)1 << 1; /* end of the 1-page page-0 reservation */
 
     /* Reserve BSP-prescribed RCB-SRAM IOVA range 0xFFF00000..0xFFFFFFFF.
-     * Marked as a single allocation in the start-bitmap so any UnmapMdl
-     * scanning up from a normal allocation placed just below this range
-     * stops at the reservation boundary instead of over-unmapping into it. */
+     * Marked as a single allocation in the start+end bitmaps so any
+     * UnmapMdl walking past a normal allocation can't escape into it. */
     {
         const ULONG kRcbPage  = 0xFFF00000u / RK_IOMMU_PAGE_SIZE;
         const ULONG kRcbCount = 0x00100000u / RK_IOMMU_PAGE_SIZE;
@@ -105,8 +117,11 @@ NTSTATUS RkIommuDomainCreateVdec(PRKIOMMU_DOMAIN *Domain)
         for (ULONG p = kRcbPage; p < kRcbPage + kRcbCount &&
                                  p < RK_IOMMU_IOVA_PAGES; p++)
             d->IovaBitmap[p / kBpw] |= (ULONG_PTR)1 << (p % kBpw);
-        if (kRcbPage < RK_IOMMU_IOVA_PAGES)
+        if (kRcbPage < RK_IOMMU_IOVA_PAGES) {
             d->IovaStartBitmap[kRcbPage / kBpw] |= (ULONG_PTR)1 << (kRcbPage % kBpw);
+            ULONG endPage = kRcbPage + kRcbCount;
+            d->IovaEndBitmap[endPage / kBpw] |= (ULONG_PTR)1 << (endPage % kBpw);
+        }
     }
 
     *Domain = d;
@@ -155,10 +170,22 @@ NTSTATUS RkIommuDomainCreateAv1d(PRKIOMMU_DOMAIN *Domain)
         ExFreePoolWithTag(d, 'mDkR');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    SIZE_T endBitmapBytes = bitmapBytes + sizeof(ULONG_PTR);
+    d->IovaEndBitmap = (ULONG_PTR *)ExAllocatePool2(POOL_FLAG_NON_PAGED, endBitmapBytes, 'eIkR');
+    if (!d->IovaEndBitmap) {
+        ExFreePoolWithTag(d->IovaStartBitmap, 'sIkR');
+        ExFreePoolWithTag(d->IovaBitmap, 'bIkR');
+        FreePageBelow4G((volatile ULONG *)d->Pta);
+        FreePageBelow4G(d->Pd);
+        ExFreePoolWithTag(d, 'mDkR');
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(d->IovaBitmap, bitmapBytes);
     RtlZeroMemory(d->IovaStartBitmap, bitmapBytes);
+    RtlZeroMemory(d->IovaEndBitmap, endBitmapBytes);
     d->IovaBitmap[0] |= (ULONG_PTR)1;
     d->IovaStartBitmap[0] |= (ULONG_PTR)1;
+    d->IovaEndBitmap[0] |= (ULONG_PTR)1 << 1;  /* end of 1-page page-0 reservation */
 
     *Domain = d;
     return STATUS_SUCCESS;
@@ -181,12 +208,6 @@ VOID RkIommuDomainDestroy(PRKIOMMU_DOMAIN Domain)
         }
     }
 
-    if (Domain->Page0Scratch) {
-        FreePageBelow4G(Domain->Page0Scratch);
-        Domain->Page0Scratch = NULL;
-        Domain->Page0Phys    = 0;
-    }
-
     if (Domain->Pd) {
         FreePageBelow4G(Domain->Pd);
         Domain->Pd    = NULL;
@@ -207,6 +228,11 @@ VOID RkIommuDomainDestroy(PRKIOMMU_DOMAIN Domain)
     if (Domain->IovaStartBitmap) {
         ExFreePoolWithTag(Domain->IovaStartBitmap, 'sIkR');
         Domain->IovaStartBitmap = NULL;
+    }
+
+    if (Domain->IovaEndBitmap) {
+        ExFreePoolWithTag(Domain->IovaEndBitmap, 'eIkR');
+        Domain->IovaEndBitmap = NULL;
     }
 
     ExFreePoolWithTag(Domain, 'mDkR');
@@ -256,11 +282,23 @@ NTSTATUS RkIommuAllocIova(PRKIOMMU_DOMAIN Domain, ULONG PageCount,
                         Domain->IovaBitmap[kw] |= (ULONG_PTR)1 << kb;
                     }
                     /* Mark this range's first page as an allocation
-                     * boundary so UnmapMdl's page-count recovery walk
-                     * stops here and can't over-unmap into us from a
-                     * neighbour that was placed immediately below. */
+                     * boundary so UnmapMdl can validate the iova it
+                     * receives belongs to a real allocation. */
                     Domain->IovaStartBitmap[base / bitsPerWord]
                         |= (ULONG_PTR)1 << (base % bitsPerWord);
+                    /* Mark the page ONE PAST the end of this allocation
+                     * as a closing boundary.  UnmapMdl scans forward from
+                     * base+1 in IovaEndBitmap; the first set bit gives it
+                     * the original PageCount.  Without this end-marker,
+                     * a forward IovaBitmap walk would run past our range
+                     * into the older (higher-iova) neighbour because the
+                     * top-down allocator places its start-bit ABOVE our
+                     * own — over-unmapping the peer's live mapping. */
+                    {
+                        ULONG endPage = base + PageCount;
+                        Domain->IovaEndBitmap[endPage / bitsPerWord]
+                            |= (ULONG_PTR)1 << (endPage % bitsPerWord);
+                    }
                     *OutIova = (ULONG64)base * RK_IOMMU_PAGE_SIZE;
                     return STATUS_SUCCESS;
                 }
@@ -291,17 +329,37 @@ VOID RkIommuFreeIova(PRKIOMMU_DOMAIN Domain, ULONG64 Iova, ULONG PageCount)
     ULONG startPage = (ULONG)(Iova >> 12);
     if (PageCount == 0 || startPage > RK_IOMMU_IOVA_PAGES - PageCount) return;
 
+    /* Defense-in-depth: refuse to free a range whose start-bit isn't set
+     * (caller passed a stray or already-freed iova).  Without this guard
+     * a double-free silently clears bits inside an unrelated live
+     * allocation, corrupting its bookkeeping.  Mirror checks the caller's
+     * pre-validation in ifc.c UnmapMdl. */
+    if (!(Domain->IovaStartBitmap[startPage / bitsPerWord] &
+          ((ULONG_PTR)1 << (startPage % bitsPerWord)))) {
+        NT_ASSERT(!"RkIommuFreeIova: start-bit not set");
+        return;
+    }
+
     for (ULONG i = 0; i < PageCount; i++) {
         ULONG page = startPage + i;
         ULONG w    = page / bitsPerWord;
         ULONG b    = page % bitsPerWord;
+        /* All bits in the run MUST be set — otherwise the caller is
+         * freeing a mismatched range. */
+        NT_ASSERT(Domain->IovaBitmap[w] & ((ULONG_PTR)1 << b));
         Domain->IovaBitmap[w] &= ~((ULONG_PTR)1 << b);
     }
-    /* Clear the start marker so a future allocation at this base can set
-     * a fresh one (and so UnmapMdl can't be tricked into bounding at a
-     * stale boundary if the bits get reused). */
+    /* Clear both boundary markers.  Start at base, end at base+PageCount.
+     * Clearing both keeps the bitmaps consistent so a future allocation
+     * at this base sets fresh markers and any future Unmap doesn't see a
+     * stale boundary. */
     Domain->IovaStartBitmap[startPage / bitsPerWord]
         &= ~((ULONG_PTR)1 << (startPage % bitsPerWord));
+    {
+        ULONG endPage = startPage + PageCount;
+        Domain->IovaEndBitmap[endPage / bitsPerWord]
+            &= ~((ULONG_PTR)1 << (endPage % bitsPerWord));
+    }
 }
 
 /* ---------------------------------------------------------------------------

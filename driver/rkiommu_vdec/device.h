@@ -24,7 +24,12 @@ typedef struct _RKIOMMU_DEVICE {
     BOOLEAN             FlagEnableCmdRetry;    /* rockchip,enable-cmd-retry  */
     BOOLEAN             FlagShootdownEntire;   /* rockchip,shootdown-entire  */
 
-    /* Registered fault callback (set by client via RegisterFaultHandler) */
+    /* Registered fault callback (set by client via RegisterFaultHandler).
+     * Protected by FaultLock: the (Cb, Cookie) PAIR must be read or
+     * written atomically — without a lock the DPC could read a freshly
+     * installed Cb against a stale (NULL or other consumer's) Cookie and
+     * pass garbage to the wrong destructor.  Review #9. */
+    KSPIN_LOCK             FaultLock;
     RKIOMMU_FAULT_CALLBACK FaultCb;
     PVOID                  FaultCbCookie;
 
@@ -111,15 +116,16 @@ extern KSPIN_LOCK  g_deviceListLock;
  * Internal "Hw" helper.  The bare-named RkIommuEnable in ifc.c is the
  * public RKIOMMU_INTERFACE.Enable wrapper that resolves ProviderContext
  * to PRKIOMMU_DEVICE and then calls this. */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+/* PASSIVE_LEVEL — issues KeStallExecutionProcessor 20µs stalls inside the
+ * STALL/UN-STALL bracket; called from EvtPrepareHardware / EvtFileCleanup
+ * / EvtReleaseHardware (all PASSIVE).  Review #7. */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS RkIommuEnableHw(_In_ PRKIOMMU_DEVICE Dev);
 
 /* Disable IOMMU paging on the hardware.  STALLs all instances, masks
  * IRQs, sends DISABLE_PAGING, zeroes DTE_ADDR, and clears PagingEnabled
- * so the next MapMdl/Reattach lazily re-enables.  Idempotent.
- *
- * Internal "Hw" helper.  See RkIommuEnableHw for naming rationale. */
-_IRQL_requires_max_(DISPATCH_LEVEL)
+ * so the next MapMdl/Reattach lazily re-enables.  Idempotent. */
+_IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS RkIommuDisableHw(_In_ PRKIOMMU_DEVICE Dev);
 
 /* Phase 2: master-only.  Publishes GUID_DEVINTERFACE_RKIOMMU_MASTER so

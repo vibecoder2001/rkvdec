@@ -27,7 +27,10 @@
  * shows fd=12 alloc len=122880 == ALIGN(7168,4K) + ALIGN(3200,4K) +
  * ALIGN(110160,4K) — the consolidated info buffer for one decode slot.
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * Portions Copyright (c) Rockchip Electronics Co., Ltd., licensed under
+ * Apache-2.0 OR MIT.  See http://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: (BSD-2-Clause-Patent AND Apache-2.0)
  */
 #pragma once
 #include <stdint.h>

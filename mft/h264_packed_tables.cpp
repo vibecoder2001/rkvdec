@@ -7,6 +7,14 @@
  *   prepare_scanlist        : mpp/hal/rkdec/h264d/hal_h264d_vdpu34x.c:291
  *   vdpu34x_get_rcb_buf_size: mpp/vdpu34x_com.c:57
  *   rkv_cabac_table         : mpp/hal/rkdec/h264d/hal_h264d_com.c:16
+ *
+ * Portions Copyright (c) Rockchip Electronics Co., Ltd., licensed
+ * under Apache-2.0 OR MIT — the algorithms below (BitPacker, prepare_*
+ * function bodies, RCB sizing) are re-implementations of the cited
+ * rockchip-linux/mpp routines.  See http://www.apache.org/licenses/LICENSE-2.0.
+ * The verbatim CABAC table data is in h264_cabac_init.inc.
+ *
+ * SPDX-License-Identifier: (BSD-2-Clause-Patent AND Apache-2.0)
  */
 
 #include "h264_packed_tables.h"

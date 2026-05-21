@@ -1,3 +1,22 @@
+/* mft/h264_cabac_init.inc — verbatim copy of the rkvdec2 H.264 CABAC
+ * initialization table from rockchip-linux/mpp
+ * (mpp/hal/rkdec/h264d/hal_h264d_com.c, RK_U32 rkv_cabac_table[928]).
+ *
+ * Size matches RKH264_CABAC_INIT_SIZE in h264_packed_tables.h (3712 bytes).
+ * Loaded into the cabac_init buffer at offset 0; reg197 (cabactbl_base)
+ * points there.  These u32 words are the hardware-packed CABAC context
+ * init values (HW-specific layout, not the ITU-T spec table format).
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright (c) Rockchip Electronics Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ */
 static constexpr uint32_t kRkH264CabacInit[928] = {
     0x3602f114, 0xf1144a03, 0x4a033602, 0x68e97fe4, 0x36ff35fa, 0x21173307,
     0x00150217, 0x31000901, 0x390576db, 0x41f54ef3, 0x310c3e01, 0x321149fc,

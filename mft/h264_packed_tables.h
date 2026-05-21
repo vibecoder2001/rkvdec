@@ -16,7 +16,10 @@
  * `prepare_scanlist` / `vdpu34x_get_rcb_buf_size` byte-for-byte; see
  * h264_packed_tables.cpp for line-level cross references.
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * Portions Copyright (c) Rockchip Electronics Co., Ltd., licensed under
+ * Apache-2.0 OR MIT.  See http://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * SPDX-License-Identifier: (BSD-2-Clause-Patent AND Apache-2.0)
  */
 #pragma once
 #include <stdint.h>

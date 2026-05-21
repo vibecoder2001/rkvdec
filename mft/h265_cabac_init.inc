@@ -7,7 +7,15 @@
  * points there.  Codec-agnostic from rkvdec2 PoV — same hardware reads
  * a different blob for HEVC than for H.264.
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright (c) Rockchip Electronics Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
  */
 static const uint8_t kRkH265CabacInit[27456] = {
     0x07, 0x0f, 0x48, 0x58, 0x58, 0x40, 0x40, 0x40, 0x40, 0x40, 0x0f, 0x40, 0x40, 0x40, 0x0f, 0x68,

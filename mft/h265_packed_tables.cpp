@@ -29,7 +29,13 @@
  *   RPS_ALIGEND_SIZE  = ALIGN(400 * 8, 4K) = 4096 bytes (payload 3200)
  *   SCALING_LIST_SIZE = 81 * 1360 = 110160 bytes (one slot used = 1360)
  *
- * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * Portions Copyright (c) Rockchip Electronics Co., Ltd., licensed under
+ * Apache-2.0 OR MIT — the algorithms below (BitPacker, packet emitters,
+ * RCB sizing) are re-implementations of the cited rockchip-linux/mpp
+ * routines.  See http://www.apache.org/licenses/LICENSE-2.0.
+ * The verbatim CABAC table data is in h265_cabac_init.inc.
+ *
+ * SPDX-License-Identifier: (BSD-2-Clause-Patent AND Apache-2.0)
  */
 
 #include "h265_packed_tables.h"

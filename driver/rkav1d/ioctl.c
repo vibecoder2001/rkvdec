@@ -7,6 +7,7 @@
 #include <wdf.h>
 
 #include "../../shared/rkmpp_ioctl.h"
+#include "../../shared/rkiommu_ifc.h"
 #include "devpub.h"
 #include "../shared/rkmpp/bufpool.h"
 #include "job.h"
@@ -14,6 +15,18 @@
 /* Provided by device.c */
 extern void RkMppGetPublic(_In_ WDFDEVICE Device, _Out_ RKMPP_DEVICE_PUBLIC *Out);
 extern void RkMppGetFaultState(_In_ WDFDEVICE Device, _Out_ RKMPP_FAULT_STATE *Out);
+extern PRKIOMMU_INTERFACE RkMppGetIommuIfc(_In_ WDFDEVICE Device);
+
+/* AV1 IOMMU-attach gate mirroring rkvdec/device.c::RkMppIsIommuAttached.
+ * rkav1d's device context doesn't track an explicit IommuAttached flag,
+ * but the rkiommu_av1d provider only fills the interface (MapMdl, etc.)
+ * after attach completes — so a NULL Header.Context (or NULL MapMdl)
+ * means we haven't bound yet.  See review finding #5. */
+static BOOLEAN RkAv1dIsIommuAttached(_In_ WDFDEVICE Device)
+{
+    PRKIOMMU_INTERFACE i = RkMppGetIommuIfc(Device);
+    return (i != NULL) && (i->Header.Context != NULL) && (i->MapMdl != NULL);
+}
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RkMppEvtIoDeviceControl;
 
@@ -47,6 +60,15 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
     NTSTATUS   status = STATUS_INVALID_DEVICE_REQUEST;
     ULONG_PTR  info   = 0;
     WDFDEVICE  device = WdfIoQueueGetDevice(Queue);
+
+    /* Refuse IOCTLs that require IOMMU before the rkiommu_av1d provider
+     * has attached.  GET_CAPS is exempt (read-only device-context fields).
+     * Mirrors rkvdec/ioctl.c.  See review finding #5. */
+    if (IoControlCode != IOCTL_RKMPP_GET_CAPS &&
+        !RkAv1dIsIommuAttached(device)) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
 
     switch (IoControlCode) {
 
@@ -85,7 +107,7 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
 
         /* Upper-bound StructSize too — see rkvdec/ioctl.c for the
          * rationale.  Review I1. */
-        if (in->StructSize < sizeof(*in) || in->StructSize > sizeof(*in)) {
+        if (in->StructSize != sizeof(*in)) {
             status = (in->StructSize > sizeof(*in))
                      ? STATUS_REVISION_MISMATCH
                      : STATUS_INVALID_PARAMETER;
@@ -96,11 +118,24 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                                 (PVOID*)&out, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        /* Initialise the per-file context on first use. */
+        /* Initialise the per-file context on first use.  Race-safe via
+         * sentinel-pointer election; see review finding #2 and
+         * rkvdec/ioctl.c for the matching pattern. */
         WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
         PRKMPP_FILE_CTX fctx = RkMppFileGet(file);
         if (!fctx->Device) {
-            RkMppBufFileCtxInit(file, device);
+            PVOID sentinel = (PVOID)(LONG_PTR)-1;
+            PVOID prev = InterlockedCompareExchangePointer(
+                (PVOID volatile *)&fctx->Device, sentinel, NULL);
+            if (prev == NULL) {
+                RkMppBufFileCtxInit(file, device);
+                InterlockedExchangePointer((PVOID volatile *)&fctx->Device,
+                                           device);
+            } else {
+                while (fctx->Device == sentinel) {
+                    KeStallExecutionProcessor(1);
+                }
+            }
         }
 
         status = RkMppBufAlloc(device, file, in, out);
@@ -130,11 +165,18 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
             break;
         }
 
+        /* Atomic check+remove vs concurrent FREE_BUFFER under Parallel
+         * dispatch.  See rkvdec/ioctl.c for the full rationale (review
+         * finding #3). */
+        PRKMPP_FILE_CTX freeCtx = RkMppFileGet(file);
+        KIRQL irql;
+        KeAcquireSpinLock(&freeCtx->Lock, &irql);
         if (RkMppJobBufferInUse(device, file, in->BufferHandle)) {
+            KeReleaseSpinLock(&freeCtx->Lock, irql);
             status = STATUS_DEVICE_BUSY;
             break;
         }
-
+        KeReleaseSpinLock(&freeCtx->Lock, irql);
         status = RkMppBufFree(file, in->BufferHandle);
         break;
     }

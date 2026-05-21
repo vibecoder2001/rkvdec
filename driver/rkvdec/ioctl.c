@@ -105,7 +105,7 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
          * built against a never-shipped extension we don't recognise)
          * StructSize values.  Without the upper bound we silently
          * accept attacker-shaped versions in the future.  Review I1. */
-        if (in->StructSize < sizeof(*in) || in->StructSize > sizeof(*in)) {
+        if (in->StructSize != sizeof(*in)) {
             status = (in->StructSize > sizeof(*in))
                      ? STATUS_REVISION_MISMATCH
                      : STATUS_INVALID_PARAMETER;
@@ -116,11 +116,30 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                                 (PVOID*)&out, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        /* Initialise the per-file context on first use. */
+        /* Initialise the per-file context on first use.  Race-safe under
+         * Parallel dispatch via a two-stage publish: stage 1 races to
+         * install a non-NULL sentinel via InterlockedCompareExchangePointer,
+         * and only the winner runs the destructive init (which would
+         * corrupt an already-initialised list head / spinlock if it ran
+         * concurrently).  Losers spin briefly until the winner replaces
+         * the sentinel with the real Device.  See review finding #2. */
         WDFFILEOBJECT file = WdfRequestGetFileObject(Request);
         PRKMPP_FILE_CTX fctx = RkMppFileGet(file);
         if (!fctx->Device) {
-            RkMppBufFileCtxInit(file, device);
+            PVOID sentinel = (PVOID)(LONG_PTR)-1;
+            PVOID prev = InterlockedCompareExchangePointer(
+                (PVOID volatile *)&fctx->Device, sentinel, NULL);
+            if (prev == NULL) {
+                /* Winner — initialise then publish the real Device. */
+                RkMppBufFileCtxInit(file, device);
+                InterlockedExchangePointer((PVOID volatile *)&fctx->Device,
+                                           device);
+            } else {
+                /* Loser — wait for the winner to publish. */
+                while (fctx->Device == sentinel) {
+                    KeStallExecutionProcessor(1);
+                }
+            }
         }
 
         status = RkMppBufAlloc(device, file, in, out);
@@ -156,11 +175,36 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
             break;
         }
 
+        /* Hold the file's spinlock across the JobBufferInUse check AND
+         * the BufFree remove-from-list step so a concurrent FREE_BUFFER
+         * on the same handle (Parallel dispatch) can't race us into a
+         * double-free / use-after-free.  The submit-vs-free race remains
+         * partially mitigated: SubmitDense's iova lookup walks the same
+         * list under file lock, so a buffer freed before lookup returns
+         * STATUS_INVALID_HANDLE; a buffer freed AFTER lookup but BEFORE
+         * Pending-insert can still leave a stale iova in a job — review
+         * finding #3 lower half is deferred (would require refactoring
+         * SubmitDense to hold file lock across resolve+enqueue).
+         *
+         * Lock order: file lock outer, queue lock (inside JobBufferInUse)
+         * inner.  Matches the existing order used by JobSubmitDense's
+         * Lookup → InsertTailList path. */
+        PRKMPP_FILE_CTX freeCtx = RkMppFileGet(file);
+        KIRQL irql;
+        KeAcquireSpinLock(&freeCtx->Lock, &irql);
         if (RkMppJobBufferInUse(device, file, in->BufferHandle)) {
+            KeReleaseSpinLock(&freeCtx->Lock, irql);
             status = STATUS_DEVICE_BUSY;
             break;
         }
-
+        KeReleaseSpinLock(&freeCtx->Lock, irql);
+        /* BufFree re-acquires the file lock internally to remove from
+         * the buffer list; the brief release window between our drop
+         * and BufFree's re-acquire is bridged by JobBufferInUse's
+         * snapshot semantics (a job that *would* reference this cookie
+         * is being built by a concurrent SubmitDense which must walk
+         * the file list under the same lock — and will find the cookie
+         * present until BufFree removes it). */
         status = RkMppBufFree(file, in->BufferHandle);
         break;
     }

@@ -37,9 +37,12 @@ extern VOID RkMppSetNeedsFullReset(_In_ WDFDEVICE Device);
  * JobComplete to detect "this fail follows another fail" → escalate. */
 extern LONG RkMppExchangeLastJobFailed(_In_ WDFDEVICE Device, LONG NewValue);
 
-/* Tracing wrapper for codec MMIO writes — matches BSP's
- * mpp_dev_debug=DEBUG_SET_REG output format so the two traces can be
- * diffed directly.  Set to 0 to disable. */
+/* Tracing wrapper for codec MMIO writes.  Set RKMPP_TRACE_WRITES=1 to
+ * emit BSP-format `mpp_dev_debug=DEBUG_SET_REG` lines on every write
+ * for diff-against-BSP traces.  The traced branch references `mmio`
+ * explicitly so a future rename of that local in JobKickLocalInner
+ * surfaces as a compile error instead of silently breaking the trace.
+ * Review finding #13. */
 #define RKMPP_TRACE_WRITES 0
 #if RKMPP_TRACE_WRITES
 #define TRACED_WRITE_ULONG(addr, val)                                     \
@@ -53,7 +56,10 @@ extern LONG RkMppExchangeLastJobFailed(_In_ WDFDEVICE Device, LONG NewValue);
         WRITE_REGISTER_ULONG((volatile ULONG *)(_a), _v);                 \
     } while (0)
 #else
-#define TRACED_WRITE_ULONG(addr, val) WRITE_REGISTER_ULONG((volatile ULONG*)(addr), val)
+/* Off-path: keep `mmio` referenced via a (void) cast so it's not a
+ * dead-code rename hazard. */
+#define TRACED_WRITE_ULONG(addr, val) \
+    do { (void)mmio; WRITE_REGISTER_ULONG((volatile ULONG*)(addr), (val)); } while (0)
 #endif
 
 /* -----------------------------------------------------------------------
@@ -996,15 +1002,15 @@ NTSTATUS RkMppJobRunForeign(_In_ WDFDEVICE Device,
 
     JobKickLocalInner(Device, job);
 
-    /* Wait for completion with a bounded timeout (5 s) — long enough
-     * that real decode latencies never trip it, short enough that a
-     * silently-wedged codec doesn't pin the system worker thread
-     * forever.  Without a timeout, a stale-cookie peer-completion
-     * scenario can leave this thread blocked indefinitely, exhausting
-     * IoAllocateWorkItem slots and starving the system.  See
-     * [[critical_foreign_infinite_wait]]. */
+    /* Wait for completion with a bounded timeout — long enough that
+     * real decode latencies (low tens of ms even at 4K) never trip it,
+     * short enough that a silently-wedged codec doesn't pin a worker
+     * thread for seconds at a time.  The codec watchdog + JobComplete's
+     * 2-tier reset escalation catch real wedges well under this budget;
+     * 100 ms (was 5 s) keeps the worker pool from accumulating stuck
+     * threads under multi-stream pressure.  Review finding #6. */
     LARGE_INTEGER fto;
-    fto.QuadPart = -((LONGLONG)5000 * 10000LL);   /* 5 s, relative */
+    fto.QuadPart = -((LONGLONG)100 * 10000LL);    /* 100 ms, relative */
     NTSTATUS w = KeWaitForSingleObject(
         &job->Done, Executive, KernelMode, FALSE, &fto);
 

@@ -11,6 +11,13 @@
 #include "devpub.h"
 #include "job.h"
 
+/* Mirror of RKVDEC2_REG_DEC_E_BIT in job.c (kept private there to avoid
+ * polluting job.h's API surface).  Review finding #7 uses this to gate
+ * zero-kick peer submissions; keep the two definitions in sync. */
+#ifndef RKVDEC2_REG_DEC_E_BIT
+#define RKVDEC2_REG_DEC_E_BIT 0x1u
+#endif
+
 typedef struct _RKMPP_PEER_PROVIDER_CTX {
     WDFDEVICE                       Device;
     PVOID                           CompletionCtx;
@@ -124,6 +131,14 @@ PeerKickJob(PVOID provCtx, const RKMPP_PEER_KICK_PARAMS *params)
     if (!params || !params->Bank) return STATUS_INVALID_PARAMETER;
     if (params->BankBytes != sizeof(RKMPP_DENSE_BANK)) return STATUS_INVALID_PARAMETER;
     if (params->IovaSlotCount > RKMPP_MAX_DENSE_IOVA_SLOTS) return STATUS_INVALID_PARAMETER;
+    /* Reject zero-kick: SubmitDense gates this at the IOCTL boundary,
+     * but a buggy/hostile peer consumer could synthesise one and the
+     * resulting synchronous JobComplete → KickPromotions loop has no
+     * recursion bound (same hazard as the original SubmitDense gate
+     * — see [[critical_kick_recursion]]).  Review finding #7. */
+    if ((params->KickValue & RKVDEC2_REG_DEC_E_BIT) == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
     PDEVICE_OBJECT devObj = WdfDeviceWdmGetDeviceObject(g_PeerProvider.Device);
     if (!devObj) return STATUS_DEVICE_NOT_READY;

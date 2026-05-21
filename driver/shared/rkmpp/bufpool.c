@@ -102,6 +102,13 @@ RkMppBufRoundSize(_In_ UINT32 Size, _Out_ PULONG Rounded)
 static NTSTATUS
 RkMppBufReserveQuota(_In_ PRKMPP_FILE_CTX Ctx, _In_ ULONG Size)
 {
+    /* Defensive: Size > RKMPP_MAX_FILE_BYTES would underflow the
+     * (RKMPP_MAX_FILE_BYTES - Size) check below (Size is UINT32 widened
+     * to UINT64 here; RKMPP_MAX_FILE_BYTES is 2 GiB; ULONG fits).
+     * Review finding #9. */
+    if ((UINT64)Size > RKMPP_MAX_FILE_BYTES)
+        return STATUS_QUOTA_EXCEEDED;
+
     KIRQL oldIrql;
     KeAcquireSpinLock(&Ctx->Lock, &oldIrql);
 
@@ -115,15 +122,26 @@ RkMppBufReserveQuota(_In_ PRKMPP_FILE_CTX Ctx, _In_ ULONG Size)
     Ctx->BufferCount++;
     KeReleaseSpinLock(&Ctx->Lock, oldIrql);
 
-    LONG64 newTotal = InterlockedAdd64(&g_totalAllocatedBytes, Size);
-    if (newTotal > RKMPP_MAX_GLOBAL_BYTES) {
-        InterlockedAdd64(&g_totalAllocatedBytes, -(LONG64)Size);
-
-        KeAcquireSpinLock(&Ctx->Lock, &oldIrql);
-        Ctx->AllocatedBytes -= Size;
-        Ctx->BufferCount--;
-        KeReleaseSpinLock(&Ctx->Lock, oldIrql);
-        return STATUS_QUOTA_EXCEEDED;
+    /* Atomic global-cap check via CAS loop.  The previous
+     * InterlockedAdd64 + rollback pattern could transiently exceed the
+     * cap if another reserver observed the inflated value and read its
+     * own InterlockedAdd64 return before we rolled back, leaking the
+     * cap.  Review finding #8. */
+    for (;;) {
+        LONG64 cur = ReadNoFence64(&g_totalAllocatedBytes);
+        LONG64 next = cur + (LONG64)Size;
+        if (next > RKMPP_MAX_GLOBAL_BYTES) {
+            /* Reservation refused; roll back the per-file charge. */
+            KeAcquireSpinLock(&Ctx->Lock, &oldIrql);
+            if (Ctx->AllocatedBytes >= Size) Ctx->AllocatedBytes -= Size;
+            else Ctx->AllocatedBytes = 0;
+            if (Ctx->BufferCount > 0) Ctx->BufferCount--;
+            KeReleaseSpinLock(&Ctx->Lock, oldIrql);
+            return STATUS_QUOTA_EXCEEDED;
+        }
+        if (InterlockedCompareExchange64(&g_totalAllocatedBytes, next, cur) == cur)
+            break;
+        /* Lost the race — retry. */
     }
 
     return STATUS_SUCCESS;
@@ -149,16 +167,24 @@ RkMppBufReleaseQuota(_In_ PRKMPP_FILE_CTX Ctx, _In_ ULONG Size)
 
 /* -----------------------------------------------------------------------
  * RkMppBufFileCtxInit
- * --------------------------------------------------------------------- */
+ *
+ * Initialises every field EXCEPT ctx->Device and returns.  The caller
+ * publishes ctx->Device atomically via InterlockedCompareExchangePointer
+ * AFTER this returns so that under Parallel-dispatch two racing
+ * first-IOCTLs see a consistent state — the loser observes the winner's
+ * published Device and skips re-initialising fields (which would corrupt
+ * an already-published list head / spinlock).  See review finding #2. */
 NTSTATUS
 RkMppBufFileCtxInit(_In_ WDFFILEOBJECT File, _In_ WDFDEVICE Device)
 {
+    UNREFERENCED_PARAMETER(Device);
     PRKMPP_FILE_CTX ctx = RkMppFileGet(File);
     InitializeListHead(&ctx->Buffers);
     KeInitializeSpinLock(&ctx->Lock);
-    ctx->Device = Device;
     ctx->AllocatedBytes = 0;
     ctx->BufferCount = 0;
+    /* Device assignment is the caller's responsibility via
+     * InterlockedCompareExchangePointer — see ioctl.c sites. */
     return STATUS_SUCCESS;
 }
 
@@ -405,7 +431,13 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
     }
 
     /* --- 6. Assign cookie --------------------------------------------- */
-    UINT64 cookie = (UINT64)InterlockedIncrement64(&g_nextCookie);
+    /* If the counter wraps and lands on 0 (the "no buffer" sentinel),
+     * skip past it.  In practice 2^63 allocations are unreachable, but
+     * a defensive skip is one branch.  Review finding #10. */
+    UINT64 cookie;
+    do {
+        cookie = (UINT64)InterlockedIncrement64(&g_nextCookie);
+    } while (cookie == 0);
 
     /* --- 7. Allocate tracking node ------------------------------------ */
     PRKMPP_BUFFER buf = (PRKMPP_BUFFER)ExAllocatePoolWithTag(

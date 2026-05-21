@@ -110,6 +110,43 @@ typedef struct _RKMPP_CODEC_OPS {
     ULONG KickRegBit;
 } RKMPP_CODEC_OPS;
 
+/* AV1 address-class swreg whitelist.  Mirrors the security-load-bearing
+ * decision in upstream `kAv1DmaLsbIdx` (mft/engine/decode_engine_av1.cpp):
+ * BSP's `trans_tbl_av1_vcd[]` defines which swreg slots the kernel
+ * iommu-substitutor recognises as address-bearing.  We require BufferHandle
+ * != 0 (i.e. iova substitution) for any RKMPP_REG_WRITE that lands on one
+ * of these *_lsb indices OR its companion *_msb (idx - 1).  Conversely a
+ * BufferHandle != 0 write targeting a non-address swreg is rejected — that
+ * would let user mode point the codec at an arbitrary IOVA target.
+ *
+ * The set below was hand-mirrored from kAv1DmaLsbIdx in MFT and re-checked
+ * against regbuilder_av1_reg.h's `*_base_lsb` field names; every entry has
+ * a matching `sw_*_base_lsb` (or PP/lanczos lsb) declaration.  Adding new
+ * address-class regs MUST be done in BOTH places (kernel whitelist here
+ * + user-mode emit list in decode_engine_av1.cpp). */
+static const UINT32 RKAV1D_DMA_LSB_IDX[] = {
+    65, 67, 69, 71, 73, 75, 77, 79, 81, 83, 85, 87, 89, 91, 93, 95,
+    97, 99, 101, 103, 105, 107, 109, 111, 113, 133, 135, 137, 139,
+    141, 143, 145, 147, 167, 169, 171, 173, 175, 177, 179, 183, 190,
+    192, 194, 196, 198, 200, 202, 204, 224, 226, 228, 230, 232, 234,
+    236, 238, 326, 328, 339, 341, 348, 350, 505, 507,
+};
+
+static BOOLEAN
+RkAv1dIsAddressReg(_In_ UINT32 SwregIdx)
+{
+    for (size_t i = 0; i < RTL_NUMBER_OF(RKAV1D_DMA_LSB_IDX); i++) {
+        if (SwregIdx == RKAV1D_DMA_LSB_IDX[i]) return TRUE;
+        /* The msb companion sits at idx-1 (kernel ORs the high byte
+         * during substitution).  User mode currently writes 0 there
+         * with BufferHandle==0; keep that allowed as a plain write
+         * but also accept BufferHandle!=0 if a future regbuilder
+         * decides to substitute both halves. */
+        if (SwregIdx + 1 == RKAV1D_DMA_LSB_IDX[i]) return TRUE;
+    }
+    return FALSE;
+}
+
 static const RKMPP_CODEC_OPS g_ops = {
     .SwregBase             = 0,                /* offset = idx*4 directly */
     .IntStatusOffset       = AV1D_INT_STATUS_OFFSET,
@@ -655,12 +692,20 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
 
 #define CACHE_W(off, val) \
     WRITE_REGISTER_ULONG((volatile ULONG*)((PUCHAR)cacheBase + (off)), (val))
-            /* TEST: keep cache disabled for all kicks to confirm whether the
-             * L2 write cache is causing alternating-frame corruption.
-             * PP writes bypass the cache and go directly to DRAM.
-             * If all frames decode correctly without the cache, the root cause
-             * is in the cache enable/disable/flush sequencing.
-             * TODO: re-enable once correct flush sequence is identified. */
+            /* AV1 L2 write cache intentionally left disabled.
+             *
+             * 2026-05-xx: enabling the cache (CACHE_W(0x204, 0x81)
+             * — reorder_e | cache_e) caused alternating-frame
+             * corruption.  PP writes bypassing the cache and going
+             * straight to DRAM eliminated the artifact.  AV1
+             * HW-decode is otherwise validated (see memory:
+             * [[hevc_av1_10bit_wired]] / [[av1_bringup_table]]).
+             *
+             * Deferred: re-enable behind a correct flush sequence
+             * (likely needs an inter-kick invalidate of the L2 write
+             * cache once the precise trigger is isolated).  We still
+             * configure the PP0_Y/PP0_U channel registers below so
+             * the geometry is correct when the cache is re-enabled. */
             CACHE_W(0x204, 0x00000000);
             /* PP0_Y channel */
             CACHE_W(0x84, reg326 + 1);                                 /* CONFIG0 */
@@ -678,11 +723,10 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
             if (!(reg10 & (1u << 1))) {
                 CACHE_W(0x208, 0x00000001);
             }
-            /* DISABLED: do not write 0x81 (reorder_e | cache_e) — L2 cache
-             * disabled for all kicks while diagnosing alternating-frame
-             * corruption.  Without the enable, PP writes go directly to DRAM
-             * bypassing the cache write-combining path entirely. */
-            /* CACHE_W(0x204, 0x00000081); */
+            /* L2 write cache enable intentionally deferred — see the
+             * "AV1 L2 write cache intentionally left disabled" note
+             * above for the alternating-frame-corruption history.
+             * CACHE_W(0x204, 0x00000081); */
 #undef CACHE_W
         }
     }
@@ -962,9 +1006,34 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
         dst->IovaOffset   = src->IovaOffset;
         dst->Reserved     = 0;
 
+        /* Reject byte-misaligned offsets early — AV1 swregs are 4-byte
+         * aligned by construction; any unaligned offset would either land
+         * in the gap between regs (no-op write inside the codec's MMIO
+         * window) or split across two regs (impossible at 32-bit MMIO
+         * granularity).  Both are security-relevant — a misaligned
+         * offset bypasses RkAv1dIsAddressReg below. */
+        if ((src->Offset & 3u) != 0 || src->Offset >= 512u * 4u) {
+            ExFreePoolWithTag(job, 'JppM');
+            return STATUS_INVALID_PARAMETER;
+        }
+        const UINT32 swregIdx = src->Offset / 4u;
+        const BOOLEAN isAddr = RkAv1dIsAddressReg(swregIdx);
+
         if (src->BufferHandle == 0) {
+            /* Plain write.  Allowed for every swreg — including the
+             * msb companions of address regs, which BSP also writes
+             * as 0 plain (kernel ORs the high byte). */
             dst->Value = src->Value;
             continue;
+        }
+
+        /* BufferHandle != 0 ⇒ iova substitution.  This MUST target an
+         * address-class swreg; otherwise user mode could write an
+         * arbitrary iova into a non-address register and divert the
+         * codec to attacker-controlled DMA targets.  Review finding #1. */
+        if (!isAddr) {
+            ExFreePoolWithTag(job, 'JppM');
+            return STATUS_INVALID_PARAMETER;
         }
 
         UINT64 iova = 0;

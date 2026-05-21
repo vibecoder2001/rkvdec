@@ -200,14 +200,7 @@ static const RDCC_REGS g_rdcc = {
     .SoftRstCon41     = RDCC_CRU_SOFTRST_CON41,
     .SoftRstCon41Mask = 0x000001FCu,  /* bits 2..8 — rkvdec1 group          */
     .SoftRstCon44     = RDCC_CRU_SOFTRST_CON44,
-    .SoftRstCon44Mask = 0x00000070u,  /* bits 4..6 — VDPU NIU resets.
-                                       * Used ONLY by RaiseParents / DropParents
-                                       * (the VDPU NIU is the parent-side bus
-                                       * shared with all VDPU children).  v8
-                                       * intentionally removed CON44 NIU
-                                       * touches from FullCoreReset0/1/Av1 —
-                                       * a single codec's hang-recovery must
-                                       * not disrupt peer codecs.            */
+    .SoftRstCon44Mask = 0x00000070u,  /* bits 4..6 — VDPU NIU resets        */
 };
 
 /* Per-job reset bundle (used by AssertRvdec0CoreReset / DeassertRvdec0CoreReset).
@@ -235,12 +228,7 @@ static const RDCC_REGS g_rdcc = {
  * that for clock and reset control in Phase 2. */
 extern volatile UCHAR *g_rdcc_mmio;
 extern volatile UCHAR *g_cru_mmio;
-
-/* Refcount for the rkvdec0/1 cluster RaiseCluster/DropCluster path.
- * Moved out of driver.c (was global) and made static-to-ccu.c so the
- * locking discipline is colocated with the only code that touches it.
- * Guarded by g_ccu_mutex — never accessed lock-free. */
-static LONG g_raise_refcount = 0;
+extern LONG            g_raise_refcount;
 
 /* AV1 cluster bring-up is independent of the rkvdec0/1 cluster — it
  * has its own PD (PD_AV1) with its own clock + reset bundle.  Use a
@@ -316,18 +304,6 @@ static NTSTATUS RaiseParents(void)
     if (!NT_SUCCESS(s)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: PD_VDPU power-on failed 0x%08x\n", s);
-        /* Full reverse-of-RaiseParents sequence (matches DropParents).
-         * Earlier code only re-gated CON44 clocks and PowerOff'd VCODEC,
-         * leaving SOFTRST_CON44 deasserted — the next Raise after a
-         * failed Raise would then have clocks-against-deasserted-reset
-         * for the VDPU NIU.  Replicate DropParents inline (rather than
-         * calling DropParents) because DropParents has refcount
-         * assumptions that don't quite fit this failure path. */
-        /* PowerOff VDPU is a no-op here (PowerOn just failed) but
-         * matches DropParents structure for clarity. */
-        RkMppPmuPowerOff(&g_pdVdpu);
-        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44,
-                         g_rdcc.SoftRstCon44Mask, g_rdcc.SoftRstCon44Mask);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
                          g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
         RkMppPmuPowerOff(&g_pdVcodec);
@@ -424,21 +400,14 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
 
     s = RkMppPmuPowerOn(&g_pdRkvdec0);
     if (!NT_SUCCESS(s)) {
-        ULONG g40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKGATE_CON40));
-        ULONG g44 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKGATE_CON44));
-        ULONG s89 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKSEL_CON89));
-        ULONG r40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_SOFTRST_CON40));
+        ULONG g40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8A0));
+        ULONG g44 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8B0));
+        ULONG s89 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x4A4));
+        ULONG r40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0xAA0));
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: PD_RKVDEC0 power-on failed 0x%08x "
                    "CLKGATE40=0x%08x CLKGATE44=0x%08x CLKSEL89=0x%08x SOFTRST40=0x%08x\n",
                    s, g40, g44, s89, r40);
-        /* Re-assert SOFTRST_CON40 group and re-gate clocks so the next
-         * Raise attempt starts from the same reset state as a clean
-         * boot.  Without the SOFTRST reassert, clocks would be gated
-         * but resets deasserted — leaving the codec FSM clock-against-
-         * deasserted-reset for the duration. */
-        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
-                         g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                          g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
         DropParents();
@@ -456,17 +425,9 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
     if (!NT_SUCCESS(s)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: PD_RKVDEC1 power-on failed 0x%08x\n", s);
-        /* Re-assert SOFTRSTs and re-gate clocks for BOTH RVD1 (which
-         * we just touched) and RVD0 (which we power-cycled earlier).
-         * Same rationale as the RVD0 cleanup branch: a failed Raise
-         * must leave CRU state symmetric with a clean boot. */
-        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41,
-                         g_rdcc.SoftRstCon41Mask, g_rdcc.SoftRstCon41Mask);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
                          g_rdcc.ClkGateCon41Mask, g_rdcc.ClkGateCon41Mask);
         RkMppPmuPowerOff(&g_pdRkvdec0);
-        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
-                         g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                          g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
         DropParents();
@@ -656,41 +617,11 @@ NTSTATUS RkMppCcuDropAv1Cluster(_In_ PVOID Ctx)
  * Not refcounted — paired 1:1 with the matching Ungate/Gate call.
  * RaiseAv1Cluster/DropAv1Cluster keep their own refcount for the
  * long-lived PD-up state established at PrepareHardware. */
-/* Leaf-clock entrypoint locking discipline
- * ----------------------------------------------------------------
- * MUST stay lock-free.  The RVD0/RVD1 Gate/Ungate sites in
- * driver/rkvdec/job.c are reached from RkMppJobComplete which runs
- * at DISPATCH_LEVEL (called from the WDF Interrupt DPC, job.c:534)
- * and from KickPromotions which chains into JobKickLocalInner at
- * the same IRQL.  FAST_MUTEX requires APC_LEVEL or lower —
- * acquiring at DISPATCH corrupts thread APC state (uncontended) or
- * bugchecks (contended).  A prior attempt to take g_ccu_mutex here
- * caused intermittent RVD0 timeouts.
- *
- * The hi-word-mask MMIO write inside each entrypoint is atomic at
- * the bus level and idempotent.  The historical RVD0 leaf-reset
- * race (memory/rvd0_peer_completion_gate_race) was caused by an
- * extra peer-side gate call, not by lack of serialisation here;
- * the fix removed that call (driver/rkvdec/job.c:1510-1542) and
- * restored RVD0/RVD1 to exactly one gate site each.
- *
- * The theoretical interleave against FullCoreReset0/1 (which holds
- * g_ccu_mutex while it writes CLKSEL → ungate-all → SOFTRST) is
- * scoped to FileCleanup races on the same engine while a peer file
- * is mid-decode; the rkvdec/device.c FileCleanup path already
- * guards that case via the otherActive check (skips FullCoreReset
- * when a peer is active).  If a future caller needs the leaf-clock
- * entrypoints to serialise against the wide reset sequences, the
- * proper fix is to defer JobComplete's tail-kick to a WDFWORKITEM
- * so JobStart and the gate call always run at PASSIVE
- * (memory/rkvdec_recovery_strategy.md "deferred follow-ups").
- */
 NTSTATUS RkMppCcuGateAv1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    /* Set gate bits = stop the AV1 leaf clocks.  Lock-free — see
-     * the discipline comment above. */
+    /* Set gate bits = stop the AV1 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKGATE_CON68,
                      RDCC_CRU_CLKGATE_CON68_MASK,
                      RDCC_CRU_CLKGATE_CON68_MASK);
@@ -701,7 +632,7 @@ NTSTATUS RkMppCcuUngateAv1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    /* Clear gate bits = restart the AV1 leaf clocks.  Lock-free. */
+    /* Clear gate bits = restart the AV1 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKGATE_CON68,
                      RDCC_CRU_CLKGATE_CON68_MASK, 0);
     return STATUS_SUCCESS;
@@ -792,14 +723,11 @@ NTSTATUS RkMppCcuUngateAv1LeafClocks(_In_ PVOID Ctx)
  * cycle per-kick: no other consumer touches them between kicks. */
 #define RDCC_CON41_LEAF_GATE_MASK  0x000001C0u  /* bits 6,7,8 (RVD1) */
 
-/* RVD0/RVD1 leaf-clock entrypoints — MUST stay lock-free; callers
- * include the rkvdec DPC chain (JobComplete → KickPromotions →
- * JobKickLocalInner) which runs at DISPATCH_LEVEL.  See the
- * locking-discipline comment above RkMppCcuGateAv1LeafClocks. */
 NTSTATUS RkMppCcuGateRvdec0LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    /* Set gate bits = stop the RVD0 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                      RDCC_CON40_LEAF_GATE_MASK,
                      RDCC_CON40_LEAF_GATE_MASK);
@@ -810,6 +738,7 @@ NTSTATUS RkMppCcuUngateRvdec0LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    /* Clear gate bits = restart the RVD0 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                      RDCC_CON40_LEAF_GATE_MASK, 0);
     return STATUS_SUCCESS;
@@ -819,6 +748,7 @@ NTSTATUS RkMppCcuGateRvdec1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    /* Set gate bits = stop the RVD1 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
                      RDCC_CON41_LEAF_GATE_MASK,
                      RDCC_CON41_LEAF_GATE_MASK);
@@ -829,6 +759,7 @@ NTSTATUS RkMppCcuUngateRvdec1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
+    /* Clear gate bits = restart the RVD1 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
                      RDCC_CON41_LEAF_GATE_MASK, 0);
     return STATUS_SUCCESS;
@@ -1022,24 +953,7 @@ NTSTATUS RkMppCcuFullAv1Reset(_In_ PVOID Ctx)
     RKMPP_LOG_WARN(
                "rkmpp_ccu: FullAv1Reset — wide CRU reset for AV1\n");
 
-    /* Serialise with RaiseAv1Cluster / DropAv1Cluster / FullCoreReset0/1
-     * via g_ccu_mutex.  Review finding #1: counterpart FullCoreReset0/1
-     * already take the mutex; this path skipped it.  Without the mutex
-     * a concurrent RaiseAv1Cluster could land its CLKGATE_CON68 ungate
-     * between this path's SOFTRST_CON68 deassert and the PMU idle
-     * release, leaving AV1 in an intermediate state. */
-    ExAcquireFastMutex(&g_ccu_mutex);
-
-    /* Review finding #6: RkMppPmuIdleRequest returns SUCCESS on
-     * timeout (intentional — callers don't abandon wedge recovery)
-     * but the timeout is silent.  Log a warning so the path is
-     * observable in event traces. */
-    NTSTATUS sIdleOn = RkMppPmuIdleRequest(&g_pdAv1, TRUE);
-    if (!NT_SUCCESS(sIdleOn)) {
-        RKMPP_LOG_WARN(
-                   "rkmpp_ccu: FullAv1Reset idle-request(TRUE) returned 0x%08x\n",
-                   sIdleOn);
-    }
+    (void)RkMppPmuIdleRequest(&g_pdAv1, TRUE);
 
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_SOFTRST_CON68,
                      RDCC_CRU_SOFTRST_CON68_MASK, RDCC_CRU_SOFTRST_CON68_MASK);
@@ -1049,13 +963,7 @@ NTSTATUS RkMppCcuFullAv1Reset(_In_ PVOID Ctx)
                      RDCC_CRU_SOFTRST_CON68_MASK, 0);
     KeStallExecutionProcessor(20);
 
-    NTSTATUS sIdleOff = RkMppPmuIdleRequest(&g_pdAv1, FALSE);
-    if (!NT_SUCCESS(sIdleOff)) {
-        RKMPP_LOG_WARN(
-                   "rkmpp_ccu: FullAv1Reset idle-request(FALSE) returned 0x%08x\n",
-                   sIdleOff);
-    }
+    (void)RkMppPmuIdleRequest(&g_pdAv1, FALSE);
 
-    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }

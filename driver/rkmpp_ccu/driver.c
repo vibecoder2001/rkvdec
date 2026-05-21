@@ -31,7 +31,7 @@
 volatile UCHAR *g_rdcc_mmio     = NULL;
 volatile UCHAR *g_cru_mmio      = NULL;
 volatile UCHAR *g_pmu_mmio      = NULL;
-/* g_raise_refcount moved to ccu.c (static there, guarded by g_ccu_mutex). */
+LONG            g_raise_refcount = 0;
 
 /* MMIO mapping bookkeeping — kept here so ReleaseHardware can unmap. */
 static SIZE_T   g_rdcc_mmio_len = 0;

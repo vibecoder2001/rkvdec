@@ -799,7 +799,16 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
             const ULONG bit = 1u << (idx & 31);
             const BOOLEAN was_nz = (prev[idx >> 5] & bit) != 0;
             const BOOLEAN is_nz  = (cur_nonzero[idx >> 5] & bit) != 0;
-            if (!was_nz && !is_nz) continue;  /* zero→zero: skip */
+            /* Skip MMIO only when (a) user-mode did NOT explicitly emit
+             * this reg in Writes[] AND (b) it was zero last kick.  The
+             * av1_seen[] check is what keeps the regbuilder's
+             * kAv1ForceWriteIdx force-zeros (swreg 260, 266) actually
+             * landing on the MMIO every kick — without it the
+             * skip-zero-when-zero optimisation silently drops the very
+             * write the user-mode list exists to guarantee, and the
+             * right-edge corruption on 10-bit AV1 that 590f3c6 was
+             * supposed to fix never actually got the clear it needed. */
+            if (!av1_seen[idx] && !was_nz && !is_nz) continue;
             TRACED_WRITE_ULONG(((PUCHAR)mmio + idx * 4), av1_vals[idx]);
         }
         /* Snapshot for next kick. */

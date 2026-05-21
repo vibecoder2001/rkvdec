@@ -656,55 +656,44 @@ NTSTATUS RkMppCcuDropAv1Cluster(_In_ PVOID Ctx)
  * Not refcounted — paired 1:1 with the matching Ungate/Gate call.
  * RaiseAv1Cluster/DropAv1Cluster keep their own refcount for the
  * long-lived PD-up state established at PrepareHardware. */
-/* Leaf-clock entrypoint locking discipline (review finding #2)
+/* Leaf-clock entrypoint locking discipline
  * ----------------------------------------------------------------
- * The individual hi-word-mask write inside each Gate/Ungate*LeafClocks
- * is atomic at the bus level and idempotent — re-applying the same
- * value is a no-op.  So at first glance these entrypoints look
- * "stateless" and lock-free safe (the position taken in
- * memory/ccu_refcount_serialization.md).
+ * MUST stay lock-free.  The RVD0/RVD1 Gate/Ungate sites in
+ * driver/rkvdec/job.c are reached from RkMppJobComplete which runs
+ * at DISPATCH_LEVEL (called from the WDF Interrupt DPC, job.c:534)
+ * and from KickPromotions which chains into JobKickLocalInner at
+ * the same IRQL.  FAST_MUTEX requires APC_LEVEL or lower —
+ * acquiring at DISPATCH corrupts thread APC state (uncontended) or
+ * bugchecks (contended).  A prior attempt to take g_ccu_mutex here
+ * caused intermittent RVD0 timeouts.
  *
- * The ACTUAL risk is the *interleave* against FullCoreReset0/1 and
- * RaiseCluster.  Those sequences look like:
- *   write CLKSEL_CON8x  (rate config)
- *   write CLKGATE_CON40 (ungate-all)
- *   write SOFTRST_CON40 (deassert)
- * If a JobComplete-DPC-issued GateRvdec0LeafClocks lands BETWEEN the
- * CLKSEL writes and the CLKGATE ungate-all in FullCoreReset0, then
- * FullCoreReset0's ungate-all undoes the gate but the leaf-clock
- * caller has already returned thinking the clocks are gated.  The
- * codec then runs with clocks-on when the driver above thinks they
- * are off — observed as RVD0 release-build wedges in the
- * rvd0_peer_completion_gate_race memory entry.
+ * The hi-word-mask MMIO write inside each entrypoint is atomic at
+ * the bus level and idempotent.  The historical RVD0 leaf-reset
+ * race (memory/rvd0_peer_completion_gate_race) was caused by an
+ * extra peer-side gate call, not by lack of serialisation here;
+ * the fix removed that call (driver/rkvdec/job.c:1510-1542) and
+ * restored RVD0/RVD1 to exactly one gate site each.
  *
- * Taking g_ccu_mutex on the leaf-clock entrypoints serialises them
- * against FullCoreReset0/1, FullAv1Reset, RaiseCluster, DropCluster,
- * RaiseAv1Cluster and DropAv1Cluster — all of which already hold
- * the mutex for their full sequence.  Lock-ordering analysis:
- *
- *   - All leaf-clock callers (driver/rkvdec/job.c JobStart and
- *     JobComplete, driver/rkav1d/device.c D0Entry/D0Exit) invoke
- *     these methods at PASSIVE_LEVEL with NO spinlock held.  The
- *     JobComplete site explicitly releases q->Lock before the
- *     Gate*LeafClocks call (job.c ~line 1393).
- *   - The leaf-clock body does not call back into any other ifc
- *     method, so no nested-lock inversion is possible.
- *   - FAST_MUTEX is fine at PASSIVE_LEVEL.
- *
- * Cost: one mutex acquire/release per gate cycle.  These already
- * dominate at hundreds of µs per cycle (PMU/CRU latency), so an
- * uncontended FAST_MUTEX is in the noise.
+ * The theoretical interleave against FullCoreReset0/1 (which holds
+ * g_ccu_mutex while it writes CLKSEL → ungate-all → SOFTRST) is
+ * scoped to FileCleanup races on the same engine while a peer file
+ * is mid-decode; the rkvdec/device.c FileCleanup path already
+ * guards that case via the otherActive check (skips FullCoreReset
+ * when a peer is active).  If a future caller needs the leaf-clock
+ * entrypoints to serialise against the wide reset sequences, the
+ * proper fix is to defer JobComplete's tail-kick to a WDFWORKITEM
+ * so JobStart and the gate call always run at PASSIVE
+ * (memory/rkvdec_recovery_strategy.md "deferred follow-ups").
  */
 NTSTATUS RkMppCcuGateAv1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    ExAcquireFastMutex(&g_ccu_mutex);
-    /* Set gate bits = stop the AV1 leaf clocks. */
+    /* Set gate bits = stop the AV1 leaf clocks.  Lock-free — see
+     * the discipline comment above. */
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKGATE_CON68,
                      RDCC_CRU_CLKGATE_CON68_MASK,
                      RDCC_CRU_CLKGATE_CON68_MASK);
-    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -712,11 +701,9 @@ NTSTATUS RkMppCcuUngateAv1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    ExAcquireFastMutex(&g_ccu_mutex);
-    /* Clear gate bits = restart the AV1 leaf clocks. */
+    /* Clear gate bits = restart the AV1 leaf clocks.  Lock-free. */
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_CLKGATE_CON68,
                      RDCC_CRU_CLKGATE_CON68_MASK, 0);
-    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -805,19 +792,17 @@ NTSTATUS RkMppCcuUngateAv1LeafClocks(_In_ PVOID Ctx)
  * cycle per-kick: no other consumer touches them between kicks. */
 #define RDCC_CON41_LEAF_GATE_MASK  0x000001C0u  /* bits 6,7,8 (RVD1) */
 
-/* See locking-discipline comment above RkMppCcuGateAv1LeafClocks for
- * why the RVD0/RVD1 leaf-clock entrypoints take g_ccu_mutex despite
- * the underlying hi-word-mask write being individually idempotent. */
+/* RVD0/RVD1 leaf-clock entrypoints — MUST stay lock-free; callers
+ * include the rkvdec DPC chain (JobComplete → KickPromotions →
+ * JobKickLocalInner) which runs at DISPATCH_LEVEL.  See the
+ * locking-discipline comment above RkMppCcuGateAv1LeafClocks. */
 NTSTATUS RkMppCcuGateRvdec0LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    ExAcquireFastMutex(&g_ccu_mutex);
-    /* Set gate bits = stop the RVD0 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                      RDCC_CON40_LEAF_GATE_MASK,
                      RDCC_CON40_LEAF_GATE_MASK);
-    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -825,11 +810,8 @@ NTSTATUS RkMppCcuUngateRvdec0LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    ExAcquireFastMutex(&g_ccu_mutex);
-    /* Clear gate bits = restart the RVD0 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                      RDCC_CON40_LEAF_GATE_MASK, 0);
-    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -837,12 +819,9 @@ NTSTATUS RkMppCcuGateRvdec1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    ExAcquireFastMutex(&g_ccu_mutex);
-    /* Set gate bits = stop the RVD1 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
                      RDCC_CON41_LEAF_GATE_MASK,
                      RDCC_CON41_LEAF_GATE_MASK);
-    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }
 
@@ -850,11 +829,8 @@ NTSTATUS RkMppCcuUngateRvdec1LeafClocks(_In_ PVOID Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
-    ExAcquireFastMutex(&g_ccu_mutex);
-    /* Clear gate bits = restart the RVD1 leaf clocks. */
     RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
                      RDCC_CON41_LEAF_GATE_MASK, 0);
-    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }
 

@@ -70,9 +70,12 @@ static uint32_t br_ue(BitReader *br) {
     int zeros = 0;
     while (!br_eof(br) && br_u1(br) == 0) zeros++;
     if (br_eof(br) && zeros > 0) { br->failed = true; return 0; }
-    if (zeros >= 32) { br->failed = true; return 0; }
+    /* `zeros > 31` + `1ull << zeros`: safe-by-construction form so a
+     * boundary `zeros == 31` value doesn't risk `1u << 31` UB/wrap.
+     * Review parser Medium #7. */
+    if (zeros > 31) { br->failed = true; return 0; }
     uint32_t suffix = br_u(br, zeros);
-    return ((1u << zeros) - 1) + suffix;
+    return (uint32_t)(((uint64_t)1 << zeros) - 1) + suffix;
 }
 
 /* Signed Exp-Golomb se(v) — H.265 9.2.2. */
@@ -94,7 +97,10 @@ static int ceil_log2(uint32_t n) {
 
 static size_t find_start_code(const uint8_t *buf, size_t len, size_t from,
                               size_t *sc_start) {
-    for (size_t i = from; i + 2 < len; i++) {
+    /* Bound check `i + 3 <= len` matches au_iter.cpp — `i + 2 < len`
+     * skipped the last legal 3-byte start code at offset len-3
+     * (review parser Medium #5). */
+    for (size_t i = from; i + 3 <= len; i++) {
         if (buf[i] == 0 && buf[i+1] == 0) {
             if (buf[i+2] == 1) {
                 *sc_start = i;
@@ -822,13 +828,27 @@ static H265ParseStatus parse_slice_header(BitReader *br,
             sh->short_term_ref_pic_set_size = (uint32_t)br->bit_pos - bit_begin;
 
             if (sps->long_term_ref_pics_present_flag) {
+                /* Capture into uint32 BEFORE the uint8 truncation so a
+                 * value that wraps mod 256 to 0 can't sneak past the
+                 * "no LT refs" check below while the bit cursor
+                 * advanced.  HEVC spec caps each at the SPS's
+                 * num_long_term_ref_pics_sps + DPB capacity (32 max);
+                 * reject anything larger as malformed.  Review parser
+                 * Medium #4. */
+                uint32_t n_lt_sps = 0;
                 if (sps->num_long_term_ref_pics_sps > 0)
-                    sh->num_long_term_sps = (uint8_t)br_ue(br);
-                sh->num_long_term_pics = (uint8_t)br_ue(br);
+                    n_lt_sps = br_ue(br);
+                uint32_t n_lt_pics = br_ue(br);
+                if (n_lt_sps > H265_MAX_LONG_TERM_REFS ||
+                    n_lt_pics > H265_MAX_LONG_TERM_REFS) {
+                    return H265_PARSE_INVALID;
+                }
+                sh->num_long_term_sps  = (uint8_t)n_lt_sps;
+                sh->num_long_term_pics = (uint8_t)n_lt_pics;
                 /* Skip per-LT entries — we don't manage LTR.  Bail
                  * out cleanly if the stream actually uses them; for
                  * our test streams the count is always 0. */
-                if (sh->num_long_term_sps + sh->num_long_term_pics > 0)
+                if (n_lt_sps + n_lt_pics > 0)
                     return H265_PARSE_UNSUPPORTED;
             }
 
@@ -979,9 +999,27 @@ static H265ParseStatus parse_slice_header(BitReader *br,
     }
 
     if (pps->tiles_enabled_flag || pps->entropy_coding_sync_enabled_flag) {
-        sh->num_entry_point_offsets = br_ue(br);
+        uint32_t n_ep = br_ue(br);
+        /* HEVC spec 7.4.7.1: num_entry_point_offsets is bounded by
+         * PicHeightInCtbsY (when entropy_coding_sync_enabled_flag is 1)
+         * or PicHeightInCtbsY * (num_tile_columns_minus1 + 1) (tiles).
+         * Reject any adversarial value larger than pic_height_in_ctbs_y
+         * times the maximum tile-column count, otherwise the loop below
+         * spins for 2B iterations consuming bits per spec.  Review
+         * parser High #1. */
+        uint32_t ep_max = sps->pic_height_in_ctbs_y *
+                          (uint32_t)(pps->num_tile_columns_minus1 + 1u);
+        if (n_ep > ep_max) {
+            br->failed = true;
+            return H265_PARSE_INVALID;
+        }
+        sh->num_entry_point_offsets = n_ep;
         if (sh->num_entry_point_offsets) {
             uint32_t offset_len_minus1 = br_ue(br);
+            if (offset_len_minus1 > 31) {
+                br->failed = true;
+                return H265_PARSE_INVALID;
+            }
             for (uint32_t i = 0; i < sh->num_entry_point_offsets; i++)
                 (void)br_u(br, (int)(offset_len_minus1 + 1));
         }
@@ -989,6 +1027,17 @@ static H265ParseStatus parse_slice_header(BitReader *br,
 
     if (pps->slice_segment_header_extension_present_flag) {
         uint32_t length = br_ue(br);
+        /* Cap the extension data length at the bytes remaining in the
+         * RBSP (br->len) — without this, an adversarial slice header
+         * with `length = 2^32-1` spins for billions of iterations.
+         * Review parser High #1. */
+        size_t remaining_bytes = (br->bit_pos < br->len * 8)
+                                   ? (br->len - (br->bit_pos + 7) / 8)
+                                   : 0;
+        if (length > remaining_bytes) {
+            br->failed = true;
+            return H265_PARSE_INVALID;
+        }
         for (uint32_t i = 0; i < length; i++)
             (void)br_u(br, 8);
     }
@@ -1047,6 +1096,14 @@ H265ParseStatus H265ParseAccessUnit(const uint8_t *buf, size_t len,
     out->is_irap              = 0;
     out->slice_data           = nullptr;
     out->slice_data_size      = 0;
+
+    /* Stage prev_poc_*_tid0 on the stack across the AU loop; commit only
+     * on PARSE_OK at the end.  A later NAL failure after we've already
+     * written new POC state would otherwise leave the per-instance
+     * state poisoned across calls (POC desync on the next AU).
+     * Review parser High #2. */
+    int32_t staged_prev_poc_msb_tid0 = out->prev_poc_msb_tid0;
+    int32_t staged_prev_poc_lsb_tid0 = out->prev_poc_lsb_tid0;
 
     size_t scratch_off = 0;
     size_t pos = 0;
@@ -1123,14 +1180,14 @@ H265ParseStatus H265ParseAccessUnit(const uint8_t *buf, size_t len,
             int32_t poc;
             if (out->is_idr) {
                 poc = 0;
-                out->prev_poc_msb_tid0 = 0;
-                out->prev_poc_lsb_tid0 = 0;
+                staged_prev_poc_msb_tid0 = 0;
+                staged_prev_poc_lsb_tid0 = 0;
             } else {
                 const H265Sps *sps = &out->sps[out->active_sps_id];
                 int max_lsb = 1 << (sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
                 int32_t lsb = out->slice.slice_pic_order_cnt_lsb;
-                int32_t prev_lsb = out->prev_poc_lsb_tid0;
-                int32_t prev_msb = out->prev_poc_msb_tid0;
+                int32_t prev_lsb = staged_prev_poc_lsb_tid0;
+                int32_t prev_msb = staged_prev_poc_msb_tid0;
                 int32_t msb;
                 if (lsb < prev_lsb && (prev_lsb - lsb) >= max_lsb / 2)
                     msb = prev_msb + max_lsb;
@@ -1157,9 +1214,9 @@ H265ParseStatus H265ParseAccessUnit(const uint8_t *buf, size_t len,
                     max_lsb = 1 << (sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
                 }
                 if (max_lsb) {
-                    out->prev_poc_lsb_tid0 = poc % max_lsb;
-                    if (out->prev_poc_lsb_tid0 < 0) out->prev_poc_lsb_tid0 += max_lsb;
-                    out->prev_poc_msb_tid0 = poc - out->prev_poc_lsb_tid0;
+                    staged_prev_poc_lsb_tid0 = poc % max_lsb;
+                    if (staged_prev_poc_lsb_tid0 < 0) staged_prev_poc_lsb_tid0 += max_lsb;
+                    staged_prev_poc_msb_tid0 = poc - staged_prev_poc_lsb_tid0;
                 }
             }
 
@@ -1183,6 +1240,10 @@ H265ParseStatus H265ParseAccessUnit(const uint8_t *buf, size_t len,
                  ? H265_PARSE_NEED_MORE
                  : H265_PARSE_INVALID;
     }
+    /* Commit staged POC state — see comment at the top of the AU loop.
+     * Review parser High #2. */
+    out->prev_poc_msb_tid0 = staged_prev_poc_msb_tid0;
+    out->prev_poc_lsb_tid0 = staged_prev_poc_lsb_tid0;
     return H265_PARSE_OK;
 }
 

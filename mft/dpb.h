@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>   /* abort() — used by RKMPP_VERIFY in release builds */
 
 #include "parser_glue.h"
 #include "parser_glue_h265.h"
@@ -29,6 +30,24 @@ extern "C" {
 #endif
 
 #define DPB_MAX_SLOTS 16
+
+/* Load-bearing invariant check that survives Release builds (where
+ * `assert()` compiles out via NDEBUG).  A failing invariant on the DPB
+ * consumer-hold path corrupts slot lifetime tracking — the kernel
+ * would then receive a slot iova that a live consumer is still reading
+ * from.  Trap loudly instead of silently corrupting state.  Review
+ * parser Low #11.
+ *
+ * MSVC + clang-cl support __debugbreak; abort() is the final safety
+ * net.  Define before any consumer #includes dpb.h. */
+#ifndef RKMPP_VERIFY
+#  ifdef _MSC_VER
+#    define RKMPP_VERIFY(cond) do { if (!(cond)) { __debugbreak(); abort(); } } while(0)
+#  else
+#    define RKMPP_VERIFY(cond) do { if (!(cond)) { __builtin_trap(); abort(); } } while(0)
+#  endif
+#endif
+
 
 /* Sentinel POC for unused entries in H265DpbSelection::ref_pocs[].  Mirrors
  * the H.264 sentinel pattern; the regbuilder packs reg67..82 with these

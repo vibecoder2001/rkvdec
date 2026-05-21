@@ -1004,7 +1004,8 @@ int Vp9Parser_SuperframeSplit(const uint8_t *buf, size_t len,
          * `remain -= sz` below safely underflows nowhere because
          * we've validated `sz <= remain` first.  Review parser
          * Important #16. */
-        if (sz > remain) return -1;
+        if (sz == 0)        return -1;   /* zero-length subframe is malformed */
+        if (sz > remain)    return -1;
         frames[i] = data;
         sizes[i]  = sz;
         data   += sz;

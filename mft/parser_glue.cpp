@@ -87,9 +87,13 @@ static uint32_t br_ue(BitReader *br) {
     int zeros = 0;
     while (!br_eof(br) && br_u1(br) == 0) zeros++;
     if (br_eof(br) && zeros > 0) { br->failed = true; return 0; }
-    if (zeros >= 32) { br->failed = true; return 0; }
+    /* `zeros > 31` is the safe-by-construction form: `1ull << 32` is UB
+     * for `1u <<`, and `1u << 31` produces 0x80000000 then the `-1`
+     * wraps — using `1ull << zeros` keeps the math correct up to the
+     * full 31-bit suffix.  Review parser Medium #7. */
+    if (zeros > 31) { br->failed = true; return 0; }
     uint32_t suffix = br_u(br, zeros);
-    return ((1u << zeros) - 1) + suffix;
+    return (uint32_t)(((uint64_t)1 << zeros) - 1) + suffix;
 }
 
 /* Signed Exp-Golomb. */
@@ -105,7 +109,10 @@ static int32_t br_se(BitReader *br) {
  * the start of the start code itself. */
 static size_t find_start_code(const uint8_t *buf, size_t len, size_t from,
                               size_t *sc_start) {
-    for (size_t i = from; i + 2 < len; i++) {
+    /* Bound check `i + 3 <= len` matches au_iter.cpp's `i + 3 <= len`
+     * form — `i + 2 < len` skipped the last legal 3-byte start code at
+     * offset len-3 (review parser Medium #5). */
+    for (size_t i = from; i + 3 <= len; i++) {
         if (buf[i] == 0 && buf[i+1] == 0) {
             if (buf[i+2] == 1) {
                 *sc_start = i;
@@ -739,6 +746,11 @@ static H264ParseStatus parse_slice_header(
         }
     }
 
+    /* Surface any latched malformed-bitstream condition from br_ue/br_se
+     * — the rest of the function reads many Exp-Golomb fields and a
+     * malformed slice header would otherwise have a clamped-zero
+     * mmco/RPLM table flow into the DPB layer.  Review parser Medium #8. */
+    if (br_failed(br)) return H264_PARSE_INVALID;
     return H264_PARSE_OK;
 }
 
@@ -916,6 +928,18 @@ H264ParseStatus H264ParseAccessUnit(const uint8_t *buf, size_t len,
     memset(out->rplm_l0, 0, sizeof(out->rplm_l0));
     memset(out->rplm_l1, 0, sizeof(out->rplm_l1));
 
+    /* Stage prev_* POC state on the stack across the AU loop and commit
+     * back to `out` only at the very end on success.  Without this
+     * staging, a successfully-parsed slice early in the AU writes new
+     * POC state into `out->prev_*`, then a later NAL fails and the
+     * caller sees the partially-mutated POC state next call — visible
+     * as POC desync after a corrupted middle NAL.  Review parser
+     * High #2. */
+    int32_t staged_prev_msb         = out->prev_pic_order_cnt_msb;
+    int32_t staged_prev_lsb         = out->prev_pic_order_cnt_lsb;
+    int32_t staged_prev_frame_num   = out->prev_frame_num;
+    int32_t staged_prev_frame_num_offset = out->prev_frame_num_offset;
+
     size_t scratch_off = 0;
     size_t pos = 0;
     while (pos < len) {
@@ -1008,18 +1032,18 @@ H264ParseStatus H264ParseAccessUnit(const uint8_t *buf, size_t len,
                 if (out->sps.pic_order_cnt_type == 0) {
                     h264_compute_poc_type0(&out->sps, &out->pps, &out->decode,
                                            is_idr_now, nal_ref,
-                                           &out->prev_pic_order_cnt_msb,
-                                           &out->prev_pic_order_cnt_lsb);
+                                           &staged_prev_msb,
+                                           &staged_prev_lsb);
                 } else if (out->sps.pic_order_cnt_type == 1) {
                     h264_compute_poc_type1(&out->sps, &out->decode,
                                            is_idr_now, nal_ref,
-                                           &out->prev_frame_num,
-                                           &out->prev_frame_num_offset);
+                                           &staged_prev_frame_num,
+                                           &staged_prev_frame_num_offset);
                 } else {
                     h264_compute_poc_type2(&out->sps, &out->decode,
                                            is_idr_now, nal_ref,
-                                           &out->prev_frame_num,
-                                           &out->prev_frame_num_offset);
+                                           &staged_prev_frame_num,
+                                           &staged_prev_frame_num_offset);
                 }
             }
             /* Bit position rounded up to the next byte gives us the start
@@ -1044,5 +1068,11 @@ H264ParseStatus H264ParseAccessUnit(const uint8_t *buf, size_t len,
         return out->has_sps && out->has_pps ? H264_PARSE_NEED_MORE
                                             : H264_PARSE_INVALID;
     }
+    /* Commit staged POC state — see comment at the top of the AU loop.
+     * Review parser High #2. */
+    out->prev_pic_order_cnt_msb     = staged_prev_msb;
+    out->prev_pic_order_cnt_lsb     = staged_prev_lsb;
+    out->prev_frame_num             = staged_prev_frame_num;
+    out->prev_frame_num_offset      = staged_prev_frame_num_offset;
     return H264_PARSE_OK;
 }

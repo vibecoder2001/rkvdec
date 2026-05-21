@@ -800,7 +800,14 @@ HRESULT DecoderMFT::ParseAvcCExtradata(const uint8_t *blob, size_t len) {
      */
     if (len < 7) return E_INVALIDARG;
     if (blob[0] != 1) return E_INVALIDARG;
-    length_size_ = static_cast<uint8_t>((blob[4] & 0x03) + 1);
+    uint8_t len_size = static_cast<uint8_t>((blob[4] & 0x03) + 1);
+    /* ISO/IEC 14496-15 leaves length-size 3 unused (and AvccLenSize only
+     * names 1/2/4).  Without this gate, length_size_=3 would later
+     * default-fall-through to LEN_4 in AvccToAnnexB, misframing every
+     * sample.  Review parser Medium #3. */
+    if (len_size != 1 && len_size != 2 && len_size != 4)
+        return E_INVALIDARG;
+    length_size_ = len_size;
 
     size_t off = 5;
     uint8_t sps_count = blob[off++] & 0x1f;
@@ -845,7 +852,12 @@ HRESULT DecoderMFT::ParseHvcCExtradata(const uint8_t *blob, size_t len) {
      */
     if (len < 23) return E_INVALIDARG;
     if (blob[0] != 1) return E_INVALIDARG;
-    length_size_ = static_cast<uint8_t>((blob[21] & 0x03) + 1);
+    uint8_t len_size = static_cast<uint8_t>((blob[21] & 0x03) + 1);
+    /* Reject the spec-unused length_size==3 (same rationale as the
+     * avcC path).  Review parser Medium #3. */
+    if (len_size != 1 && len_size != 2 && len_size != 4)
+        return E_INVALIDARG;
+    length_size_ = len_size;
     uint8_t num_arrays = blob[22];
 
     size_t off = 23;
@@ -1007,18 +1019,16 @@ STDMETHODIMP DecoderMFT::ProcessMessage(MFT_MESSAGE_TYPE msg, ULONG_PTR param) {
             } else {
                 engine_ = eng;
                 engine_init_failed_ = false;
-                /* Zero-copy readout (eng->populate_yuv = false) was tried
-                 * here but reliably wedged the codec at 4K, even with the
-                 * external-hold infrastructure protecting slot lifetime.
-                 * Best guess: removing the engine-side ~12 ms memcpy
-                 * collapses the gap between back-to-back kicks, exposing
-                 * a hardware contention issue (AXI write retire vs. ref
-                 * read on the same slot) that the slow read used to
-                 * mask.  Reverting to populate_yuv=true keeps the engine
-                 * memcpy gap and the codec stays stable.  The Phase 1
-                 * hold infrastructure (slot_idx + external_hold) is
-                 * left in place for future use if/when we sequence
-                 * kicks more carefully. */
+                /* Zero-copy readout (eng->populate_yuv = false) was
+                 * tried here but reliably wedged the codec at 4K — see
+                 * memory/rkmpp_zero_copy_kicks_too_fast.md.  Reverting
+                 * to populate_yuv=true (the default) keeps the engine
+                 * memcpy gap and the codec stays stable.  The old
+                 * `external_hold` refcount that gated zero-copy was
+                 * replaced by the named lifecycle flags
+                 * (pending_reorder / pending_ready / held_by_consumer)
+                 * in dpb.h; no external-hold infra remains in code,
+                 * only the named-flag system.  Review parser Low #12. */
                 /* Prime persistent SPS/PPS state from container extradata
                  * (avcC / hvcC parsed into Annex-B in SetInputType). */
                 if (!extradata_annexb_.empty()) {
@@ -1172,6 +1182,20 @@ void DecoderMFT::DumpAuIfActive(const uint8_t *au, size_t au_len, int64_t pts_hn
             absoluteOk = true;
         }
         if (!absoluteOk) return;
+        /* Defense-in-depth path traversal guards.  Attacker controls the
+         * env var on a hostile process, but defending the parser keeps
+         * the surface small.  Reject:
+         *   - any `..` substring (path-traversal escape),
+         *   - any `:` past the drive-letter colon (NTFS alternate data
+         *     streams: `C:\dir\file:stream`).
+         * Review parser Low #10. */
+        for (DWORD i = 0; i + 1 < got; i++) {
+            if (dumpPath[i] == '.' && dumpPath[i+1] == '.') return;
+        }
+        /* Drive-letter ':' is at offset 1; any further ':' is illegal. */
+        for (DWORD i = 2; i < got; i++) {
+            if (dumpPath[i] == ':') return;
+        }
         {
             errno_t e = fopen_s(&dump_file_, dumpPath, "wb");
             if (e != 0 || !dump_file_) {
@@ -1442,13 +1466,14 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
 
     if (!engine_ || engine_init_failed_) return MF_E_NOTACCEPTING;
 
-    /* Backpressure: each queued frame holds a DPB slot via the external-
-     * hold counter (see dpb.h Dpb_AddExternalHold).  The DPB also needs
-     * slots for active reference frames (~5-8 typical).  When the engine
-     * pumps faster than EVR drains (e.g. zero-copy at 4K — Submit ~1ms,
-     * Output @ 24fps), uncapped queue growth exhausts the slot pool and
-     * the next decode hits DPB_FULL → bad refs → codec wedge.  Cap the
-     * queue at kQueueCap so EVR's source reader retries this AU later. */
+    /* Backpressure: each queued frame holds a DPB slot via the
+     * `held_by_consumer` lifecycle flag (see dpb.h Dpb_AddHold with
+     * DPB_HOLD_CONSUMER).  The DPB also needs slots for active
+     * reference frames (~5-8 typical).  When the engine pumps faster
+     * than EVR drains, uncapped queue growth exhausts the slot pool
+     * and the next decode hits DPB_FULL → bad refs → codec wedge.
+     * Cap the queue at kQueueCap so EVR's source reader retries this
+     * AU later. */
     {
         auto *eng = static_cast<DecodeEngine *>(engine_);
         if (DecodeEngine_QueueDepth(eng) >= DecodeEngine_InputQueueCapacity(eng)) {
@@ -1538,11 +1563,36 @@ STDMETHODIMP DecoderMFT::ProcessInput(DWORD id, IMFSample *sample, DWORD /*flags
      * Submit returns; we want the caller's PTS to flow through, so
      * pass it directly.  Duration is per-stream framerate; we ignore
      * the per-sample dur the host supplied (engine's frame rate is
-     * the truth). */
-    int rc = DecodeEngine_SubmitFramed(eng, framing, len_size,
+     * the truth).
+     *
+     * Shorten the critical section across DecodeEngine_SubmitFramed —
+     * the call blocks on the kernel WAIT_JOB IOCTL for the full decode
+     * latency (~1 ms typical, up to ~100 ms under contention); holding
+     * `lock_` across that stalls SetInputType / SetOutputType / status
+     * polls from other host threads.  Safe to drop because:
+     *   - the engine pointer is stable for the MFT lifetime (assigned
+     *     once in BEGIN_STREAMING, freed in END_STREAMING / dtor),
+     *   - the MFT framework serialises ProcessInput with
+     *     END_STREAMING / destructor (sync MFT contract — hosts must
+     *     not call those concurrently on a single instance), and
+     *   - the only other path that touches engine_ is FLUSH, which
+     *     calls DecodeEngine_Flush; flush running concurrently with
+     *     submit is the engine's own concern (which it handles via
+     *     its internal mutex).
+     * Review parser Low #9. */
+    int rc;
+    {
+        /* `lock_` was acquired at the top of ProcessInput; we move the
+         * lock_guard out of the way explicitly via unique_lock. */
+        /* No — the `lock_guard g(lock_)` at function entry doesn't
+         * support unlock.  Instead, manually release. */
+        lock_.unlock();
+        rc = DecodeEngine_SubmitFramed(eng, framing, len_size,
                                        au.data(), au.size(),
                                        (int64_t)pts,
                                        stream_epoch_);
+        lock_.lock();
+    }
     if (rc != 0) {
         decode_errors_++;
         /* Don't fail the whole pipeline; report success but produce

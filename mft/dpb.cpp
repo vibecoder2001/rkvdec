@@ -88,6 +88,16 @@ static void apply_mmco_ops(DpbCtx *ctx, int cur) {
             break;
         }
         case 3: { /* assign LT idx to a short-term ref */
+            /* H.264 7.4.3.3: long_term_frame_idx must be in
+             * [0, MaxLongTermFrameIdx].  Reject out-of-range values so
+             * an adversarial stream can't promote a slot to an LT idx
+             * the codec never authorised — would later confuse
+             * find_long_term_by_frame_idx and the codec's own LT match.
+             * Defense-in-depth for the kernel (review parser Medium #6). */
+            if (ctx->max_long_term_frame_idx < 0 ||
+                (int32_t)m.long_term_frame_idx > ctx->max_long_term_frame_idx) {
+                break;
+            }
             uint32_t pic_num_x = (uint32_t)curr_pic_num
                                - (m.difference_of_pic_nums_minus1 + 1);
             /* If any LT ref already holds this idx, drop it. */
@@ -129,6 +139,12 @@ static void apply_mmco_ops(DpbCtx *ctx, int cur) {
             break;
         }
         case 6: { /* mark current as long-term */
+            /* Same range check as MMCO 3 — see spec 7.4.3.3.
+             * Review parser Medium #6. */
+            if (ctx->max_long_term_frame_idx < 0 ||
+                (int32_t)m.long_term_frame_idx > ctx->max_long_term_frame_idx) {
+                break;
+            }
             int prev_lt = find_long_term_by_frame_idx(ctx, m.long_term_frame_idx);
             if (prev_lt >= 0 && prev_lt != cur) slot_clear(ctx, prev_lt);
             if (cur >= 0) {
@@ -180,14 +196,13 @@ extern "C" void Dpb_AddHold(DpbCtx *ctx, uint32_t slot_idx,
                             DpbHoldReason reason, uint32_t entry_epoch)
 {
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    /* Single-set: the reason flag must currently be clear.  Repeated Adds
-     * for the same reason indicate a queue-tracking bug (e.g. a slot
-     * inserted into reorder_q twice). */
-    assert(h264_flag_get(ctx, slot_idx, reason) == 0);
-    /* Epoch must match.  A mismatch means the entry survived a flush
-     * (current_epoch was bumped) but is still trying to grab a slot
-     * whose epoch is from before the flush — or vice versa. */
-    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    /* RKMPP_VERIFY: consumer-hold-path invariants are load-bearing —
+     * silently violating them corrupts slot lifetime tracking and the
+     * kernel later DMAs into a slot a live consumer is still reading.
+     * `assert()` compiles out under NDEBUG; use the always-evaluated
+     * macro instead.  Review parser Low #11. */
+    RKMPP_VERIFY(h264_flag_get(ctx, slot_idx, reason) == 0);
+    RKMPP_VERIFY(ctx->slots[slot_idx].epoch == entry_epoch);
     (void)entry_epoch;  /* silence Release-build unused-param warning */
     h264_flag_set(ctx, slot_idx, reason, 1);
 }
@@ -196,10 +211,9 @@ extern "C" void Dpb_ReleaseHold(DpbCtx *ctx, uint32_t slot_idx,
                                 DpbHoldReason reason)
 {
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    /* Single-clear: a release of a reason that wasn't held is a
-     * decrement-from-zero bug.  Catches double-release and stray
-     * cleanup paths. */
-    assert(h264_flag_get(ctx, slot_idx, reason) == 1);
+    /* Double-release on the consumer path is load-bearing — see
+     * Dpb_AddHold rationale.  Review parser Low #11. */
+    RKMPP_VERIFY(h264_flag_get(ctx, slot_idx, reason) == 1);
     h264_flag_set(ctx, slot_idx, reason, 0);
 }
 
@@ -208,10 +222,10 @@ extern "C" void Dpb_TransferHold(DpbCtx *ctx, uint32_t slot_idx,
                                  uint32_t entry_epoch)
 {
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    assert(from != to);
-    assert(h264_flag_get(ctx, slot_idx, from) == 1);
-    assert(h264_flag_get(ctx, slot_idx, to)   == 0);
-    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    RKMPP_VERIFY(from != to);
+    RKMPP_VERIFY(h264_flag_get(ctx, slot_idx, from) == 1);
+    RKMPP_VERIFY(h264_flag_get(ctx, slot_idx, to)   == 0);
+    RKMPP_VERIFY(ctx->slots[slot_idx].epoch == entry_epoch);
     (void)entry_epoch;
     h264_flag_set(ctx, slot_idx, from, 0);
     h264_flag_set(ctx, slot_idx, to,   1);
@@ -225,9 +239,10 @@ extern "C" void Dpb_Flush(DpbCtx *ctx)
          * calling Flush — those are tied to engine queue entries the
          * caller knows about.  Consumer holds may legitimately survive a
          * flush and must keep their pre-flush epoch so a later
-         * ReleaseHold(CONSUMER) still asserts cleanly. */
-        assert(ctx->slots[i].pending_reorder == 0);
-        assert(ctx->slots[i].pending_ready   == 0);
+         * ReleaseHold(CONSUMER) still asserts cleanly.  RKMPP_VERIFY:
+         * load-bearing — see Dpb_AddHold.  Review parser Low #11. */
+        RKMPP_VERIFY(ctx->slots[i].pending_reorder == 0);
+        RKMPP_VERIFY(ctx->slots[i].pending_ready   == 0);
         if (!ctx->slots[i].held_by_consumer) {
             slot_clear(ctx, (int)i);
         } else {
@@ -758,8 +773,9 @@ extern "C" void H265Dpb_AddHold(H265DpbCtx *ctx, uint32_t slot_idx,
                                 DpbHoldReason reason, uint32_t entry_epoch)
 {
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    assert(h265_flag_get(ctx, slot_idx, reason) == 0);
-    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    /* RKMPP_VERIFY — see Dpb_AddHold rationale.  Review parser Low #11. */
+    RKMPP_VERIFY(h265_flag_get(ctx, slot_idx, reason) == 0);
+    RKMPP_VERIFY(ctx->slots[slot_idx].epoch == entry_epoch);
     (void)entry_epoch;
     h265_flag_set(ctx, slot_idx, reason, 1);
 }
@@ -767,7 +783,7 @@ extern "C" void H265Dpb_ReleaseHold(H265DpbCtx *ctx, uint32_t slot_idx,
                                     DpbHoldReason reason)
 {
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    assert(h265_flag_get(ctx, slot_idx, reason) == 1);
+    RKMPP_VERIFY(h265_flag_get(ctx, slot_idx, reason) == 1);
     h265_flag_set(ctx, slot_idx, reason, 0);
 }
 extern "C" void H265Dpb_TransferHold(H265DpbCtx *ctx, uint32_t slot_idx,
@@ -775,10 +791,10 @@ extern "C" void H265Dpb_TransferHold(H265DpbCtx *ctx, uint32_t slot_idx,
                                      uint32_t entry_epoch)
 {
     if (!ctx || slot_idx >= ctx->pool_size) return;
-    assert(from != to);
-    assert(h265_flag_get(ctx, slot_idx, from) == 1);
-    assert(h265_flag_get(ctx, slot_idx, to)   == 0);
-    assert(ctx->slots[slot_idx].epoch == entry_epoch);
+    RKMPP_VERIFY(from != to);
+    RKMPP_VERIFY(h265_flag_get(ctx, slot_idx, from) == 1);
+    RKMPP_VERIFY(h265_flag_get(ctx, slot_idx, to)   == 0);
+    RKMPP_VERIFY(ctx->slots[slot_idx].epoch == entry_epoch);
     (void)entry_epoch;
     h265_flag_set(ctx, slot_idx, from, 0);
     h265_flag_set(ctx, slot_idx, to,   1);
@@ -787,8 +803,8 @@ extern "C" void H265Dpb_Flush(H265DpbCtx *ctx)
 {
     if (!ctx) return;
     for (uint32_t i = 0; i < ctx->pool_size; i++) {
-        assert(ctx->slots[i].pending_reorder == 0);
-        assert(ctx->slots[i].pending_ready   == 0);
+        RKMPP_VERIFY(ctx->slots[i].pending_reorder == 0);
+        RKMPP_VERIFY(ctx->slots[i].pending_ready   == 0);
         if (!ctx->slots[i].held_by_consumer) {
             h265_slot_clear(ctx, (int)i);
         } else {

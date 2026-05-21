@@ -11,7 +11,11 @@
  * 4-byte gives byte-for-byte size parity with AVCC4 input. */
 static const uint8_t kStartCode[4] = { 0x00, 0x00, 0x00, 0x01 };
 
-/* Read a big-endian length field of `n` bytes (1, 2, or 4). */
+/* Read a big-endian length field of `n` bytes (1, 2, or 4).  `n` MUST
+ * be a validated AvccLenSize value — AvccToAnnexB's entry-guard rejects
+ * anything else.  The default branch is kept only because some compilers
+ * warn on a missing one even with a complete enum switch; it's a defensive
+ * AVCC_LEN_4 read, but the caller never reaches it.  Review parser Medium #3. */
 static uint32_t read_be_len(const uint8_t *p, AvccLenSize n) {
     switch (n) {
         case AVCC_LEN_1:
@@ -19,9 +23,14 @@ static uint32_t read_be_len(const uint8_t *p, AvccLenSize n) {
         case AVCC_LEN_2:
             return ((uint32_t)p[0] << 8) | (uint32_t)p[1];
         case AVCC_LEN_4:
-        default:
             return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                    ((uint32_t)p[2] <<  8) | ((uint32_t)p[3]      );
+        default:
+            /* Should be unreachable — AvccToAnnexB's entry-guard rejects
+             * invalid sizes.  Return 0 here so a bug that bypasses the
+             * guard fails loudly with "zero-length NAL" rather than
+             * silently mis-framing as AVCC_LEN_4.  Review parser Medium #3. */
+            return 0;
     }
 }
 

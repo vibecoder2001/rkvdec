@@ -175,6 +175,14 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
 NTSTATUS
 RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
+    /* Explicit device ACL — admin/system only.  Same rationale as
+     * rkiommu_vdec: kernel-side QueryInterface only, no user-mode
+     * IOCTL surface that needs IU access. */
+    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    NTSTATUS sddlStatus = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
+    if (!NT_SUCCESS(sddlStatus)) return sddlStatus;
+    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_OPEN, FALSE);
+
     if (InterlockedCompareExchange(&g_listInitialized, 1, 0) == 0) {
         InitializeListHead(&g_deviceList);
         KeInitializeSpinLock(&g_deviceListLock);

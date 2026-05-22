@@ -188,6 +188,16 @@ static NTSTATUS RkMppReadAcpiId(_In_ WDFDEVICE Device,
 NTSTATUS
 RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
+    /* Explicit device ACL — see driver/rkav1d/device.c for the
+     * rationale.  Same policy: SY/BA full, IU read/write/execute,
+     * everything else denied.  FILE_DEVICE_SECURE_OPEN propagates
+     * the ACL to namespace opens. */
+    DECLARE_CONST_UNICODE_STRING(sddl,
+        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWGX;;;IU)");
+    NTSTATUS sddlStatus = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
+    if (!NT_SUCCESS(sddlStatus)) return sddlStatus;
+    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_OPEN, FALSE);
+
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDevicePrepareHardware = RkMppEvtPrepareHardware;

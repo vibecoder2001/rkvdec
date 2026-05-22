@@ -292,20 +292,20 @@ STDMETHODIMP DecoderMFT::AddInputStreams(DWORD, DWORD *)               { return 
 STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
     if (id != 0) return MF_E_INVALIDSTREAMNUMBER;
     if (!flags) return E_POINTER;
-    /* Intentionally lock-free.  MF's quality manager polls
-     * GetInputStatus / GetOutputStatus from worker threads under
-     * sustained load; holding `lock_` here would stall those polls
-     * for the entire duration of any in-flight ProcessInput, which
-     * can block up to ~1 s on the kernel WAIT_JOB IOCTL.  EVR
-     * (synchronous host) would then deadlock its topology rebuild.
+    /* Take `lock_` to serialise against MFT_MESSAGE_NOTIFY_END_STREAMING
+     * which deletes engines under the same mutex (ProcessMessage at the
+     * top of the file).  An earlier revision claimed it was safe to read
+     * engine pointers lock-free "because engine_* is stable for the MFT
+     * lifetime" — that was wrong.  END_STREAMING does free engines and
+     * null the pointers before ~DecoderMFT, so a status read concurrent
+     * with END_STREAMING can deref a freed engine (UAF).
      *
-     * Engine pointers are stable for the MFT's lifetime — assigned
-     * once in BEGIN_STREAMING, freed in ~DecoderMFT.  Since this
-     * method is on the call stack while we read them, COM's
-     * Release-to-zero invariant guarantees no concurrent destructor.
-     * QueueDepth itself reads `reorder_q.size() + ready_q.size()`
-     * without locks — a slightly-stale value here is acceptable for
-     * an advisory "can I accept more?" signal. */
+     * The original justification for skipping the lock (avoiding stalls
+     * on kernel WAIT_JOB) is also obsolete since 2de09bc — ProcessInput
+     * now releases `lock_` around DecodeEngine_SubmitFramed, so taking
+     * it here only blocks for the brief windows around engine pointer
+     * mutation, not for full decode latency. */
+    std::lock_guard<std::mutex> g(lock_);
     Av1DecodeEngine *av1 = static_cast<Av1DecodeEngine *>(engine_av1_);
     DecodeEngine    *gen = static_cast<DecodeEngine *>(engine_);
     *flags = 0;
@@ -322,9 +322,9 @@ STDMETHODIMP DecoderMFT::GetInputStatus(DWORD id, DWORD *flags) {
 }
 STDMETHODIMP DecoderMFT::GetOutputStatus(DWORD *flags) {
     if (!flags) return E_POINTER;
-    /* Lock-free for the same reason as GetInputStatus; see comment
-     * there.  Polling these from MF's worker pool must not stall on
-     * a ProcessInput holding `lock_` across the kernel WAIT_JOB. */
+    /* See GetInputStatus for the lock rationale — same UAF window
+     * vs END_STREAMING engine teardown. */
+    std::lock_guard<std::mutex> g(lock_);
     Av1DecodeEngine *av1 = static_cast<Av1DecodeEngine *>(engine_av1_);
     DecodeEngine    *gen = static_cast<DecodeEngine *>(engine_);
     *flags = 0;

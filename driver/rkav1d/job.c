@@ -133,15 +133,30 @@ static const UINT32 RKAV1D_DMA_LSB_IDX[] = {
 };
 
 static BOOLEAN
-RkAv1dIsAddressReg(_In_ UINT32 SwregIdx)
+RkAv1dIsAddressLsbReg(_In_ UINT32 SwregIdx)
 {
     for (size_t i = 0; i < RTL_NUMBER_OF(RKAV1D_DMA_LSB_IDX); i++) {
         if (SwregIdx == RKAV1D_DMA_LSB_IDX[i]) return TRUE;
-        /* The msb companion sits at idx-1 (kernel ORs the high byte
-         * during substitution).  User mode currently writes 0 there
-         * with BufferHandle==0; keep that allowed as a plain write
-         * but also accept BufferHandle!=0 if a future regbuilder
-         * decides to substitute both halves. */
+    }
+    return FALSE;
+}
+
+static BOOLEAN
+RkAv1dIsAddressMsbReg(_In_ UINT32 SwregIdx)
+{
+    /* The msb companion sits at idx-1 of each LSB.  Kernel-side
+     * substitution writes only the low 32 bits into the LSB slot;
+     * the MSB slot is BSP-written as plain 0 ("kernel ORs the high
+     * byte" in BSP — but we don't OR anything, the regbuilder
+     * already pushes a 0-valued plain write at the MSB slot).
+     * Treated separately from LSB so the IOCTL validator can:
+     *   - allow plain-zero writes here (regbuilder's normal path),
+     *   - reject plain-nonzero (would set high-32 bits of a DMA
+     *     target — undefined behaviour today),
+     *   - reject BufferHandle != 0 (no high-half substitution
+     *     implemented kernel-side, so accepting it would silently
+     *     produce a 32-bit truncated iova). */
+    for (size_t i = 0; i < RTL_NUMBER_OF(RKAV1D_DMA_LSB_IDX); i++) {
         if (SwregIdx + 1 == RKAV1D_DMA_LSB_IDX[i]) return TRUE;
     }
     return FALSE;
@@ -1048,21 +1063,43 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
             return STATUS_INVALID_PARAMETER;
         }
         const UINT32 swregIdx = src->Offset / 4u;
-        const BOOLEAN isAddr = RkAv1dIsAddressReg(swregIdx);
+        const BOOLEAN isLsb = RkAv1dIsAddressLsbReg(swregIdx);
+        const BOOLEAN isMsb = RkAv1dIsAddressMsbReg(swregIdx);
 
         if (src->BufferHandle == 0) {
-            /* Plain write.  Allowed for every swreg — including the
-             * msb companions of address regs, which BSP also writes
-             * as 0 plain (kernel ORs the high byte). */
+            /* Plain write.
+             *
+             * LSB address regs MUST go through iova substitution
+             * (BufferHandle != 0) — accepting a raw plain value here
+             * would let user mode program any 32-bit IOVA into a DMA
+             * target register, diverting the codec to any
+             * iommu-mapped address in the domain.  This was the gap
+             * left open by the initial whitelist commit (c20c11b).
+             *
+             * MSB companion regs accept ONLY plain zero — the
+             * regbuilder's normal path emits a 0-valued write at the
+             * MSB slot.  A non-zero plain write would set the high
+             * 32 bits of a DMA target and is undefined behaviour
+             * today (no consumer expects high-half addressing). */
+            if (isLsb) {
+                ExFreePoolWithTag(job, 'JppM');
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (isMsb && src->Value != 0) {
+                ExFreePoolWithTag(job, 'JppM');
+                return STATUS_INVALID_PARAMETER;
+            }
             dst->Value = src->Value;
             continue;
         }
 
-        /* BufferHandle != 0 ⇒ iova substitution.  This MUST target an
-         * address-class swreg; otherwise user mode could write an
-         * arbitrary iova into a non-address register and divert the
-         * codec to attacker-controlled DMA targets.  Review finding #1. */
-        if (!isAddr) {
+        /* BufferHandle != 0 ⇒ iova substitution.  MUST target an LSB
+         * address-class swreg.  MSB regs are rejected because no
+         * high-half substitution is implemented kernel-side —
+         * accepting BufferHandle != 0 here would silently truncate
+         * to a 32-bit iova in the MSB slot, producing undefined
+         * behaviour or a stray DMA. */
+        if (!isLsb) {
             ExFreePoolWithTag(job, 'JppM');
             return STATUS_INVALID_PARAMETER;
         }

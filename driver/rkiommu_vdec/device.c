@@ -783,17 +783,6 @@ RkIommuEvtReleaseHardware(_In_ WDFDEVICE Device,
 NTSTATUS
 RkIommuDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
-    /* Explicit device ACL — admin/system only.  rkiommu_vdec has no
-     * user-mode IOCTL surface (interfaces are kernel-side via
-     * WdfDeviceAddQueryInterface), so non-admin access has no
-     * legitimate purpose.  FILE_DEVICE_SECURE_OPEN propagates the
-     * ACL to namespace opens.  Tighter than the codec drivers
-     * (rkvdec / rkav1d) which need IU access for MFT playback. */
-    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-    NTSTATUS sddlStatus = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
-    if (!NT_SUCCESS(sddlStatus)) return sddlStatus;
-    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_OPEN, FALSE);
-
     /* Ensure the global list is initialized.  CAS 0 → 1 to claim init,
      * publish ready=2 after the InitializeList/InitializeSpinLock pair.
      * Other threads that lost the CAS spin-wait until ready=2. */

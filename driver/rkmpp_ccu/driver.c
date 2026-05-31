@@ -197,15 +197,6 @@ RkMppCcuEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 {
     UNREFERENCED_PARAMETER(Driver);
 
-    /* Explicit device ACL — admin/system only.  rkmpp_ccu has no
-     * user-mode IOCTL surface (interfaces are kernel-side via
-     * WdfDeviceAddQueryInterface), so non-admin access has no
-     * legitimate purpose. */
-    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-    NTSTATUS sddlStatus = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
-    if (!NT_SUCCESS(sddlStatus)) return sddlStatus;
-    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_OPEN, FALSE);
-
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDevicePrepareHardware = RkMppCcuEvtPrepareHardware;

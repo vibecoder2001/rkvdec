@@ -104,24 +104,6 @@ static NTSTATUS RkMppReadAcpiId(_In_ WDFDEVICE Device,
 NTSTATUS
 RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
-    /* Explicit device ACL.  Without this we'd inherit the Media class
-     * default which is too permissive for a device that allocates
-     * kernel memory and programs codec hardware via IOCTL.  Policy:
-     *   SY (Local System)        — all access
-     *   BA (Built-in Admins)     — all access
-     *   IU (Interactive Users)   — read/write/execute, so locally-
-     *                              logged-in users can play videos
-     *                              through the MFT path.
-     * Service accounts, network logons, and anonymous tokens are
-     * deliberately excluded.  FILE_DEVICE_SECURE_OPEN propagates the
-     * ACL to namespace opens / child PDOs so an attacker can't
-     * sidestep via a relative path. */
-    DECLARE_CONST_UNICODE_STRING(sddl,
-        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWGX;;;IU)");
-    NTSTATUS sddlStatus = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
-    if (!NT_SUCCESS(sddlStatus)) return sddlStatus;
-    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_OPEN, FALSE);
-
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDevicePrepareHardware = RkMppEvtPrepareHardware;

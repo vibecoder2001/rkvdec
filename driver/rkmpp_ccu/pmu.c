@@ -158,6 +158,15 @@ static BOOLEAN PmuDomainIsOn(_In_ const RKMPP_PMU_DOMAIN *D)
     return TRUE;  /* no status mechanism — assume on */
 }
 
+/* TRUE iff this domain exposes a meaningful is-on status path.
+ * Used by RkMppPmuPowerOff to avoid the full 10-ms spin on domains
+ * where PmuDomainIsOn unconditionally returns TRUE — those would
+ * otherwise wait the entire poll budget on every PowerOff. */
+static FORCEINLINE BOOLEAN PmuDomainHasStatusPath(_In_ const RKMPP_PMU_DOMAIN *D)
+{
+    return (D->RepairStatusBit != 0) || (D->StatusBit != 0);
+}
+
 NTSTATUS RkMppPmuPowerOn(_In_ const RKMPP_PMU_DOMAIN *D)
 {
     if (!g_pmu_mmio) return STATUS_DEVICE_NOT_READY;
@@ -273,6 +282,16 @@ bus_idled:;
      * PmuDomainIsOn that returns TRUE) fall through quickly because
      * IsOn never returns FALSE — they get a small fixed delay below.
      * Review I4. */
+    /* Domains with no status mechanism would spin the full 10 ms
+     * because PmuDomainIsOn returns TRUE unconditionally.  Today
+     * every codec PD has either RepairStatusBit or StatusBit set, so
+     * this branch is defensive — but it costs nothing and prevents
+     * a 10 ms-per-PowerOff stall if a future domain ever lands
+     * without a status path. */
+    if (!PmuDomainHasStatusPath(D)) {
+        KeStallExecutionProcessor(5);
+        return STATUS_SUCCESS;
+    }
     for (ULONG i = 0; i < 10000; i++) {
         if (!PmuDomainIsOn(D)) {
             return STATUS_SUCCESS;

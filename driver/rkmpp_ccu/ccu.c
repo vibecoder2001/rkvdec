@@ -955,7 +955,16 @@ NTSTATUS RkMppCcuFullAv1Reset(_In_ PVOID Ctx)
     RKMPP_LOG_WARN(
                "rkmpp_ccu: FullAv1Reset — wide CRU reset for AV1\n");
 
-    (void)RkMppPmuIdleRequest(&g_pdAv1, TRUE);
+    /* RkMppPmuIdleRequest returns SUCCESS on timeout (intentional —
+     * callers shouldn't abandon wedge recovery just because the bus
+     * didn't ack) but the timeout itself is silent.  Log a warning
+     * so the path is observable in event traces if it ever fires. */
+    NTSTATUS sIdleOn = RkMppPmuIdleRequest(&g_pdAv1, TRUE);
+    if (!NT_SUCCESS(sIdleOn)) {
+        RKMPP_LOG_WARN(
+                   "rkmpp_ccu: FullAv1Reset idle-request(TRUE) returned 0x%08x\n",
+                   sIdleOn);
+    }
 
     RkCcuHiwordWrite(g_cru_mmio, RDCC_CRU_SOFTRST_CON68,
                      RDCC_CRU_SOFTRST_CON68_MASK, RDCC_CRU_SOFTRST_CON68_MASK);
@@ -965,7 +974,12 @@ NTSTATUS RkMppCcuFullAv1Reset(_In_ PVOID Ctx)
                      RDCC_CRU_SOFTRST_CON68_MASK, 0);
     KeStallExecutionProcessor(20);
 
-    (void)RkMppPmuIdleRequest(&g_pdAv1, FALSE);
+    NTSTATUS sIdleOff = RkMppPmuIdleRequest(&g_pdAv1, FALSE);
+    if (!NT_SUCCESS(sIdleOff)) {
+        RKMPP_LOG_WARN(
+                   "rkmpp_ccu: FullAv1Reset idle-request(FALSE) returned 0x%08x\n",
+                   sIdleOff);
+    }
 
     return STATUS_SUCCESS;
 }

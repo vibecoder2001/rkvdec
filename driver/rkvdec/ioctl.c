@@ -24,6 +24,22 @@ extern BOOLEAN RkMppIsIommuAttached(_In_ WDFDEVICE Device);  /* Phase 4 (Task 4.
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RkMppEvtIoDeviceControl;
 
+/* Predicate bridge for RkMppBufFreeIfNotInUse: lets bufpool run the
+ * job-layer in-use check inside its file-lock hold without bufpool
+ * depending on the job layer.  Invoked at DISPATCH under the file lock;
+ * RkMppJobBufferInUse takes the queue lock (file-outer/queue-inner). */
+typedef struct _RKMPP_FREE_INUSE_CTX {
+    WDFDEVICE     Device;
+    WDFFILEOBJECT File;
+} RKMPP_FREE_INUSE_CTX;
+
+static BOOLEAN
+RkMppFreeBufInUseCb(_In_ PVOID Ctx, _In_ UINT64 Cookie)
+{
+    RKMPP_FREE_INUSE_CTX *c = (RKMPP_FREE_INUSE_CTX *)Ctx;
+    return RkMppJobBufferInUse(c->Device, c->File, Cookie);
+}
+
 NTSTATUS RkMppQueueInit(_In_ WDFDEVICE Device)
 {
     /* Parallel dispatch: required for concurrent decode sessions on the
@@ -175,37 +191,24 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
             break;
         }
 
-        /* Hold the file's spinlock across the JobBufferInUse check AND
-         * the BufFree remove-from-list step so a concurrent FREE_BUFFER
-         * on the same handle (Parallel dispatch) can't race us into a
-         * double-free / use-after-free.  The submit-vs-free race remains
-         * partially mitigated: SubmitDense's iova lookup walks the same
-         * list under file lock, so a buffer freed before lookup returns
-         * STATUS_INVALID_HANDLE; a buffer freed AFTER lookup but BEFORE
-         * Pending-insert can still leave a stale iova in a job — review
-         * finding #3 lower half is deferred (would require refactoring
-         * SubmitDense to hold file lock across resolve+enqueue).
+        /* Free the buffer iff no job references it.  The in-use check
+         * AND the remove-from-list step run in ONE file-lock hold inside
+         * RkMppBufFreeIfNotInUse, so a concurrent SubmitDense on the same
+         * handle (Parallel dispatch) — which resolves cookies + inserts
+         * its job under the same lock — is fully ordered against us: it
+         * either runs first and is seen by JobBufferInUse (DEVICE_BUSY),
+         * or runs after the removal and fails to resolve the cookie
+         * (INVALID_HANDLE).  Closes review finding #3 lower half (the
+         * earlier separate-acquisition check/remove left a window where a
+         * submit could resolve a cookie about to be freed).
          *
          * Lock order: file lock outer, queue lock (inside JobBufferInUse)
-         * inner.  Matches the existing order used by JobSubmitDense's
-         * Lookup → InsertTailList path. */
-        PRKMPP_FILE_CTX freeCtx = RkMppFileGet(file);
-        KIRQL irql;
-        KeAcquireSpinLock(&freeCtx->Lock, &irql);
-        if (RkMppJobBufferInUse(device, file, in->BufferHandle)) {
-            KeReleaseSpinLock(&freeCtx->Lock, irql);
-            status = STATUS_DEVICE_BUSY;
-            break;
-        }
-        KeReleaseSpinLock(&freeCtx->Lock, irql);
-        /* BufFree re-acquires the file lock internally to remove from
-         * the buffer list; the brief release window between our drop
-         * and BufFree's re-acquire is bridged by JobBufferInUse's
-         * snapshot semantics (a job that *would* reference this cookie
-         * is being built by a concurrent SubmitDense which must walk
-         * the file list under the same lock — and will find the cookie
-         * present until BufFree removes it). */
-        status = RkMppBufFree(file, in->BufferHandle);
+         * inner — matches JobSubmitDense's resolve → InsertTailList path. */
+        RKMPP_FREE_INUSE_CTX inUseCtx;
+        inUseCtx.Device = device;
+        inUseCtx.File   = file;
+        status = RkMppBufFreeIfNotInUse(file, in->BufferHandle,
+                                        RkMppFreeBufInUseCb, &inUseCtx);
         break;
     }
 

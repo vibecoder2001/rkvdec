@@ -65,8 +65,27 @@ NTSTATUS RkMppBufAlloc(_In_ WDFDEVICE           Device,
                        _In_ const RKMPP_ALLOC_BUFFER_IN *In,
                        _Out_ RKMPP_ALLOC_BUFFER_OUT     *Out);
 
-/* Free a single buffer identified by Cookie. */
-NTSTATUS RkMppBufFree(_In_ WDFFILEOBJECT File, _In_ UINT64 Cookie);
+/* Predicate invoked by RkMppBufFreeIfNotInUse while the file ctx's
+ * spinlock is held: returns TRUE if Cookie is still referenced by an
+ * in-flight/pending/completed job (i.e. unsafe to free).  The driver
+ * passes RkMppJobBufferInUse wrapped with its (Device, File).  Runs at
+ * DISPATCH under the file lock; the callee acquires the queue lock
+ * (file-outer/queue-inner, same nesting as SubmitDense). */
+typedef BOOLEAN (*RKMPP_BUF_INUSE_CB)(_In_ PVOID Ctx, _In_ UINT64 Cookie);
+
+/* Free a single buffer identified by Cookie, but only if InUse() reports
+ * it is not referenced by any job.  The in-use check AND the removal from
+ * the file's buffer list happen in ONE file-lock hold, so a concurrent
+ * SubmitDense (which resolves cookies + inserts its job under the same
+ * lock) is fully ordered: it either runs first and is seen by InUse
+ * (returns STATUS_DEVICE_BUSY), or runs after the removal and fails to
+ * resolve the cookie.  This closes the check/remove window the old
+ * separate-acquisition path left open (review finding #3 lower half).
+ * Returns STATUS_DEVICE_BUSY if in use, STATUS_NOT_FOUND if the cookie is
+ * unknown.  InUse may be NULL to skip the check (unconditional free). */
+NTSTATUS RkMppBufFreeIfNotInUse(_In_ WDFFILEOBJECT File, _In_ UINT64 Cookie,
+                                _In_opt_ RKMPP_BUF_INUSE_CB InUse,
+                                _In_opt_ PVOID InUseCtx);
 
 /* Free every buffer on the file-object's list (called from EvtFileCleanup). */
 VOID RkMppBufFreeAll(_In_ WDFFILEOBJECT File);

@@ -517,16 +517,31 @@ RkMppBufAlloc(_In_ WDFDEVICE                    Device,
 }
 
 /* -----------------------------------------------------------------------
- * RkMppBufFree — look up by cookie, remove, and release
+ * RkMppBufFreeIfNotInUse — atomic in-use check + remove, then release
+ *
+ * The InUse predicate and the list removal run in a single file-lock
+ * hold so a concurrent SubmitDense cannot slip a cookie-resolving job in
+ * between (see header for the ordering argument).  The heavy teardown
+ * (IOMMU unmap, pool free) runs AFTER the lock is dropped — safe because
+ * the buffer is already off the list (no new submit can resolve it) and
+ * InUse confirmed no existing job references it.
  * --------------------------------------------------------------------- */
 NTSTATUS
-RkMppBufFree(_In_ WDFFILEOBJECT File, _In_ UINT64 Cookie)
+RkMppBufFreeIfNotInUse(_In_ WDFFILEOBJECT File, _In_ UINT64 Cookie,
+                       _In_opt_ RKMPP_BUF_INUSE_CB InUse,
+                       _In_opt_ PVOID InUseCtx)
 {
     PRKMPP_FILE_CTX fctx = RkMppFileGet(File);
     PRKMPP_BUFFER   found = NULL;
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&fctx->Lock, &oldIrql);
+
+    if (InUse && InUse(InUseCtx, Cookie)) {
+        KeReleaseSpinLock(&fctx->Lock, oldIrql);
+        return STATUS_DEVICE_BUSY;
+    }
+
     for (PLIST_ENTRY e = fctx->Buffers.Flink;
          e != &fctx->Buffers; e = e->Flink) {
         PRKMPP_BUFFER b = CONTAINING_RECORD(e, RKMPP_BUFFER, Link);

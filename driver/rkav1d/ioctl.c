@@ -30,6 +30,19 @@ static BOOLEAN RkAv1dIsIommuAttached(_In_ WDFDEVICE Device)
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL RkMppEvtIoDeviceControl;
 
+/* Predicate bridge for RkMppBufFreeIfNotInUse — see rkvdec/ioctl.c. */
+typedef struct _RKMPP_FREE_INUSE_CTX {
+    WDFDEVICE     Device;
+    WDFFILEOBJECT File;
+} RKMPP_FREE_INUSE_CTX;
+
+static BOOLEAN
+RkMppFreeBufInUseCb(_In_ PVOID Ctx, _In_ UINT64 Cookie)
+{
+    RKMPP_FREE_INUSE_CTX *c = (RKMPP_FREE_INUSE_CTX *)Ctx;
+    return RkMppJobBufferInUse(c->Device, c->File, Cookie);
+}
+
 NTSTATUS RkMppQueueInit(_In_ WDFDEVICE Device)
 {
     /* Parallel dispatch: required for concurrent AV1 decode sessions on
@@ -165,19 +178,14 @@ RkMppEvtIoDeviceControl(_In_ WDFQUEUE Queue,
             break;
         }
 
-        /* Atomic check+remove vs concurrent FREE_BUFFER under Parallel
-         * dispatch.  See rkvdec/ioctl.c for the full rationale (review
-         * finding #3). */
-        PRKMPP_FILE_CTX freeCtx = RkMppFileGet(file);
-        KIRQL irql;
-        KeAcquireSpinLock(&freeCtx->Lock, &irql);
-        if (RkMppJobBufferInUse(device, file, in->BufferHandle)) {
-            KeReleaseSpinLock(&freeCtx->Lock, irql);
-            status = STATUS_DEVICE_BUSY;
-            break;
-        }
-        KeReleaseSpinLock(&freeCtx->Lock, irql);
-        status = RkMppBufFree(file, in->BufferHandle);
+        /* Atomic in-use check + remove-from-list in one file-lock hold,
+         * closing the window a concurrent SubmitJob could slip through.
+         * See rkvdec/ioctl.c for the full rationale (review finding #3). */
+        RKMPP_FREE_INUSE_CTX inUseCtx;
+        inUseCtx.Device = device;
+        inUseCtx.File   = file;
+        status = RkMppBufFreeIfNotInUse(file, in->BufferHandle,
+                                        RkMppFreeBufInUseCb, &inUseCtx);
         break;
     }
 

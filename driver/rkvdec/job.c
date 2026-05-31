@@ -304,12 +304,15 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
         RKMPP_JOB *inFlight = NULL;
 
         /* Under lock, find the first in-flight job matching this File's
-         * ownership.  Check both cores — a peer-dispatched job lands
-         * on [1]. */
+         * ownership AND pin it via WaiterPin so JobComplete can't free
+         * the job between this lock release and our KeWaitForSingleObject
+         * (review H3 TOCTOU).  Check both cores — a peer-dispatched job
+         * lands on [1]. */
         KeAcquireSpinLock(&q->Lock, &old);
         for (ULONG c = 0; c < q->CoreCount; c++) {
             if (q->InFlightPerCore[c] && q->InFlightPerCore[c]->Owner == File) {
                 inFlight = q->InFlightPerCore[c];
+                inFlight->WaiterPin++;
                 break;
             }
         }
@@ -320,34 +323,47 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
             break;
         }
 
-        /* Wait for this in-flight job to complete naturally.  Safe to
-         * dereference Done event because the poller never frees an
-         * in-flight job while it's still marked in-flight; it only moves
-         * to Completed (then we'd own it via the walk below). */
+        /* Wait for this in-flight job to complete naturally.  The
+         * WaiterPin held above guarantees JobComplete cannot free
+         * the job out from under our KEVENT deref — if completion
+         * fires while we're here, JobComplete observes pin > 0 and
+         * defers the free to the unpin below. */
         KEVENT *doneEvt = &inFlight->Done;
         LARGE_INTEGER timeout;
         timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
         NTSTATUS w = KeWaitForSingleObject(doneEvt, Executive, KernelMode,
                                            FALSE, &timeout);
-        if (w == STATUS_TIMEOUT) {
+        BOOLEAN timedOut = (w == STATUS_TIMEOUT);
+        if (timedOut) {
             *InFlightTimedOut = TRUE;
-            {
-                RKMPP_DEVICE_PUBLIC dpub;
-                RkMppGetPublic(Device, &dpub);
-                RKMPP_LOG_WARN(
-                       "rkmpp: RVD%u file-cleanup in-flight wait timed out "
-                       "(stalled on core %u)\n",
-                       dpub.Uid, inFlight->TargetCore);
-            }
-            /* Sever in-flight jobs' MDL refs AND mark them orphan so the
-             * eventual natural completion (poller-driven JobComplete or
-             * peer completion DPC) frees the job memory rather than
-             * inserting it into the Completed list where it would leak
-             * indefinitely.  Without OrphanOnComplete, every abandoned
-             * drain accumulated an RKMPP_JOB (~5 KB) of non-paged pool
-             * that nothing ever dequeued — a DoS vector once the IOCTL
-             * surface is non-admin.  See [[critical_drainer_leak]]. */
-            KeAcquireSpinLock(&q->Lock, &old);
+            RKMPP_DEVICE_PUBLIC dpub;
+            RkMppGetPublic(Device, &dpub);
+            RKMPP_LOG_WARN(
+                   "rkmpp: RVD%u file-cleanup in-flight wait timed out "
+                   "(stalled on core %u)\n",
+                   dpub.Uid, inFlight->TargetCore);
+        }
+
+        /* Single unified post-wait section, handling both timeout and
+         * natural-completion paths:
+         *
+         *   - Unpin `inFlight` under lock (we still hold the WaiterPin
+         *     we took before the wait).
+         *   - On timeout: sever MDL refs and mark all File-owned
+         *     InFlight jobs as OrphanOnComplete so the eventual
+         *     natural completion path (poller / peer / DPC) frees
+         *     them.  See [[critical_drainer_leak]].
+         *   - Walk Completed and reap any File-owned entries.  On the
+         *     non-orphan success case `inFlight` is among them; on the
+         *     timeout-race case (JobComplete fired between wait return
+         *     and lock acquire — pin > 0 forced non-orphan Completed
+         *     insert) it's also among them.  Without this walk in the
+         *     timeout-race case, the now-Completed pinned job would
+         *     leak. */
+        InitializeListHead(&toFree);
+        KeAcquireSpinLock(&q->Lock, &old);
+        inFlight->WaiterPin--;
+        if (timedOut) {
             for (ULONG c = 0; c < q->CoreCount; c++) {
                 RKMPP_JOB *jf = q->InFlightPerCore[c];
                 if (jf && jf->Owner == File) {
@@ -356,19 +372,7 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
                     jf->OrphanOnComplete = TRUE;
                 }
             }
-            KeReleaseSpinLock(&q->Lock, old);
-            /* Escalate to a wide reset on the next idle window so the
-             * wedged hardware unblocks the poller (which then runs
-             * JobComplete, sees OrphanOnComplete, and frees). */
-            RkMppSetNeedsFullReset(Device);
-            break;   /* Stop looping after timeout; caller handles force-reset. */
         }
-
-        /* In-flight completed cleanly.  It's now on the Completed list —
-         * pull it and any other just-completed jobs off so they don't leak
-         * waiting for a WaitJob caller that's never coming. */
-        InitializeListHead(&toFree);
-        KeAcquireSpinLock(&q->Lock, &old);
         entry = q->Completed.Flink;
         while (entry != &q->Completed) {
             RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
@@ -385,7 +389,16 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
             RKMPP_JOB *j = CONTAINING_RECORD(e, RKMPP_JOB, Link);
             ExFreePoolWithTag(j, 'JppM');
         }
-        /* Loop back — check if there's another in-flight on the other core. */
+
+        if (timedOut) {
+            /* Escalate to a wide reset on the next idle window so the
+             * wedged hardware unblocks the poller (which then runs
+             * JobComplete, sees OrphanOnComplete, and frees). */
+            RkMppSetNeedsFullReset(Device);
+            break;   /* Stop looping after timeout; caller handles force-reset. */
+        }
+        /* Otherwise loop back — there may be another in-flight on the
+         * other core. */
     }
 
     return STATUS_SUCCESS;
@@ -1364,8 +1377,15 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     /* Orphan check — caller has abandoned this job (drainer/wait/foreign
      * timeout).  Skip Completed-list insert (nobody will dequeue it) and
      * arrange to free it after we release the lock.  Done is still set
-     * for any waiter that happens to hold a reference via the queue. */
+     * for any waiter that happens to hold a reference via the queue.
+     *
+     * If a WaiterPin is held (RkMppJobsDrainOwner captured the InFlight
+     * pointer and is about to / currently waiting on Done), we must NOT
+     * free here even on the orphan path — the drainer would deref freed
+     * pool on its KeWaitForSingleObject.  The last unpin frees instead. */
     BOOLEAN orphan = job->OrphanOnComplete;
+    BOOLEAN pinned = (job->WaiterPin > 0);
+    BOOLEAN freeHere = orphan && !pinned;
 
     if (!orphan) {
         /* Move from InFlight to Completed. */
@@ -1412,8 +1432,10 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     }
 
     /* Free orphan job out-of-lock (DISPATCH-safe).  Done before promote
-     * dispatch so a back-to-back completion doesn't pile up references. */
-    if (orphan) {
+     * dispatch so a back-to-back completion doesn't pile up references.
+     * When freeHere==FALSE despite orphan, a drainer holds a WaiterPin
+     * and will free the job after its KeWaitForSingleObject returns. */
+    if (freeHere) {
         ExFreePoolWithTag(job, 'JppM');
     }
 
@@ -1959,7 +1981,11 @@ RkMppJobWait(_In_ WDFDEVICE Device,
     }
 
     if (!alreadyComplete) {
-        /* Job still in progress — wait for it with the caller's timeout. */
+        /* Job still in progress — wait for it with the caller's
+         * timeout.  Pin via WaiterPin so a concurrent DrainOwner /
+         * peer path can't free the job between this lock release and
+         * our KeWaitForSingleObject (review H3 TOCTOU). */
+        job->WaiterPin++;
         KeReleaseSpinLock(&q->Lock, oldIrql);
 
         LARGE_INTEGER timeout;
@@ -2002,6 +2028,9 @@ RkMppJobWait(_In_ WDFDEVICE Device,
             Out->ElapsedQpc     = 0;
 
             KeAcquireSpinLock(&q->Lock, &oldIrql);
+            /* Unpin first — we're done waiting.  Job stays alive
+             * as long as it's still on a list or in-flight. */
+            job->WaiterPin--;
             BOOLEAN onPending   = FALSE;
             BOOLEAN onCompleted = FALSE;
             for (PLIST_ENTRY e = q->Pending.Flink; e != &q->Pending;
@@ -2052,8 +2081,10 @@ RkMppJobWait(_In_ WDFDEVICE Device,
             return STATUS_TIMEOUT;
         }
 
-        /* Job is now on the Completed list; re-acquire lock to remove it. */
+        /* Job is now on the Completed list; re-acquire lock to
+         * remove it and unpin our wait reference. */
         KeAcquireSpinLock(&q->Lock, &oldIrql);
+        job->WaiterPin--;
     }
 
     /* Remove from Completed list and copy result. */

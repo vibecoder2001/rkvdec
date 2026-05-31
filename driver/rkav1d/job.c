@@ -297,15 +297,14 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
         entry = next;
     }
 
-    /* Snapshot in-flight ownership while still under the lock. */
+    /* Snapshot in-flight ownership while still under the lock, and
+     * pin the job via WaiterPin so JobComplete cannot free it between
+     * here and our KeWaitForSingleObject (review H3 TOCTOU). */
     RKMPP_JOB *inFlight = q->InFlight;
     BOOLEAN inFlightIsOurs = (inFlight != NULL && inFlight->Owner == File);
-
-    /* Capture the Done event pointer for the wait below — it's safe to
-     * dereference once we have the spinlock-stable inFlight pointer
-     * because the poller never frees an in-flight job while it's still
-     * marked in-flight; it only moves to Completed (then we'd own it
-     * via the next under-lock walk). */
+    if (inFlightIsOurs) {
+        inFlight->WaiterPin++;
+    }
     KEVENT *doneEvt = inFlightIsOurs ? &inFlight->Done : NULL;
 
     KeReleaseSpinLock(&q->Lock, old);
@@ -318,53 +317,54 @@ RkMppJobsDrainOwner(_In_ WDFDEVICE Device,
     }
 
     /* Phase 3: wait for the in-flight job (if it was ours) to complete
-     * naturally.  Most decode kicks finish in <30ms; a 500ms cap is
-     * generous and keeps process-exit latency bounded. */
+     * naturally.  WaiterPin keeps the job alive across the wait — see
+     * the matching block in driver/rkvdec/job.c for the full
+     * rationale (review H3 TOCTOU). */
     if (inFlightIsOurs && doneEvt) {
         LARGE_INTEGER timeout;
         timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
         NTSTATUS w = KeWaitForSingleObject(doneEvt, Executive, KernelMode,
                                            FALSE, &timeout);
-        if (w == STATUS_TIMEOUT) {
+        BOOLEAN timedOut = (w == STATUS_TIMEOUT);
+        if (timedOut) {
             *InFlightTimedOut = TRUE;
             RKMPP_LOG_WARN(
                        "rkav1d: file-cleanup in-flight wait timed out\n");
-            /* Sever MDL refs AND mark orphan so the eventual natural
-             * completion (poller-driven JobComplete) frees the job
-             * memory instead of inserting it into Completed where it
-             * would leak indefinitely.  Without OrphanOnComplete every
-             * abandoned drain leaked one RKMPP_JOB — a DoS vector once
-             * IOCTL is non-admin.  See [[critical_drainer_leak]]. */
-            KeAcquireSpinLock(&q->Lock, &old);
-            if (q->InFlight == inFlight && inFlight->Owner == File) {
-                inFlight->OutputFrameMdl    = NULL;
-                inFlight->InternalOutputMdl = NULL;
-                inFlight->AuxOutputMdl      = NULL;
-                inFlight->OrphanOnComplete  = TRUE;
+        }
+        /* Unified post-wait section: unpin, set orphan on timeout,
+         * reap any File-owned entries on Completed.  Covers both
+         * the natural-completion case (job moved to Completed by
+         * JobComplete, walk picks it up) and the timeout-race case
+         * (JobComplete fired between wait return and lock re-take —
+         * pin > 0 forced the non-orphan Completed insert, walk picks
+         * it up).  See driver/rkvdec/job.c for the full case
+         * analysis. */
+        KeAcquireSpinLock(&q->Lock, &old);
+        inFlight->WaiterPin--;
+        if (timedOut && q->InFlight == inFlight && inFlight->Owner == File) {
+            inFlight->OutputFrameMdl    = NULL;
+            inFlight->InternalOutputMdl = NULL;
+            inFlight->AuxOutputMdl      = NULL;
+            inFlight->OrphanOnComplete  = TRUE;
+        }
+        entry = q->Completed.Flink;
+        while (entry != &q->Completed) {
+            RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
+            PLIST_ENTRY next = entry->Flink;
+            if (cand->Owner == File) {
+                RemoveEntryList(entry);
+                InsertTailList(&toFree, entry);
             }
-            KeReleaseSpinLock(&q->Lock, old);
+            entry = next;
+        }
+        KeReleaseSpinLock(&q->Lock, old);
+        while (!IsListEmpty(&toFree)) {
+            PLIST_ENTRY e = RemoveHeadList(&toFree);
+            RKMPP_JOB *j = CONTAINING_RECORD(e, RKMPP_JOB, Link);
+            ExFreePoolWithTag(j, 'JppM');
+        }
+        if (timedOut) {
             RkMppSetNeedsCoreReset(Device);
-        } else {
-            /* In-flight completed cleanly.  It's now on the Completed
-             * list — pull it off so it doesn't leak waiting for a
-             * WaitJob caller that's never coming. */
-            KeAcquireSpinLock(&q->Lock, &old);
-            entry = q->Completed.Flink;
-            while (entry != &q->Completed) {
-                RKMPP_JOB *cand = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
-                PLIST_ENTRY next = entry->Flink;
-                if (cand->Owner == File) {
-                    RemoveEntryList(entry);
-                    InsertTailList(&toFree, entry);
-                }
-                entry = next;
-            }
-            KeReleaseSpinLock(&q->Lock, old);
-            while (!IsListEmpty(&toFree)) {
-                PLIST_ENTRY e = RemoveHeadList(&toFree);
-                RKMPP_JOB *j = CONTAINING_RECORD(e, RKMPP_JOB, Link);
-                ExFreePoolWithTag(j, 'JppM');
-            }
         }
     }
 
@@ -950,10 +950,19 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
 
     /* Orphan check — caller has abandoned this job (drainer/wait
      * timeout).  Skip Completed-list insert and arrange to free after
-     * the lock release; without this, abandoned jobs leak forever. */
+     * the lock release; without this, abandoned jobs leak forever.
+     *
+     * If a WaiterPin is held (RkMppJobsDrainOwner captured this job's
+     * pointer and is about to / currently waiting on Done), defer the
+     * free to the unpin path — the drainer would otherwise deref
+     * freed pool on its KeWaitForSingleObject.  Review H3 TOCTOU. */
     BOOLEAN orphan = job->OrphanOnComplete;
+    BOOLEAN pinned = (job->WaiterPin > 0);
+    BOOLEAN freeHere = orphan && !pinned;
 
-    /* Move from InFlight to Completed (unless orphan). */
+    /* Move from InFlight to Completed (unless orphan).  When pinned
+     * but not orphan, also insert into Completed so the drainer's
+     * post-wait list walk can find and reap it. */
     q->InFlight = NULL;
     if (!orphan) {
         InsertTailList(&q->Completed, &job->Link);
@@ -987,8 +996,10 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
         RkMppJobStart(Device, next);
     }
 
-    /* Free orphan job after kicking the next one. */
-    if (orphan) {
+    /* Free orphan job after kicking the next one.  freeHere==FALSE
+     * despite orphan means a drainer holds a pin — they free after
+     * KeWaitForSingleObject returns. */
+    if (freeHere) {
         ExFreePoolWithTag(job, 'JppM');
     }
 }
@@ -1400,7 +1411,11 @@ RkMppJobWait(_In_ WDFDEVICE Device,
     }
 
     if (!alreadyComplete) {
-        /* Job still in progress — wait for it with the caller's timeout. */
+        /* Job still in progress — wait for it with the caller's
+         * timeout.  Pin via WaiterPin so a concurrent DrainOwner can't
+         * free the job between this lock release and our
+         * KeWaitForSingleObject (review H3 TOCTOU). */
+        job->WaiterPin++;
         KeReleaseSpinLock(&q->Lock, oldIrql);
 
         LARGE_INTEGER timeout;
@@ -1438,6 +1453,8 @@ RkMppJobWait(_In_ WDFDEVICE Device,
             Out->ElapsedQpc     = 0;
 
             KeAcquireSpinLock(&q->Lock, &oldIrql);
+            /* Unpin first — we're done waiting. */
+            job->WaiterPin--;
             BOOLEAN onPending   = FALSE;
             BOOLEAN onCompleted = FALSE;
             for (PLIST_ENTRY e = q->Pending.Flink; e != &q->Pending;
@@ -1477,8 +1494,10 @@ RkMppJobWait(_In_ WDFDEVICE Device,
             return STATUS_TIMEOUT;
         }
 
-        /* Job is now on the Completed list; re-acquire lock to remove it. */
+        /* Job is now on the Completed list; re-acquire lock to
+         * remove it and unpin our wait reference. */
         KeAcquireSpinLock(&q->Lock, &oldIrql);
+        job->WaiterPin--;
     }
 
     /* Remove from Completed list and copy result. */

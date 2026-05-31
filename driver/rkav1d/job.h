@@ -80,6 +80,13 @@ typedef struct _RKMPP_JOB {
      * the flag, skips the Completed-list insert, frees the job, and
      * returns.  Prevents per-timeout RKMPP_JOB leak on abandoned waits. */
     BOOLEAN         OrphanOnComplete;
+
+    /* WaiterPin — refcount of external callers holding this job alive
+     * across a KeWaitForSingleObject on Done.  Manipulated only under
+     * q->Lock.  Closes the DrainOwner Done-event TOCTOU (review H3) —
+     * see the matching field in driver/rkvdec/job.h for the full
+     * rationale. */
+    LONG            WaiterPin;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------

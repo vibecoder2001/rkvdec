@@ -108,6 +108,21 @@ typedef struct _RKMPP_JOB {
      * Without this, abandoned jobs accumulate on Completed forever —
      * a non-paged-pool DoS once IOCTL is reachable from non-admin. */
     BOOLEAN         OrphanOnComplete;
+
+    /* WaiterPin — refcount of external callers that have captured a
+     * pointer to this job (via the q->Lock-held lookup in
+     * RkMppJobsDrainOwner) and intend to KeWaitForSingleObject on
+     * `Done` after releasing the lock.  Manipulated only under
+     * q->Lock.
+     *
+     * When non-zero, RkMppJobComplete (and the peer/foreign
+     * completion paths) must NOT free the job — the last unpin
+     * frees it instead.  Without this pin, the drainer's lock-
+     * release → wait window opens a UAF: JobComplete can fire,
+     * signal Done, and free the orphan job between lock release
+     * and KeWaitForSingleObject's deref of &job->Done.  Closes
+     * review finding H3 (DrainOwner Done-event TOCTOU). */
+    LONG            WaiterPin;
 } RKMPP_JOB, *PRKMPP_JOB;
 
 /* -----------------------------------------------------------------------

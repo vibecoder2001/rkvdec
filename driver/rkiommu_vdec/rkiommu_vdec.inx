@@ -33,6 +33,17 @@ CopyFiles = Drivers_Dir
 [Drivers_Dir]
 rkiommu_vdec.sys
 
+; Device-level security — admin/system only.  rkiommu_vdec has no
+; user-mode IOCTL surface (interfaces are kernel-side via
+; WdfDeviceAddQueryInterface), so AU access has no legitimate purpose.
+; See rkvdec.inx for the why-INF-not-Wdf rationale.
+[rkiommu_vdec_Inst.NT.HW]
+AddReg = rkiommu_vdec_HW_AddReg
+
+[rkiommu_vdec_HW_AddReg]
+HKR,, "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+HKR,, "DeviceCharacteristics", 0x10001, 0x00000100
+
 [rkiommu_vdec_Inst.NT.Services]
 AddService = rkiommu_vdec, %SPSVCINST_ASSOCSERVICE%, rkiommu_vdec_Service_Inst
 

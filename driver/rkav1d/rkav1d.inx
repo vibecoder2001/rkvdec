@@ -32,6 +32,15 @@ CopyFiles = Drivers_Dir
 [Drivers_Dir]
 rkav1d.sys
 
+; Device-level security — see rkvdec.inx for the policy + rationale.
+; Same SDDL: SY/BA full, AU read/write/execute.
+[rkav1d_Inst.NT.HW]
+AddReg = rkav1d_HW_AddReg
+
+[rkav1d_HW_AddReg]
+HKR,, "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWGX;;;AU)"
+HKR,, "DeviceCharacteristics", 0x10001, 0x00000100
+
 [rkav1d_Inst.NT.Services]
 AddService = rkav1d, %SPSVCINST_ASSOCSERVICE%, rkav1d_Service_Inst
 

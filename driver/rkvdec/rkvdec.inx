@@ -32,6 +32,24 @@ CopyFiles = Drivers_Dir
 [Drivers_Dir]
 rkvdec.sys
 
+; Device-level security.  PnP-managed FDOs must set security via INF
+; AddReg, not via WdfDeviceInitAssignSDDLString (that API is for control
+; devices only; using it here makes the device fail PnP load with a
+; SECURITY_DESCRIPTOR complaint in Device Manager — see commit 4cf23bf).
+; Policy:
+;   SY (Local System)        — all access
+;   BA (Built-in Admins)     — all access
+;   AU (Authenticated Users) — read/write/execute, so any non-anonymous
+;                              user can open the device through the MFT.
+; Anonymous tokens are denied.  FILE_DEVICE_SECURE_OPEN (0x100) propagates
+; the ACL to namespace opens / child PDOs.
+[rkvdec_Inst.NT.HW]
+AddReg = rkvdec_HW_AddReg
+
+[rkvdec_HW_AddReg]
+HKR,, "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWGX;;;AU)"
+HKR,, "DeviceCharacteristics", 0x10001, 0x00000100
+
 [rkvdec_Inst.NT.Services]
 AddService = rkvdec, %SPSVCINST_ASSOCSERVICE%, rkvdec_Service_Inst
 

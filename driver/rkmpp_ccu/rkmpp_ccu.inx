@@ -33,6 +33,15 @@ CopyFiles = Drivers_Dir
 [Drivers_Dir]
 rkmpp_ccu.sys
 
+; Device-level security — admin/system only.  See rkiommu_vdec.inx
+; (and rkvdec.inx for the why-INF-not-Wdf rationale).
+[rkmpp_ccu_Inst.NT.HW]
+AddReg = rkmpp_ccu_HW_AddReg
+
+[rkmpp_ccu_HW_AddReg]
+HKR,, "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+HKR,, "DeviceCharacteristics", 0x10001, 0x00000100
+
 [rkmpp_ccu_Inst.NT.Services]
 AddService = rkmpp_ccu, %SPSVCINST_ASSOCSERVICE%, rkmpp_ccu_Service_Inst
 

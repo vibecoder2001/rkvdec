@@ -32,6 +32,15 @@ CopyFiles = Drivers_Dir
 [Drivers_Dir]
 rkiommu_av1d.sys
 
+; Device-level security — admin/system only.  See rkiommu_vdec.inx
+; (and rkvdec.inx for the why-INF-not-Wdf rationale).
+[rkiommu_av1d_Inst.NT.HW]
+AddReg = rkiommu_av1d_HW_AddReg
+
+[rkiommu_av1d_HW_AddReg]
+HKR,, "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+HKR,, "DeviceCharacteristics", 0x10001, 0x00000100
+
 [rkiommu_av1d_Inst.NT.Services]
 AddService = rkiommu_av1d, %SPSVCINST_ASSOCSERVICE%, rkiommu_av1d_Service_Inst
 

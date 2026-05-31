@@ -306,8 +306,17 @@ static NTSTATUS RaiseParents(void)
     if (!NT_SUCCESS(s)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: PD_VDPU power-on failed 0x%08x\n", s);
+        /* Reverse-sequence rollback to leave CRU symmetric with
+         * cold boot.  The original cleanup only re-gated CON44 and
+         * powered off VCODEC, leaving SOFTRST_CON44 deasserted — so
+         * a follow-up Raise saw clocks gated but resets deasserted,
+         * different from clean boot.  Mirror the DropParents shape:
+         * re-assert SOFTRST_CON44 too, in the right order
+         * (gate-clocks → assert-reset → power-off-parent). */
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon44,
                          g_rdcc.ClkGateCon44Mask, g_rdcc.ClkGateCon44Mask);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon44,
+                         g_rdcc.SoftRstCon44Mask, g_rdcc.SoftRstCon44Mask);
         RkMppPmuPowerOff(&g_pdVcodec);
         --g_parents_refcount;
         return s;

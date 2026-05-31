@@ -63,7 +63,11 @@
     <ClCompile Include="..\shared\rkmpp\peer_attach.c" />
     <ClCompile Include="..\shared\iommu\pgtable.c" />
     <ClCompile Include="fault.c" />
-    <Inf Include="rkiommu_vdec.inx" />
+    <ResourceCompile Include="..\shared\version.rc" />
+    <Inf Include="rkiommu_vdec.inx">
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.8.0.0</TimeStamp>
+    </Inf>
   </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />

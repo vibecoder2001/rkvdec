@@ -57,7 +57,11 @@
     <ClCompile Include="ifc.c" />
     <ClCompile Include="pmu.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
-    <Inf Include="rkmpp_ccu.inx" />
+    <ResourceCompile Include="..\shared\version.rc" />
+    <Inf Include="rkmpp_ccu.inx">
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.8.0.0</TimeStamp>
+    </Inf>
   </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />

@@ -63,7 +63,11 @@
     <ClCompile Include="..\shared\rkmpp\bufpool.c" />
     <ClCompile Include="..\shared\rkmpp\ifc_client.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
-    <Inf Include="rkav1d.inx" />
+    <ResourceCompile Include="..\shared\version.rc" />
+    <Inf Include="rkav1d.inx">
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.8.0.0</TimeStamp>
+    </Inf>
   </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />

@@ -65,7 +65,11 @@
     <ClCompile Include="..\shared\rkmpp\ifc_client.c" />
     <ClCompile Include="..\shared\rkmpp\peer_attach.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
-    <Inf Include="rkvdec.inx" />
+    <ResourceCompile Include="..\shared\version.rc" />
+    <Inf Include="rkvdec.inx">
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.8.0.0</TimeStamp>
+    </Inf>
   </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />

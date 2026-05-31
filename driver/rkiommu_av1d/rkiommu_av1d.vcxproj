@@ -61,7 +61,11 @@
     <ClCompile Include="fault.c" />
     <ClCompile Include="..\shared\acpi_uid.c" />
     <ClCompile Include="..\shared\iommu\pgtable.c" />
-    <Inf Include="rkiommu_av1d.inx" />
+    <ResourceCompile Include="..\shared\version.rc" />
+    <Inf Include="rkiommu_av1d.inx">
+      <SpecifyDriverVerDirectiveVersion>true</SpecifyDriverVerDirectiveVersion>
+      <TimeStamp>0.8.0.0</TimeStamp>
+    </Inf>
   </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />

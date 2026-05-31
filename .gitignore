@@ -1,6 +1,8 @@
 # Build outputs
 build/
 out/
+# NuGet restore dir (WDK/SDK packages pulled in CI — see packages.config)
+packages/
 **/Debug/
 **/Release/
 **/ARM64/

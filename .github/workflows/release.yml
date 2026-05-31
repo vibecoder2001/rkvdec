@@ -1,0 +1,164 @@
+name: build-release
+
+# Builds the full ARM64 release set:
+#   * 5 KMDF drivers (.sys/.inf/.cat) — rkmpp_ccu, rkiommu_vdec,
+#     rkiommu_av1d, rkvdec, rkav1d  (msbuild + WDK)
+#   * the MFT decoder DLL  rkmpp_decoder_mft.dll        (CMake / user-mode)
+#   * the player harness   mft_play.exe                 (CMake / user-mode)
+#
+# Triggers:
+#   * push to main          -> build + upload artifacts (CI confidence only)
+#   * push of a v* tag      -> build + publish a GitHub Release with the
+#                              binaries attached
+#   * manual (workflow_dispatch) -> build + upload artifacts
+#
+# Drivers are test-signed with a throwaway self-signed certificate that the
+# WDK build generates on the runner; the matching public .cer is shipped so
+# users can install it (and enable testsigning) to load the drivers.
+#
+# NOTE: hosted-runner driver builds are finicky. WDK/SDK provisioning is done
+# via NuGet (packages.config + driver/Directory.Build.props), matching
+# Microsoft's Windows-driver-samples CI; ARM64 Spectre libs are sidestepped
+# with SpectreMitigation=false. If a future runner image breaks the build, the
+# NuGet restore step and the driver msbuild step are where to look.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write          # required for the release step to create a Release
+
+env:
+  VERSION: "0.8.0"
+
+jobs:
+  build:
+    # Mirror Microsoft's own driver CI (microsoft/Windows-driver-samples):
+    # build on windows-2025-vs2026 and provide the WDK + SDK as NuGet packages
+    # rather than via an installer. Installer-based provisioning (wdksetup.exe
+    # or choco) proved unreliable on hosted runners — it exits 0 without landing
+    # Include\<ver>\km\ntddk.h, so the driver build's MatchingWdkPresent check
+    # fails with "A WDK corresponding to target version ... was not found".
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout (with dav1d submodule)
+        uses: actions/checkout@v4
+        with:
+          # third_party/dav1d supplies the AV1 parser's headers (header-only;
+          # no static lib is built). Required to configure the CMake tools.
+          submodules: recursive
+
+      - name: Set up MSBuild (64-bit)
+        uses: microsoft/setup-msbuild@v2
+        with:
+          # Must be the 64-bit MSBuild. The WDK-via-NuGet targets pick the host
+          # tool dir (stampinf/inf2cat) from $(Processor_Architecture): only
+          # 'AMD64'/'ARM64' map to a real bin\<ver>\{x64,arm64} folder. Default
+          # 32-bit MSBuild reports x86 under WOW64, leaving InfToolPath empty
+          # -> "TRK0005: Failed to locate stampinf.exe" (the NuGet packages ship
+          # no x86 host tools).
+          msbuild-architecture: x64
+
+      # ----- WDK + SDK via NuGet --------------------------------------------
+      # Restores the packages named in packages.config into .\packages\, which
+      # driver/Directory.Build.props then imports into each driver project
+      # (ARM64, Exists()-guarded). No WDK installer, no toolset registration.
+      - name: Restore WDK + SDK NuGet packages
+        shell: pwsh
+        run: |
+          nuget restore packages.config -PackagesDirectory packages
+          if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
+
+      # ----- Drivers ---------------------------------------------------------
+      # The WDK/SDK NuGet props (imported via driver/Directory.Build.props) set
+      # WindowsTargetPlatformVersion to the package version; the vcxprojs only
+      # fall back to "10.0" when that is empty (i.e. local builds with no
+      # restore). So no version override is needed on the command line.
+      #
+      # SpectreMitigation=false avoids MSB8040 on runners that lack the ARM64
+      # Spectre-mitigated import libs — acceptable for pre-v1 test builds.
+      #
+      # SignMode=TestSign (the Release default) makes the build generate a
+      # throwaway test certificate and test-sign each .sys/.cat.
+      - name: Build drivers (ARM64 / Release, test-signed)
+        shell: pwsh
+        run: |
+          $drivers = 'rkmpp_ccu','rkiommu_vdec','rkiommu_av1d','rkvdec','rkav1d'
+          foreach ($d in $drivers) {
+            Write-Host "=== Building $d ==="
+            msbuild "driver\$d\$d.vcxproj" `
+              /p:Configuration=Release /p:Platform=ARM64 `
+              /p:SignMode=TestSign /p:SpectreMitigation=false `
+              /m /nologo /v:minimal
+            if ($LASTEXITCODE -ne 0) { throw "driver $d failed" }
+          }
+
+      # ----- MFT DLL + mft_play (user-mode, CMake) ---------------------------
+      - name: Configure CMake tools (ARM64)
+        shell: pwsh
+        run: |
+          cmake -S tests/harness -B build/harness-arm64 -A ARM64 -DRKMPP_HARNESS_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+
+      - name: Build MFT DLL + mft_play (ARM64 / Release)
+        shell: pwsh
+        run: |
+          cmake --build build/harness-arm64 --config Release `
+            --target rkmpp_decoder_mft mft_play
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      # ----- Stage artifacts -------------------------------------------------
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $drivers = 'rkmpp_ccu','rkiommu_vdec','rkiommu_av1d','rkvdec','rkav1d'
+          New-Item -ItemType Directory -Force artifacts/tools | Out-Null
+          foreach ($d in $drivers) {
+            $pkg = "driver/$d/ARM64/Release/$d"     # .sys + .cat live here
+            $dst = "artifacts/drivers/$d"
+            New-Item -ItemType Directory -Force $dst | Out-Null
+            Copy-Item "$pkg/$d.sys" $dst
+            Copy-Item "$pkg/$d.cat" $dst
+            Copy-Item "driver/$d/ARM64/Release/$d.inf" $dst   # stamped INF
+          }
+          Copy-Item "build/harness-arm64/mft_dll/Release/rkmpp_decoder_mft.dll" artifacts/tools
+          Copy-Item "build/harness-arm64/mft_play/Release/mft_play.exe"          artifacts/tools
+
+          # Export the public half of the test-signing cert so users can trust
+          # the drivers (import to LocalMachine\Root + TrustedPublisher, enable
+          # `bcdedit /set testsigning on`).
+          $cert = Get-ChildItem Cert:\CurrentUser\My |
+                  Where-Object { $_.Subject -like '*WDKTest*' -or
+                                 ($_.EnhancedKeyUsageList.FriendlyName -contains 'Code Signing') } |
+                  Select-Object -First 1
+          if ($cert) {
+            Export-Certificate -Cert $cert -FilePath artifacts/rkvdec-testcert.cer | Out-Null
+            Write-Host "Exported test cert: $($cert.Subject)"
+          } else {
+            Write-Warning "No test-signing certificate found to export."
+          }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rkvdec-arm64-${{ env.VERSION }}
+          path: artifacts/**
+          if-no-files-found: error
+
+      # ----- Release (tag push only) ----------------------------------------
+      - name: Package + publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "rkvdec-arm64-$($env:GITHUB_REF_NAME).zip"
+          Compress-Archive -Path artifacts/* -DestinationPath $zip -Force
+          gh release create $env:GITHUB_REF_NAME `
+            $zip `
+            --title $env:GITHUB_REF_NAME `
+            --notes "Automated ARM64 build of the rkvdec/rkav1d driver suite, the MFT decoder DLL (rkmpp_decoder_mft.dll), and mft_play. Drivers are test-signed; install rkvdec-testcert.cer and enable testsigning to load them."
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

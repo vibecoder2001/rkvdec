@@ -1,0 +1,28 @@
+<Project>
+  <!--
+    Auto-imported by every driver vcxproj under driver/ (MSBuild discovers the
+    nearest Directory.Build.props walking up from each project). Scoped to
+    driver/ on purpose so the user-mode CMake harness under tests/harness and
+    build/ is NOT affected by the kernel-mode WDK props.
+
+    CI-only effect: when the WDK/SDK NuGet packages have been restored to
+    ../packages (see ../packages.config and .github/workflows/release.yml),
+    these imports point the build at the packaged SDK+WDK. Every import is
+    Exists()-guarded, so a local developer build — which never restores these
+    packages and uses the installed WDK instead — is completely unaffected.
+
+    Pattern mirrors microsoft/Windows-driver-samples' root Directory.Build.props.
+    ARM64 only (our sole driver target).
+  -->
+  <PropertyGroup>
+    <_WdkPkgDir>$(MSBuildThisFileDirectory)..\packages</_WdkPkgDir>
+    <_WdkPkgVer>10.0.28000.1839</_WdkPkgVer>
+  </PropertyGroup>
+
+  <Import Project="$(_WdkPkgDir)\Microsoft.Windows.WDK.arm64.$(_WdkPkgVer)\build\native\Microsoft.Windows.WDK.arm64.props"
+          Condition="'$(Platform)' == 'ARM64' and Exists('$(_WdkPkgDir)\Microsoft.Windows.WDK.arm64.$(_WdkPkgVer)\build\native\Microsoft.Windows.WDK.arm64.props')" />
+  <Import Project="$(_WdkPkgDir)\Microsoft.Windows.SDK.CPP.arm64.$(_WdkPkgVer)\build\native\Microsoft.Windows.SDK.cpp.arm64.props"
+          Condition="'$(Platform)' == 'ARM64' and Exists('$(_WdkPkgDir)\Microsoft.Windows.SDK.CPP.arm64.$(_WdkPkgVer)\build\native\Microsoft.Windows.SDK.cpp.arm64.props')" />
+  <Import Project="$(_WdkPkgDir)\Microsoft.Windows.SDK.CPP.$(_WdkPkgVer)\build\native\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('$(_WdkPkgDir)\Microsoft.Windows.SDK.CPP.$(_WdkPkgVer)\build\native\Microsoft.Windows.SDK.cpp.props')" />
+</Project>

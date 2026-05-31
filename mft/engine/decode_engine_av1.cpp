@@ -419,6 +419,7 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
                             const Dav1dSequenceHeader *p_seq_hdr,
                             int slot_idx, uint64_t kick_no,
                             const AV1ObuRecord *rec,
+                            uint32_t frame_hdr_obu_size_bytes,
                             Av1DecodedFrame *f)
 {
     /* Alias locals to the flat (non-Dav1dPicture) parameters so the body
@@ -470,13 +471,14 @@ static int Av1HwKickPicture(Av1DecodeEngine *e,
      *   - tile_info end = obu_len - frame_tag_size
      *
      * The OBU walk at Submit time gave us pre_payload_off (= hdr_len +
-     * size_leb).  For OBU_FRAME (6) we add frame_hdr_obu_size_bytes from
-     * the parser's reported Dav1dFrameHeader (local patch field).  For OBU_FRAME_
-     * HEADER (3) the payload IS the frame_header — but show_existing_frame
-     * OBU_FRAME_HEADERs don't reach here (skipped in DrainPictures). */
+     * size_leb).  For OBU_FRAME (6) we add frame_hdr_obu_size_bytes, which
+     * the clean-room parser reports via an out-param (no dav1d patch).  For
+     * OBU_FRAME_HEADER (3) the payload IS the frame_header — but
+     * show_existing_frame OBU_FRAME_HEADERs don't reach here (skipped in
+     * DrainPictures). */
     uint32_t frame_tag_size = rec->frame_tag_off;
-    if (rec->obu_type == 6 && p_frame_hdr) {
-        frame_tag_size += p_frame_hdr->frame_hdr_obu_size_bytes;
+    if (rec->obu_type == 6) {
+        frame_tag_size += frame_hdr_obu_size_bytes;
     }
     /* IOMMU offset shifts the codec's read cursor past the OBU framing.
      * Codec reads from iova + offset (16-byte-aligned), entropy-decodes
@@ -1156,12 +1158,13 @@ static int DrainPictures(Av1DecodeEngine *e, int64_t pts_hns) {
 
         /* Parse the frame header. */
         Dav1dFrameHeader hdr{};
+        uint32_t         hdr_obu_size = 0;
         const bool is_frame_type = (rec.obu_type == 6); /* OBU_FRAME */
         if (Av1ParseFrameHeader(obu_payload, obu_payload_len,
                                 is_frame_type,
                                 &e->cached_seq_hdr,
                                 e->saved_states,
-                                &hdr) != 0) {
+                                &hdr, &hdr_obu_size) != 0) {
             std::fprintf(stderr, "av1_engine: Av1ParseFrameHeader failed, dropping\n");
             continue;
         }
@@ -1286,7 +1289,8 @@ static int DrainPictures(Av1DecodeEngine *e, int64_t pts_hns) {
             f.slot_idx = -1;
         } else {
             int hw_rc = Av1HwKickPicture(e, &hdr, &e->cached_seq_hdr,
-                                         slot, kick_no, &rec, &f);
+                                         slot, kick_no, &rec,
+                                         hdr_obu_size, &f);
             if (std::getenv("RKMPP_AV1_TRACE")) {
                 uint32_t h32 = 2166136261u;
                 const uint8_t *po = (const uint8_t *)e->pool_output[slot].user_va;

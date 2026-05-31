@@ -101,7 +101,8 @@ static const char *frame_type_str(int t)
 
 static void dump_header(int idx,
                         const Dav1dSequenceHeader *s,
-                        const Dav1dFrameHeader    *h)
+                        const Dav1dFrameHeader    *h,
+                        uint32_t                   hdr_obu_size)
 {
     std::printf("frame[%d] type=%s coded=%dx%d render=%dx%d "
                 "show=%d showable=%d existing=%d primary_ref=%d refresh=0x%02x "
@@ -141,7 +142,7 @@ static void dump_header(int idx,
                 h->film_grain.present,
                 h->super_res.enabled, h->super_res.width_scale_denominator,
                 s->profile, s->hbd, s->monochrome,
-                h->frame_hdr_obu_size_bytes);
+                hdr_obu_size);
 }
 
 int main(int argc, char **argv)
@@ -217,9 +218,10 @@ int main(int argc, char **argv)
             {
                 bool is_frame = (obu_type == DAV1D_OBU_FRAME);
                 Dav1dFrameHeader fh{};
+                uint32_t         fh_obu_size = 0;
                 int rc = Av1ParseFrameHeader(
                     payload, payload_len, is_frame,
-                    &seq, saved, &fh);
+                    &seq, saved, &fh, &fh_obu_size);
                 if (rc < 0) {
                     std::fprintf(stderr,
                         "Av1ParseFrameHeader failed at frame[%d]\n",
@@ -229,7 +231,7 @@ int main(int argc, char **argv)
                 }
 
                 if (!fh.show_existing_frame || obu_type == DAV1D_OBU_REDUNDANT_FRAME_HDR) {
-                    dump_header(frame_idx, &seq, &fh);
+                    dump_header(frame_idx, &seq, &fh, fh_obu_size);
                     Av1UpdateSavedStates(saved, &fh);
                 }
                 frame_idx++;

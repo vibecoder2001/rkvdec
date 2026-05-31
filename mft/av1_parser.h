@@ -73,11 +73,18 @@ int Av1ParseSeqHeader(const uint8_t *obu_payload, size_t obu_payload_len,
  *                         the caller does not maintain this state (fields
  *                         that would be inherited will be left at their
  *                         default values instead).
- *   out                 — receives the parsed frame header (zeroed first)
- *
- * out->frame_hdr_obu_size_bytes is set to the byte count of the
- * uncompressed_header() portion (including trailing byte_alignment()),
- * so the caller can locate the tile_group payload within an OBU_FRAME.
+ *   out                 — receives the parsed frame header (zeroed first).
+ *                         This is a pristine, unmodified Dav1dFrameHeader —
+ *                         the parser does NOT depend on any local patch to
+ *                         dav1d's headers.
+ *   out_frame_hdr_obu_size_bytes
+ *                       — optional (may be NULL).  On success receives the
+ *                         byte count of the uncompressed_header() portion
+ *                         (including trailing byte_alignment()), so the
+ *                         caller can locate the tile_group payload within an
+ *                         OBU_FRAME.  Kept separate from Dav1dFrameHeader so
+ *                         this parser stays drop-in against an upstream,
+ *                         unpatched dav1d (see "frame_tag_size" in MPP).
  *
  * Returns 0 on success, -1 on parse error or unsupported stream.
  * ------------------------------------------------------------------------- */
@@ -86,7 +93,8 @@ int Av1ParseFrameHeader(const uint8_t       *obu_payload,
                         bool                 obu_is_frame_type,
                         const Dav1dSequenceHeader *seq,
                         const Av1SavedFrameState   prev_states[8],
-                        Dav1dFrameHeader    *out);
+                        Dav1dFrameHeader    *out,
+                        uint32_t            *out_frame_hdr_obu_size_bytes);
 
 /* ---------------------------------------------------------------------------
  * Av1UpdateSavedStates

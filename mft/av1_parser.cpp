@@ -1336,7 +1336,8 @@ int Av1ParseFrameHeader(const uint8_t            *obu_payload,
                         bool                      obu_is_frame_type,
                         const Dav1dSequenceHeader *seq,
                         const Av1SavedFrameState   prev_states[8],
-                        Dav1dFrameHeader          *out)
+                        Dav1dFrameHeader          *out,
+                        uint32_t                  *out_frame_hdr_obu_size_bytes)
 {
     if (!obu_payload || !seq || !out || !obu_payload_len) return -1;
 
@@ -1350,9 +1351,13 @@ int Av1ParseFrameHeader(const uint8_t            *obu_payload,
 
     /* frame_hdr_obu_size_bytes = bytes consumed by uncompressed_header()
      * including trailing alignment bits.
-     * For OBU_FRAME the tile_group payload starts immediately after this. */
-    out->frame_hdr_obu_size_bytes =
-        (uint32_t)br_bytes_consumed(r, obu_payload);
+     * For OBU_FRAME the tile_group payload starts immediately after this.
+     * Reported via the out-param (not a Dav1dFrameHeader field) so the
+     * parser stays drop-in against an unpatched upstream dav1d. */
+    if (out_frame_hdr_obu_size_bytes) {
+        *out_frame_hdr_obu_size_bytes =
+            (uint32_t)br_bytes_consumed(r, obu_payload);
+    }
 
     (void)obu_is_frame_type; /* tile_group offset is always byte-aligned */
     return 0;

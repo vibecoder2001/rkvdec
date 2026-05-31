@@ -228,7 +228,9 @@ static const RDCC_REGS g_rdcc = {
  * that for clock and reset control in Phase 2. */
 extern volatile UCHAR *g_rdcc_mmio;
 extern volatile UCHAR *g_cru_mmio;
-extern LONG            g_raise_refcount;
+/* RaiseCluster/DropCluster refcount.  Guarded by g_ccu_mutex.  Static
+ * here because nothing outside this file reads or writes it. */
+static LONG g_raise_refcount = 0;
 
 /* AV1 cluster bring-up is independent of the rkvdec0/1 cluster — it
  * has its own PD (PD_AV1) with its own clock + reset bundle.  Use a

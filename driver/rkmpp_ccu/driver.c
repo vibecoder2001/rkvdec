@@ -31,7 +31,8 @@
 volatile UCHAR *g_rdcc_mmio     = NULL;
 volatile UCHAR *g_cru_mmio      = NULL;
 volatile UCHAR *g_pmu_mmio      = NULL;
-LONG            g_raise_refcount = 0;
+/* g_raise_refcount moved to ccu.c as static — it's purely a
+ * RaiseCluster/DropCluster state field, never referenced outside ccu.c. */
 
 /* MMIO mapping bookkeeping — kept here so ReleaseHardware can unmap. */
 static SIZE_T   g_rdcc_mmio_len = 0;

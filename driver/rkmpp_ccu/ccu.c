@@ -410,6 +410,13 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
                    "rkmpp_ccu: PD_RKVDEC0 power-on failed 0x%08x "
                    "CLKGATE40=0x%08x CLKGATE44=0x%08x CLKSEL89=0x%08x SOFTRST40=0x%08x\n",
                    s, g40, g44, s89, r40);
+        /* Re-assert SOFTRST_CON40 before re-gating clocks.  Without
+         * this, a failed RaiseCluster leaves the resets deasserted
+         * (we deasserted them just before the failed handshake) and
+         * the next Raise attempt finds clocks-against-deasserted-
+         * reset — different precondition than a clean boot. */
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
+                         g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                          g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
         DropParents();
@@ -427,9 +434,19 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
     if (!NT_SUCCESS(s)) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: PD_RKVDEC1 power-on failed 0x%08x\n", s);
+        /* Re-assert SOFTRST_CON41 for the RVD1 cluster (failed to
+         * power up), then PowerOff RVD0 (which succeeded earlier)
+         * and re-assert SOFTRST_CON40 around its cleanup too.
+         * Same rationale as the RVD0 branch above: leave CRU state
+         * symmetric with a clean boot so the next Raise has a
+         * known precondition. */
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon41,
+                         g_rdcc.SoftRstCon41Mask, g_rdcc.SoftRstCon41Mask);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon41,
                          g_rdcc.ClkGateCon41Mask, g_rdcc.ClkGateCon41Mask);
         RkMppPmuPowerOff(&g_pdRkvdec0);
+        RkCcuHiwordWrite(g_cru_mmio, g_rdcc.SoftRstCon40,
+                         g_rdcc.SoftRstCon40Mask, g_rdcc.SoftRstCon40Mask);
         RkCcuHiwordWrite(g_cru_mmio, g_rdcc.ClkGateCon40,
                          g_rdcc.ClkGateCon40Mask, g_rdcc.ClkGateCon40Mask);
         DropParents();

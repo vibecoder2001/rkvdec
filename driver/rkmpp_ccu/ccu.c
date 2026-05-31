@@ -400,10 +400,10 @@ NTSTATUS RkMppCcuRaiseCluster(_In_ PVOID Ctx)
 
     s = RkMppPmuPowerOn(&g_pdRkvdec0);
     if (!NT_SUCCESS(s)) {
-        ULONG g40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8A0));
-        ULONG g44 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x8B0));
-        ULONG s89 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0x4A4));
-        ULONG r40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + 0xAA0));
+        ULONG g40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKGATE_CON40));
+        ULONG g44 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKGATE_CON44));
+        ULONG s89 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_CLKSEL_CON89));
+        ULONG r40 = READ_REGISTER_ULONG((volatile ULONG*)(g_cru_mmio + RDCC_CRU_SOFTRST_CON40));
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: PD_RKVDEC0 power-on failed 0x%08x "
                    "CLKGATE40=0x%08x CLKGATE44=0x%08x CLKSEL89=0x%08x SOFTRST40=0x%08x\n",

@@ -224,12 +224,12 @@ powered_on:
      * The CRU map lives in ccu.c — pmu.c only sees g_pmu_mmio, so we dump
      * just PMU state here and let the caller log CRU. */
     {
-        ULONG req = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x10C));
-        ULONG ack = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x118));
-        ULONG ist = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x120));
-        ULONG pwr = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x14C));
-        ULONG sta = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x180));
-        ULONG rep = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + 0x290));
+        ULONG req = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_BUS_IDLE_REQ));
+        ULONG ack = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_BUS_IDLE_ACK));
+        ULONG ist = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_BUS_IDLE_ST));
+        ULONG pwr = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_PWR_GATE_CON));
+        ULONG sta = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_PWR_GATE_STATUS));
+        ULONG rep = READ_REGISTER_ULONG((volatile ULONG*)(g_pmu_mmio + RK3588_PMU_PWR_REPAIR_STATUS));
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                    "rkmpp_ccu: bus-idle-ack timeout (PD pwrBit=0x%x) "
                    "REQ=0x%08x ACK=0x%08x IST=0x%08x PWR=0x%08x STA=0x%08x REP=0x%08x\n",

@@ -207,6 +207,9 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     Queue->LastDecMode = 0;
     Queue->LastValid   = FALSE;
     RtlZeroMemory(Queue->OwnerLru, sizeof(Queue->OwnerLru));
+    Queue->KickWorkItem = NULL;       /* created in EvtDeviceAdd */
+    Queue->KickActive   = FALSE;
+    Queue->KickRearm    = FALSE;
     /* Per-device PollerThread + KickEvent/ExitEvent removed: completion
      * is interrupt-driven (ISR → DPC → RkMppJobComplete) since Task 3
      * landed.  The vestigial thread previously sat in a KeWait that
@@ -1278,10 +1281,101 @@ KickPromotions(_In_ WDFDEVICE Device, _In_ RKMPP_JOB_QUEUE *q,
 }
 
 /* -----------------------------------------------------------------------
+ * Deferred-kick workitem.
+ *
+ * RkMppEnqueueKickWorker is called at the tail of a completion (local
+ * RkMppJobComplete or peer RkMppPeerCompletion) — the queue lock is NOT
+ * held.  It arms the rearm flag and, if no worker run is already in
+ * flight, enqueues the workitem.  RkMppKickWorker then runs every
+ * PromoteUntilFull + KickPromotions at PASSIVE.
+ *
+ * The KickActive / KickRearm pattern coalesces back-to-back completions
+ * onto a single worker run while guaranteeing no promotion is lost:
+ *   - KickActive gates enqueue so at most one run is outstanding (WDF
+ *     also won't re-enter a single workitem's callback concurrently).
+ *   - KickRearm, set under the lock by every completion, is re-checked
+ *     by the worker after each KickPromotions; the worker only clears
+ *     KickActive and exits once it re-acquires the lock and finds
+ *     KickRearm clear — so a completion racing the worker's exit forces
+ *     another pass instead of being dropped.
+ * --------------------------------------------------------------------- */
+static VOID
+RkMppEnqueueKickWorker(_Inout_ RKMPP_JOB_QUEUE *q)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+    q->KickRearm = TRUE;
+    BOOLEAN enqueue = !q->KickActive;
+    if (enqueue) q->KickActive = TRUE;
+    KeReleaseSpinLock(&q->Lock, irql);
+
+    if (enqueue) {
+        WdfWorkItemEnqueue(q->KickWorkItem);
+    }
+}
+
+static VOID
+RkMppKickWorker(_In_ WDFWORKITEM WorkItem)
+{
+    WDFDEVICE        device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
+    PRKMPP_JOB_QUEUE q      = RkMppGetJobQueue(device);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+    for (;;) {
+        if (!q->KickRearm) {
+            /* No completion has armed us since the last drain — done.
+             * A completion arriving after this point finds KickActive
+             * clear and enqueues a fresh run. */
+            q->KickActive = FALSE;
+            KeReleaseSpinLock(&q->Lock, irql);
+            return;
+        }
+        q->KickRearm = FALSE;
+
+        PROMOTION promos[2];
+        RtlZeroMemory(promos, sizeof(promos));
+        ULONG nPromos = PromoteUntilFull(q, promos);
+
+        KeReleaseSpinLock(&q->Lock, irql);
+
+        /* PASSIVE: KickPromotions may MMIO-program the local core, raise
+         * the CCU cluster, ungate leaf clocks, or dispatch to the peer.
+         * A sync-failure inside JobKickLocalInner re-enters
+         * RkMppJobComplete → RkMppEnqueueKickWorker, which sets KickRearm
+         * (KickActive already TRUE → no second enqueue); the loop below
+         * picks it up.  No re-entrant kick, no recursion. */
+        KickPromotions(device, q, promos, nPromos);
+
+        KeAcquireSpinLock(&q->Lock, &irql);
+    }
+}
+
+NTSTATUS
+RkMppJobQueueCreateWorker(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
+{
+    WDF_WORKITEM_CONFIG   cfg;
+    WDF_OBJECT_ATTRIBUTES attr;
+
+    WDF_WORKITEM_CONFIG_INIT(&cfg, RkMppKickWorker);
+    /* We serialize ourselves (KickActive/KickRearm under Queue->Lock), so
+     * disable WDF's automatic presentation-lock serialization.  Leaving
+     * it on (the WDF_WORKITEM_CONFIG_INIT default) would also make
+     * WdfWorkItemCreate fail with STATUS_WDF_INCOMPATIBLE_EXECUTION_LEVEL
+     * unless the parent device were created at passive execution level. */
+    cfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = Device;   /* reaped on device teardown */
+
+    return WdfWorkItemCreate(&cfg, &attr, &Queue->KickWorkItem);
+}
+
+/* -----------------------------------------------------------------------
  * RkMppJobComplete — finalise a job.
  *
  * Called from the software-completion DPC (Phase 2) or the ISR-DPC (Phase 3).
- * Runs at DISPATCH_LEVEL.  Must not allocate paged memory or block.
+ * Runs at DISPATCH_LEVEL.  Bookkeeping only — the next kick is dispatched
+ * by RkMppKickWorker at PASSIVE.  Must not allocate paged memory or block.
  * --------------------------------------------------------------------- */
 
 static VOID
@@ -1402,18 +1496,22 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     /* Signal the waiter before we potentially start the next job. */
     KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
 
-    /* Phase 3 (Task 3.3): release this core's slot + idle bit, then
-     * promote pending jobs to any idle core.  Local completion path:
-     * the completing core is always 0 here.  Peer completions
-     * (Task 3.4) take the symmetric path via RkMppPeerCompletion. */
+    /* Phase 3 (Task 3.3): release this core's slot + idle bit.  Promotion
+     * of pending jobs to any idle core is deferred to RkMppKickWorker at
+     * PASSIVE (see RkMppEnqueueKickWorker below) — completion only does
+     * bookkeeping here.  Local completion path: the completing core is
+     * always 0 here.  Peer completions take the symmetric path via
+     * RkMppPeerCompletion. */
     ULONG completedCore = job->TargetCore;   /* 0 in single-core; set by promote */
     q->InFlightPerCore[completedCore] = NULL;
     q->CoreIdle |= (1u << completedCore);
     if (q->CorePending[completedCore] > 0) q->CorePending[completedCore]--;
 
-    PROMOTION promos[2];
-    RtlZeroMemory(promos, sizeof(promos));
-    ULONG nPromos = PromoteUntilFull(q, promos);
+    /* Wake the deferred-kick worker iff there's something to promote.
+     * Evaluated under the lock so it's consistent with the slot/idle
+     * bookkeeping above and with idleAfter below (complementary on the
+     * Pending-empty test). */
+    BOOLEAN wantKick = !IsListEmpty(&q->Pending);
 
     /* Clock-gate only when ALL cores idle.  Under multi-core, gating
      * while one core is busy would mis-target (we gate based on this
@@ -1438,15 +1536,21 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
         }
     }
 
-    /* Free orphan job out-of-lock (DISPATCH-safe).  Done before promote
-     * dispatch so a back-to-back completion doesn't pile up references.
-     * When freeHere==FALSE despite orphan, a drainer holds a WaiterPin
-     * and will free the job after its KeWaitForSingleObject returns. */
+    /* Free orphan job out-of-lock (DISPATCH-safe).  Done before waking
+     * the kick worker so a back-to-back completion doesn't pile up
+     * references.  When freeHere==FALSE despite orphan, a drainer holds
+     * a WaiterPin and will free the job after its KeWaitForSingleObject
+     * returns. */
     if (freeHere) {
         ExFreePoolWithTag(job, 'JppM');
     }
 
-    KickPromotions(Device, q, promos, nPromos);
+    /* Defer promotion + kick to PASSIVE.  Breaks the
+     * JobKickLocalInner → sync-fail → JobComplete → kick recursion and
+     * lifts the DISPATCH-IRQL constraint off the kick path. */
+    if (wantKick) {
+        RkMppEnqueueKickWorker(q);
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -1528,9 +1632,11 @@ VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
     if (q->CorePending[1] > 0) q->CorePending[1]--;
     InsertTailList(&q->Completed, &job->Link);
 
-    PROMOTION promos[2];
-    RtlZeroMemory(promos, sizeof(promos));
-    ULONG nPromos = PromoteUntilFull(q, promos);
+    /* Defer promotion + kick to RkMppKickWorker at PASSIVE, same as the
+     * local RkMppJobComplete path — keeps promotion single-threaded
+     * (one PromoteUntilFull caller per drain) and off any DISPATCH
+     * assumption.  Evaluate wantKick under the lock. */
+    BOOLEAN wantKick = !IsListEmpty(&q->Pending);
 
     KeReleaseSpinLock(&q->Lock, irql);
 
@@ -1570,7 +1676,9 @@ VOID RkMppPeerCompletion(_In_ PVOID    ConsumerContext,
      * completion ticks; that's fine — leaf clocks are codec-internal
      * (CABAC / HEVC CABAC / core), no peer consumer. */
 
-    KickPromotions(Device, q, promos, nPromos);
+    if (wantKick) {
+        RkMppEnqueueKickWorker(q);
+    }
 }
 
 /* -----------------------------------------------------------------------

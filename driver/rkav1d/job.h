@@ -136,6 +136,23 @@ typedef struct _RKMPP_JOB_QUEUE {
      * Locking: written via InterlockedExchange (outside Queue->Lock);
      * read under Queue->Lock by RkMppJobComplete and RkMppJobSubmit. */
     volatile LONG   Draining;
+
+    /* Deferred next-kick dispatch.  RkMppJobComplete runs on the codec
+     * DPC at DISPATCH_LEVEL; promoting + RkMppJobStart'ing the next job
+     * from there imposed a DISPATCH-IRQL discipline on the kick path and
+     * made JobStart → sync-fail → JobComplete → JobStart recursion
+     * possible.  Instead JobComplete only frees InFlight and wakes this
+     * per-queue workitem; RkMppKickWorker promotes head-of-Pending and
+     * kicks at PASSIVE.  Parented to the WDFDEVICE — WDF reaps it on
+     * device teardown.
+     *
+     * Coalescing: KickActive == a worker run is enqueued or running;
+     * KickRearm == a completion armed us and the worker must promote
+     * again.  Both read+written only under Lock.  See the rkvdec
+     * RkMppKickWorker comment for the full rationale. */
+    WDFWORKITEM     KickWorkItem;
+    BOOLEAN         KickActive;
+    BOOLEAN         KickRearm;
 } RKMPP_JOB_QUEUE, *PRKMPP_JOB_QUEUE;
 
 /* -----------------------------------------------------------------------
@@ -144,6 +161,12 @@ typedef struct _RKMPP_JOB_QUEUE {
 
 /* Initialise the queue; call once during device creation. */
 VOID RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue);
+
+/* Create the deferred-kick WDFWORKITEM.  Call once from EvtDeviceAdd
+ * after RkMppJobQueueInit (the workitem is parented to Device).  Fatal
+ * on failure — deferred completion-side kick dispatch is non-optional. */
+NTSTATUS RkMppJobQueueCreateWorker(_In_ WDFDEVICE Device,
+                                   _Inout_ RKMPP_JOB_QUEUE *Queue);
 
 /* Tear down the queue (stop poller thread, wait for it).  Call from
  * EvtReleaseHardware / EvtDriverContextCleanup. */

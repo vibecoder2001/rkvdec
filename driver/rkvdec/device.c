@@ -258,6 +258,23 @@ RkMppDeviceCreate(_Inout_ PWDFDEVICE_INIT DeviceInit)
         }
     }
 
+    /* Create the deferred-kick workitem.  Completion (DPC, DISPATCH)
+     * only does bookkeeping and wakes this workitem; RkMppKickWorker
+     * runs PromoteUntilFull + the next hardware kick at PASSIVE.  Fatal
+     * on failure — deferred kick dispatch is non-optional, same as the
+     * interrupt above. */
+    {
+        NTSTATUS wiStatus = RkMppJobQueueCreateWorker(device, &devCtx->JobQueue);
+        if (!NT_SUCCESS(wiStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "rkvdec: RkMppJobQueueCreateWorker failed 0x%08x — "
+                       "refusing to load (deferred kick dispatch is "
+                       "non-optional)\n",
+                       (ULONG)wiStatus);
+            return wiStatus;
+        }
+    }
+
     return RkMppQueueInit(device);
 }
 

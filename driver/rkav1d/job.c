@@ -222,6 +222,9 @@ RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
     Queue->Interrupt = NULL;
     RtlZeroMemory(Queue->PrevNonzeroMask, sizeof(Queue->PrevNonzeroMask));
     Queue->Draining = 0;
+    Queue->KickWorkItem = NULL;       /* created in EvtDeviceAdd */
+    Queue->KickActive   = FALSE;
+    Queue->KickRearm    = FALSE;
     /* Vestigial PollerThread/KickEvent/ExitEvent removed in the
      * I14 cleanup — completion is interrupt-driven. */
 }
@@ -882,10 +885,99 @@ RkMppJobStart(_In_ WDFDEVICE Device, _In_ RKMPP_JOB *Job)
 }
 
 /* -----------------------------------------------------------------------
+ * Deferred-kick workitem.
+ *
+ * RkMppEnqueueKickWorker is called at the tail of RkMppJobComplete (the
+ * queue lock is NOT held).  It arms the rearm flag and, if no worker run
+ * is already in flight, enqueues the workitem.  RkMppKickWorker promotes
+ * head-of-Pending → InFlight and kicks at PASSIVE.
+ *
+ * The KickActive / KickRearm pattern coalesces back-to-back completions
+ * onto a single worker run while guaranteeing no promotion is lost — see
+ * the rkvdec RkMppKickWorker comment for the full rationale (this is the
+ * single-core mirror of it).
+ * --------------------------------------------------------------------- */
+static VOID
+RkMppEnqueueKickWorker(_Inout_ RKMPP_JOB_QUEUE *q)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+    q->KickRearm = TRUE;
+    BOOLEAN enqueue = !q->KickActive;
+    if (enqueue) q->KickActive = TRUE;
+    KeReleaseSpinLock(&q->Lock, irql);
+
+    if (enqueue) {
+        WdfWorkItemEnqueue(q->KickWorkItem);
+    }
+}
+
+static VOID
+RkMppKickWorker(_In_ WDFWORKITEM WorkItem)
+{
+    WDFDEVICE        device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
+    PRKMPP_JOB_QUEUE q      = RkMppGetJobQueue(device);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&q->Lock, &irql);
+    for (;;) {
+        if (!q->KickRearm) {
+            q->KickActive = FALSE;
+            KeReleaseSpinLock(&q->Lock, irql);
+            return;
+        }
+        q->KickRearm = FALSE;
+
+        /* Promote head-of-Pending → InFlight under the lock.  Respect
+         * Draining (D0Exit quiesce holds new kicks; D0Entry Resume
+         * restarts the chain).  Single core: at most one InFlight. */
+        RKMPP_JOB *next = NULL;
+        if (q->Draining == 0 && q->InFlight == NULL &&
+            !IsListEmpty(&q->Pending)) {
+            PLIST_ENTRY entry = RemoveHeadList(&q->Pending);
+            next = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
+            q->InFlight = next;
+        }
+
+        KeReleaseSpinLock(&q->Lock, irql);
+
+        /* PASSIVE.  A sync-failure inside RkMppJobStart re-enters
+         * RkMppJobComplete → RkMppEnqueueKickWorker, which sets KickRearm
+         * (KickActive already TRUE → no second enqueue); the loop picks
+         * it up.  No re-entrant kick, no recursion. */
+        if (next) {
+            RkMppJobStart(device, next);
+        }
+
+        KeAcquireSpinLock(&q->Lock, &irql);
+    }
+}
+
+NTSTATUS
+RkMppJobQueueCreateWorker(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue)
+{
+    WDF_WORKITEM_CONFIG   cfg;
+    WDF_OBJECT_ATTRIBUTES attr;
+
+    WDF_WORKITEM_CONFIG_INIT(&cfg, RkMppKickWorker);
+    /* We serialize ourselves (KickActive/KickRearm under Queue->Lock), so
+     * disable WDF's automatic presentation-lock serialization.  Leaving
+     * it on (the WDF_WORKITEM_CONFIG_INIT default) would also make
+     * WdfWorkItemCreate fail with STATUS_WDF_INCOMPATIBLE_EXECUTION_LEVEL
+     * unless the parent device were created at passive execution level. */
+    cfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = Device;   /* reaped on device teardown */
+
+    return WdfWorkItemCreate(&cfg, &attr, &Queue->KickWorkItem);
+}
+
+/* -----------------------------------------------------------------------
  * RkMppJobComplete — finalise a job.
  *
  * Called from the software-completion DPC (Phase 2) or the ISR-DPC (Phase 3).
- * Runs at DISPATCH_LEVEL.  Must not allocate paged memory or block.
+ * Runs at DISPATCH_LEVEL.  Bookkeeping only — the next kick is dispatched
+ * by RkMppKickWorker at PASSIVE.  Must not allocate paged memory or block.
  * --------------------------------------------------------------------- */
 
 static VOID
@@ -969,17 +1061,14 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
     /* Signal the waiter before we potentially start the next job. */
     KeSetEvent(&job->Done, IO_NO_INCREMENT, FALSE);
 
-    /* If another job is pending, promote it now — unless the queue is
-     * being quiesced for D0Exit.  D0Exit Quiesce holds new kicks; the
-     * paired D0Entry Resume restarts the chain by re-promoting head of
-     * Pending.  We still null InFlight above so Resume's
-     * "InFlight == NULL" check sees a clean slate. */
-    RKMPP_JOB *next = NULL;
-    if (q->Draining == 0 && !IsListEmpty(&q->Pending)) {
-        PLIST_ENTRY entry = RemoveHeadList(&q->Pending);
-        next = CONTAINING_RECORD(entry, RKMPP_JOB, Link);
-        q->InFlight = next;
-    }
+    /* Decide whether the next job should be kicked — promotion + kick
+     * are deferred to RkMppKickWorker at PASSIVE (see
+     * RkMppEnqueueKickWorker).  Respect Draining: D0Exit Quiesce holds
+     * new kicks; the paired D0Entry Resume restarts the chain by
+     * re-promoting head of Pending.  We already nulled InFlight above so
+     * both Resume and the worker see a clean slate.  Evaluate wantKick
+     * under the lock for consistency with the InFlight/Pending state. */
+    BOOLEAN wantKick = (q->Draining == 0 && !IsListEmpty(&q->Pending));
 
     KeReleaseSpinLock(&q->Lock, oldIrql);
 
@@ -989,16 +1078,18 @@ RkMppJobComplete(_In_ WDFDEVICE Device,
      * (DPC) which would have blocked the FAST_MUTEX serialization
      * added in rkmpp_ccu. */
 
-    /* Kick the next job outside the spin lock. */
-    if (next) {
-        RkMppJobStart(Device, next);
-    }
-
-    /* Free orphan job after kicking the next one.  freeHere==FALSE
-     * despite orphan means a drainer holds a pin — they free after
+    /* Free orphan job before waking the worker.  freeHere==FALSE despite
+     * orphan means a drainer holds a pin — they free after
      * KeWaitForSingleObject returns. */
     if (freeHere) {
         ExFreePoolWithTag(job, 'JppM');
+    }
+
+    /* Defer promotion + kick to PASSIVE.  Breaks the
+     * RkMppJobStart → sync-fail → JobComplete → kick recursion and lifts
+     * the DISPATCH-IRQL constraint off the kick path. */
+    if (wantKick) {
+        RkMppEnqueueKickWorker(q);
     }
 }
 

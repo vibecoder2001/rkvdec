@@ -211,6 +211,26 @@ typedef struct _RKMPP_JOB_QUEUE {
      * The vestigial polling thread + KickEvent/ExitEvent that
      * preceded Task 3's interrupt path were removed in the I14
      * cleanup. */
+
+    /* Deferred next-kick dispatch.  RkMppJobComplete runs on the codec
+     * DPC at DISPATCH_LEVEL; kicking the next promotion from there (MMIO
+     * + CCU raise/ungate + peer ifc) imposed a DISPATCH-IRQL discipline
+     * on the whole kick path and made JobKickLocalInner → sync-fail →
+     * JobComplete → KickPromotions recursion structurally possible.
+     * Instead JobComplete only does completion bookkeeping and wakes
+     * this per-queue workitem; the worker (RkMppKickWorker) runs all
+     * PromoteUntilFull + KickPromotions at PASSIVE.  Parented to the
+     * WDFDEVICE — WDF reaps it on device teardown.
+     *
+     * Coalescing: KickActive == a worker run is enqueued or running;
+     * KickRearm == a completion arrived and the worker must promote
+     * again.  Both read+written only under Lock.  The worker clears
+     * KickRearm under the lock, drains, and exits (clearing KickActive)
+     * only when it re-acquires the lock and finds KickRearm still
+     * clear — so a completion racing the worker's exit is never lost. */
+    WDFWORKITEM                 KickWorkItem;
+    BOOLEAN                     KickActive;
+    BOOLEAN                     KickRearm;
 } RKMPP_JOB_QUEUE, *PRKMPP_JOB_QUEUE;
 
 /* -----------------------------------------------------------------------
@@ -219,6 +239,12 @@ typedef struct _RKMPP_JOB_QUEUE {
 
 /* Initialise the queue; call once during device creation. */
 VOID RkMppJobQueueInit(_In_ WDFDEVICE Device, _Inout_ RKMPP_JOB_QUEUE *Queue);
+
+/* Create the deferred-kick WDFWORKITEM.  Call once from EvtDeviceAdd
+ * after RkMppJobQueueInit (the workitem is parented to Device).  Fatal
+ * on failure — deferred completion-side kick dispatch is non-optional. */
+NTSTATUS RkMppJobQueueCreateWorker(_In_ WDFDEVICE Device,
+                                   _Inout_ RKMPP_JOB_QUEUE *Queue);
 
 /* Tear down the queue (stop poller thread, wait for it).  Call from
  * EvtReleaseHardware / EvtDriverContextCleanup. */

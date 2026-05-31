@@ -30,6 +30,14 @@
 #include "bufpool.h"
 #include "profile.h"
 
+/* Exported from ntoskrnl.exe but not declared in our WDK's ntifs.h.
+ * Used by RkMppBufFreeOne to safely synchronise the user-VA unmap
+ * against owner-process teardown — see comment there. */
+NTSTATUS NTAPI
+PsAcquireProcessExitSynchronization(_In_ PEPROCESS Process);
+VOID NTAPI
+PsReleaseProcessExitSynchronization(_In_ PEPROCESS Process);
+
 /* -----------------------------------------------------------------------
  * Forward declarations for the device-context accessor defined in device.c
  * --------------------------------------------------------------------- */
@@ -205,18 +213,25 @@ RkMppBufFreeOne(_In_ PRKMPP_BUFFER Buf, _In_ WDFDEVICE Device)
      * VA backed by no valid VAD → BSOD (BAD_POOL_CALLER or
      * PAGE_FAULT_IN_NONPAGED_AREA).  Process-level address-space
      * teardown reclaims the mapping for us, so dropping the
-     * explicit unmap on this path is safe.  PsGetProcessExitStatus
-     * returns STATUS_PENDING while the process is live; anything
-     * else (STATUS_SUCCESS / exit code) means PspExitThread has
-     * begun the teardown.
+     * explicit unmap on this path is safe.
      *
-     * Code-review issue I3.  See [[bufpool_process_exit_race]]. */
+     * Use PsAcquireProcessExitSynchronization rather than a plain
+     * PsGetProcessExitStatus check: the latter is TOCTOU-racy
+     * (process can begin teardown between the check and the
+     * subsequent attach/unmap, opening the BSOD window described
+     * above).  PsAcquireProcessExitSynchronization both checks AND
+     * prevents the process from beginning exit until we release —
+     * the attach/unmap is then guaranteed to run against a live
+     * address space.  Returns STATUS_PROCESS_IS_TERMINATING if exit
+     * is already in progress, in which case we skip the unmap. */
     if (Buf->UserVa && Buf->Mdl && Buf->OwnerProcess) {
-        if (PsGetProcessExitStatus(Buf->OwnerProcess) == STATUS_PENDING) {
+        NTSTATUS acq = PsAcquireProcessExitSynchronization(Buf->OwnerProcess);
+        if (NT_SUCCESS(acq)) {
             KAPC_STATE apcState;
             KeStackAttachProcess(Buf->OwnerProcess, &apcState);
             MmUnmapLockedPages(Buf->UserVa, Buf->Mdl);
             KeUnstackDetachProcess(&apcState);
+            PsReleaseProcessExitSynchronization(Buf->OwnerProcess);
         }
         /* else: process teardown already in progress; address-space
          * reclaim handles the VA mapping. */

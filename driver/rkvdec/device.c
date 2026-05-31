@@ -1154,9 +1154,23 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
                            "concurrent File active — PD-cycle will disrupt it\n",
                            devCtx->Uid);
             }
-            if (iommu && iommu->MaskIrq) {
-                iommu->MaskIrq(iommu->Header.Context);
-            }
+            /* iommu->MaskIrq disabled — calling rkiommu_vdec's
+             * WdfInterruptDisable from rkvdec's FileCleanup is a
+             * cross-device interrupt disconnect that races KMDF's own
+             * teardown of that interrupt (and concurrent FileCleanups on
+             * simultaneous stop): IoDisconnectInterrupt → KeRemoveQueueDpc
+             * runs on an already-removed DPC → ACCESS_VIOLATION →
+             * bugcheck 0x3B.  Confirmed by the simultaneous-stop crash
+             * (FileCleanup → RkIommuMaskIrq → WdfInterruptDisable →
+             * KeRemoveQueueDpc).  Same hazard already removed from the
+             * JobKickLocalInner reset path and from ReleaseHardware
+             * (commit 9a71579); see `wdf_interrupt_disable_cross_device`.
+             * The Disable below drops IOMMU paging (AHB_CONTROL=0) before
+             * the reset, so the codec generates no faults during the
+             * window — the mask was only belt-and-suspenders.
+             *
+             * if (iommu && iommu->MaskIrq) iommu->MaskIrq(iommu->Header.Context);
+             */
             if (iommu && iommu->Disable) {
                 (void)iommu->Disable(iommu->Header.Context);
             }
@@ -1175,9 +1189,10 @@ RkMppEvtFileCleanup(_In_ WDFFILEOBJECT FileObject)
                                "next session will lazy-Enable on first MapMdl\n", rs);
                 }
             }
-            if (iommu && iommu->UnmaskIrq) {
-                iommu->UnmaskIrq(iommu->Header.Context);
-            }
+            /* iommu->UnmaskIrq disabled — paired with the MaskIrq removal
+             * above.  KMDF re-arms rkiommu_vdec's ISR on its own D0 path;
+             * rkvdec must not WdfInterruptEnable it cross-device. */
+            /* if (iommu && iommu->UnmaskIrq) iommu->UnmaskIrq(iommu->Header.Context); */
 
             /* Power-cycle subsumes both narrow CoreReset and wide
              * FullReset that JobStart would otherwise apply to the

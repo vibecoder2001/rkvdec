@@ -978,6 +978,21 @@ NTSTATUS RkMppCcuFullAv1Reset(_In_ PVOID Ctx)
     UNREFERENCED_PARAMETER(Ctx);
     if (!g_cru_mmio) return STATUS_DEVICE_NOT_READY;
 
+    /* Serialise with RaiseAv1Cluster / DropAv1Cluster (and indirectly
+     * with FullCoreReset0/1 — they share g_ccu_mutex but target
+     * different CRU bundles).  Without the mutex a concurrent
+     * RaiseAv1Cluster from another PrepareHardware path could land
+     * its CLKGATE_CON68 ungate between this path's SOFTRST_CON68
+     * assert/deassert and the PMU idle release, leaving AV1 in an
+     * intermediate state.  Both call sites (rkav1d device.c
+     * PrepareHardware-equiv + FileCleanup) are PASSIVE_LEVEL, so
+     * FAST_MUTEX is IRQL-safe here — distinct from the leaf-clock
+     * mutex experiment which was reverted because rkvdec's
+     * JobComplete DPC reached the leaf-clock entrypoints at
+     * DISPATCH (see memory/ccu_leaf_clocks_must_be_lockfree.md).
+     * FullAv1Reset has no DPC path. */
+    ExAcquireFastMutex(&g_ccu_mutex);
+
     RKMPP_LOG_WARN(
                "rkmpp_ccu: FullAv1Reset — wide CRU reset for AV1\n");
 
@@ -1007,5 +1022,6 @@ NTSTATUS RkMppCcuFullAv1Reset(_In_ PVOID Ctx)
                    sIdleOff);
     }
 
+    ExReleaseFastMutex(&g_ccu_mutex);
     return STATUS_SUCCESS;
 }

@@ -1636,6 +1636,20 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
     UINT64 reg162Handle = 0;
     UINT64 reg172Handle = 0;
 
+    /* Hold the file ctx's spinlock across the entire iova-resolve +
+     * Pending-insert window so a concurrent FREE_BUFFER on the same
+     * cookie can't free a buffer between lookup-returns-iova and
+     * InsertTailList-makes-the-job-visible-to-JobBufferInUse.  Lock
+     * order: file lock outer, queue lock inner (matches FREE_BUFFER's
+     * acquisition order — see driver/rkvdec/ioctl.c FREE_BUFFER path
+     * + the JobBufferInUse comment).  Closes the submit-side of the
+     * submit-vs-free TOCTOU deferred at commit c20c11b. */
+    PRKMPP_FILE_CTX submitCtx = RkMppFileGet(File);
+    KIRQL fctxIrql;
+    KeAcquireSpinLock(&submitCtx->Lock, &fctxIrql);
+
+    NTSTATUS resolveStatus = STATUS_SUCCESS;
+
     job->DenseIovaSlotCount = In->IovaSlotCount;
     for (UINT32 i = 0; i < In->IovaSlotCount; i++) {
         const RKMPP_DENSE_IOVA_SLOT *src = &In->IovaSlots[i];
@@ -1643,29 +1657,29 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
         *dst = *src;
 
         if (!RkMppDenseIsAddressReg(src->RegIdx)) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_PARAMETER;
+            resolveStatus = STATUS_INVALID_PARAMETER;
+            break;
         }
         if (src->BufferHandle == 0) {
             /* Caller filtered zero handles in user-mode (emit_iova) but
              * keep the check tight: an iova slot with handle == 0 is
              * indistinguishable from "no write" and would leave the
              * bank slot unsubstituted.  Reject. */
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_PARAMETER;
+            resolveStatus = STATUS_INVALID_PARAMETER;
+            break;
         }
 
         UINT64 iova    = 0;
         ULONG  bufSize = 0;
-        NTSTATUS s = RkMppBufLookupIova(File, src->BufferHandle,
-                                        &iova, &bufSize);
+        NTSTATUS s = RkMppBufLookupIovaLocked(File, src->BufferHandle,
+                                               &iova, &bufSize);
         if (!NT_SUCCESS(s)) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_HANDLE;
+            resolveStatus = STATUS_INVALID_HANDLE;
+            break;
         }
         if (src->IovaOffset >= bufSize) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_PARAMETER;
+            resolveStatus = STATUS_INVALID_PARAMETER;
+            break;
         }
 
         /* Stamp (iova + offset)[31:0] into the dense bank at RegIdx. */
@@ -1680,14 +1694,14 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
                                               - RKMPP_DENSE_CODADDR_FIRST];
         }
         if (!slot) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_PARAMETER;
+            resolveStatus = STATUS_INVALID_PARAMETER;
+            break;
         }
         *slot = (UINT32)(iova + src->IovaOffset);
 
         /* Cache-maintenance classification.  Byte offset = RegIdx * 4. */
         PMDL mdl = NULL;
-        if (!NT_SUCCESS(RkMppBufLookupMdl(File, src->BufferHandle, &mdl)) ||
+        if (!NT_SUCCESS(RkMppBufLookupMdlLocked(File, src->BufferHandle, &mdl)) ||
             mdl == NULL) {
             continue;
         }
@@ -1749,6 +1763,14 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
     }
 
 
+    /* Resolve loop hit an error — release file lock and bail.  Job
+     * was never enqueued, no buffer refs to release. */
+    if (!NT_SUCCESS(resolveStatus)) {
+        KeReleaseSpinLock(&submitCtx->Lock, fctxIrql);
+        ExFreePoolWithTag(job, 'JppM');
+        return resolveStatus;
+    }
+
     /* VP9 reg162 disambiguation: clean only when it points at a
      * different buffer than reg172.  Equal handles ⇒ prob_loop[fcx]
      * (HW writeback target, leave cache alone — clean would push
@@ -1757,7 +1779,7 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
      * the memcpy'd defaults instead of whatever cache last held). */
     if (reg162Handle != 0 && reg162Handle != reg172Handle) {
         PMDL reg162Mdl = NULL;
-        if (NT_SUCCESS(RkMppBufLookupMdl(File, reg162Handle, &reg162Mdl)) &&
+        if (NT_SUCCESS(RkMppBufLookupMdlLocked(File, reg162Handle, &reg162Mdl)) &&
             reg162Mdl != NULL) {
             BOOLEAN already = FALSE;
             for (UINT32 k = 0; k < job->CleanMdlCount; k++) {
@@ -1791,6 +1813,8 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
         RKMPP_MAX_PENDING_JOBS          = 8,
         RKMPP_MAX_PENDING_JOBS_PER_FILE = 4,
     };
+    /* Nested lock: file lock outer (we already hold), queue lock inner.
+     * Same order as FREE_BUFFER → JobBufferInUse, so no deadlock. */
     KIRQL oldIrql;
     KeAcquireSpinLock(&q->Lock, &oldIrql);
 
@@ -1811,6 +1835,7 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
     if (pendingCount >= RKMPP_MAX_PENDING_JOBS ||
         ownerCount   >= RKMPP_MAX_PENDING_JOBS_PER_FILE) {
         KeReleaseSpinLock(&q->Lock, oldIrql);
+        KeReleaseSpinLock(&submitCtx->Lock, fctxIrql);
         ExFreePoolWithTag(job, 'JppM');
         return STATUS_DEVICE_BUSY;
     }
@@ -1826,6 +1851,12 @@ RkMppJobSubmitDense(_In_ WDFDEVICE Device,
     RtlZeroMemory(promos, sizeof(promos));
     ULONG nPromos = PromoteUntilFull(q, promos);
     KeReleaseSpinLock(&q->Lock, oldIrql);
+    /* Job is now on Pending and visible to JobBufferInUse — any
+     * concurrent FREE_BUFFER that races us from here on will see
+     * this job and refuse, so the buffer iovas we stamped above
+     * stay live until the job is freed.  Release the file lock
+     * (outer of the nested pair). */
+    KeReleaseSpinLock(&submitCtx->Lock, fctxIrql);
 
     KickPromotions(Device, q, promos, nPromos);
 

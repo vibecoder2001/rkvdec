@@ -1048,6 +1048,18 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     KeInitializeEvent(&job->Done, NotificationEvent, FALSE);
     job->Owner = File;
 
+    /* Hold the file ctx's spinlock across the entire resolve +
+     * Pending-insert window so a concurrent FREE_BUFFER on the same
+     * cookie can't free a buffer between lookup-returns-iova and the
+     * job becoming visible to JobBufferInUse.  Lock order: file lock
+     * outer, queue lock inner (matches FREE_BUFFER → JobBufferInUse).
+     * Closes the submit-side of the submit-vs-free TOCTOU. */
+    PRKMPP_FILE_CTX submitCtx = RkMppFileGet(File);
+    KIRQL fctxIrql;
+    KeAcquireSpinLock(&submitCtx->Lock, &fctxIrql);
+
+    NTSTATUS resolveStatus = STATUS_SUCCESS;
+
     /* Copy the register-write list, performing iova-handle substitution
      * for any entry with BufferHandle != 0.  Iova is 64-bit but the
      * register field is 32-bit; rkiommu's address space is 32 bits so
@@ -1068,8 +1080,8 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
          * granularity).  Both are security-relevant — a misaligned
          * offset bypasses RkAv1dIsAddressReg below. */
         if ((src->Offset & 3u) != 0 || src->Offset >= 512u * 4u) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_PARAMETER;
+            resolveStatus = STATUS_INVALID_PARAMETER;
+            break;
         }
         const UINT32 swregIdx = src->Offset / 4u;
         const BOOLEAN isLsb = RkAv1dIsAddressLsbReg(swregIdx);
@@ -1091,12 +1103,12 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
              * 32 bits of a DMA target and is undefined behaviour
              * today (no consumer expects high-half addressing). */
             if (isLsb) {
-                ExFreePoolWithTag(job, 'JppM');
-                return STATUS_INVALID_PARAMETER;
+                resolveStatus = STATUS_INVALID_PARAMETER;
+                break;
             }
             if (isMsb && src->Value != 0) {
-                ExFreePoolWithTag(job, 'JppM');
-                return STATUS_INVALID_PARAMETER;
+                resolveStatus = STATUS_INVALID_PARAMETER;
+                break;
             }
             dst->Value = src->Value;
             continue;
@@ -1109,21 +1121,21 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
          * to a 32-bit iova in the MSB slot, producing undefined
          * behaviour or a stray DMA. */
         if (!isLsb) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_PARAMETER;
+            resolveStatus = STATUS_INVALID_PARAMETER;
+            break;
         }
 
         UINT64 iova = 0;
         ULONG  bufSize = 0;
-        NTSTATUS s = RkMppBufLookupIova(File, src->BufferHandle,
-                                        &iova, &bufSize);
+        NTSTATUS s = RkMppBufLookupIovaLocked(File, src->BufferHandle,
+                                               &iova, &bufSize);
         if (!NT_SUCCESS(s)) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_HANDLE;
+            resolveStatus = STATUS_INVALID_HANDLE;
+            break;
         }
         if (src->IovaOffset >= bufSize) {
-            ExFreePoolWithTag(job, 'JppM');
-            return STATUS_INVALID_PARAMETER;
+            resolveStatus = STATUS_INVALID_PARAMETER;
+            break;
         }
         dst->Value = (UINT32)(iova + src->IovaOffset);
 
@@ -1138,7 +1150,7 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
          *   (MmCached user mapping) and never reach DRAM before kick;
          *   codec reads zeros for tile_info / OBU / CDFs → timeouts. */
         PMDL mdl = NULL;
-        if (!NT_SUCCESS(RkMppBufLookupMdl(File, src->BufferHandle, &mdl)) ||
+        if (!NT_SUCCESS(RkMppBufLookupMdlLocked(File, src->BufferHandle, &mdl)) ||
             mdl == NULL) {
             continue;
         }
@@ -1171,6 +1183,15 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
             }
         }
     }
+
+    /* Resolve loop hit an error — release file lock and bail.  Job
+     * was never enqueued. */
+    if (!NT_SUCCESS(resolveStatus)) {
+        KeReleaseSpinLock(&submitCtx->Lock, fctxIrql);
+        ExFreePoolWithTag(job, 'JppM');
+        return resolveStatus;
+    }
+
     job->BufRefCount = In->BufRefCount;
     if (In->BufRefCount > 0) {
         RtlCopyMemory(job->BufRefs, In->BufRefs,
@@ -1228,6 +1249,7 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     if (pendingCount >= RKMPP_MAX_PENDING_JOBS ||
         ownerCount   >= RKMPP_MAX_PENDING_JOBS_PER_FILE) {
         KeReleaseSpinLock(&q->Lock, oldIrql);
+        KeReleaseSpinLock(&submitCtx->Lock, fctxIrql);
         /* No per-job CCU raise to undo (removed — see comment above). */
         ExFreePoolWithTag(job, 'JppM');
         return STATUS_DEVICE_BUSY;
@@ -1242,6 +1264,11 @@ RkMppJobSubmit(_In_ WDFDEVICE Device,
     }
 
     KeReleaseSpinLock(&q->Lock, oldIrql);
+    /* Job is now on Pending (or InFlight) and visible to
+     * JobBufferInUse — any concurrent FREE_BUFFER from here on sees
+     * this job and refuses, so the buffer iovas stamped above stay
+     * live until the job is freed.  Release file lock (outer). */
+    KeReleaseSpinLock(&submitCtx->Lock, fctxIrql);
 
     if (startNow) {
         RkMppJobStart(Device, job);

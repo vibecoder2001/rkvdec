@@ -272,6 +272,30 @@ RkMppBufFreeOne(_In_ PRKMPP_BUFFER Buf, _In_ WDFDEVICE Device)
  * RkMppBufLookupIova — return iova + size for a buffer cookie.  Walks the
  * file's allocation list under the spinlock; safe at <= DISPATCH_LEVEL.
  * --------------------------------------------------------------------- */
+/* _Locked variant: assumes caller holds ctx->Lock.  Used by SubmitDense
+ * to batch the lookup with subsequent InsertTailList under a single lock
+ * acquire so a concurrent FREE_BUFFER can't free a looked-up buffer
+ * before the job becomes JobBufferInUse-visible. */
+NTSTATUS
+RkMppBufLookupIovaLocked(_In_ WDFFILEOBJECT File,
+                          _In_ UINT64        Cookie,
+                          _Out_ UINT64      *OutIova,
+                          _Out_ ULONG       *OutSize)
+{
+    PRKMPP_FILE_CTX ctx = RkMppFileGet(File);
+    for (PLIST_ENTRY entry = ctx->Buffers.Flink;
+         entry != &ctx->Buffers;
+         entry = entry->Flink) {
+        PRKMPP_BUFFER buf = CONTAINING_RECORD(entry, RKMPP_BUFFER, Link);
+        if (buf->Cookie == Cookie) {
+            *OutIova = buf->Iova;
+            *OutSize = buf->Size;
+            return STATUS_SUCCESS;
+        }
+    }
+    return STATUS_NOT_FOUND;
+}
+
 NTSTATUS
 RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
                    _In_ UINT64        Cookie,
@@ -280,20 +304,8 @@ RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
 {
     PRKMPP_FILE_CTX ctx = RkMppFileGet(File);
     KIRQL oldIrql;
-    NTSTATUS status = STATUS_NOT_FOUND;
-
     KeAcquireSpinLock(&ctx->Lock, &oldIrql);
-    for (PLIST_ENTRY entry = ctx->Buffers.Flink;
-         entry != &ctx->Buffers;
-         entry = entry->Flink) {
-        PRKMPP_BUFFER buf = CONTAINING_RECORD(entry, RKMPP_BUFFER, Link);
-        if (buf->Cookie == Cookie) {
-            *OutIova = buf->Iova;
-            *OutSize = buf->Size;
-            status   = STATUS_SUCCESS;
-            break;
-        }
-    }
+    NTSTATUS status = RkMppBufLookupIovaLocked(File, Cookie, OutIova, OutSize);
     KeReleaseSpinLock(&ctx->Lock, oldIrql);
     return status;
 }
@@ -302,6 +314,26 @@ RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
  * RkMppBufLookupMdl — return the MDL for a buffer cookie.  Walks the
  * file's allocation list under the spinlock; safe at <= DISPATCH_LEVEL.
  * --------------------------------------------------------------------- */
+/* _Locked variant — see RkMppBufLookupIovaLocked. */
+NTSTATUS
+RkMppBufLookupMdlLocked(_In_  WDFFILEOBJECT File,
+                         _In_  UINT64        Cookie,
+                         _Out_ PMDL         *OutMdl)
+{
+    PRKMPP_FILE_CTX ctx = RkMppFileGet(File);
+    *OutMdl = NULL;
+    for (PLIST_ENTRY entry = ctx->Buffers.Flink;
+         entry != &ctx->Buffers;
+         entry = entry->Flink) {
+        PRKMPP_BUFFER buf = CONTAINING_RECORD(entry, RKMPP_BUFFER, Link);
+        if (buf->Cookie == Cookie) {
+            *OutMdl = buf->Mdl;
+            return STATUS_SUCCESS;
+        }
+    }
+    return STATUS_NOT_FOUND;
+}
+
 NTSTATUS
 RkMppBufLookupMdl(_In_  WDFFILEOBJECT File,
                   _In_  UINT64        Cookie,
@@ -309,20 +341,8 @@ RkMppBufLookupMdl(_In_  WDFFILEOBJECT File,
 {
     PRKMPP_FILE_CTX ctx = RkMppFileGet(File);
     KIRQL oldIrql;
-    NTSTATUS status = STATUS_NOT_FOUND;
-
-    *OutMdl = NULL;
     KeAcquireSpinLock(&ctx->Lock, &oldIrql);
-    for (PLIST_ENTRY entry = ctx->Buffers.Flink;
-         entry != &ctx->Buffers;
-         entry = entry->Flink) {
-        PRKMPP_BUFFER buf = CONTAINING_RECORD(entry, RKMPP_BUFFER, Link);
-        if (buf->Cookie == Cookie) {
-            *OutMdl = buf->Mdl;
-            status  = STATUS_SUCCESS;
-            break;
-        }
-    }
+    NTSTATUS status = RkMppBufLookupMdlLocked(File, Cookie, OutMdl);
     KeReleaseSpinLock(&ctx->Lock, oldIrql);
     return status;
 }

@@ -73,16 +73,33 @@ VOID RkMppBufFreeAll(_In_ WDFFILEOBJECT File);
 
 /* Look up a buffer by cookie within the file's allocation list and return
  * its iova + size.  STATUS_NOT_FOUND if the cookie is unknown.  Used by
- * RkMppJobSubmit for register-list iova substitution. */
+ * RkMppJobSubmit for register-list iova substitution.
+ *
+ * `Locked` variant: assumes the caller already holds the file ctx's
+ * spinlock (RKMPP_FILE_CTX::Lock).  Use when batching lookups together
+ * with a subsequent list mutation (e.g. SubmitDense holds the file
+ * lock across resolve+enqueue so a concurrent FREE_BUFFER can't free
+ * a buffer between lookup-returns-iova and InsertTailList-makes-job-
+ * findable-by-JobBufferInUse).  Closes the submit-vs-free TOCTOU
+ * that was deferred at commit c20c11b. */
 NTSTATUS RkMppBufLookupIova(_In_ WDFFILEOBJECT File,
                             _In_ UINT64 Cookie,
                             _Out_ UINT64 *OutIova,
                             _Out_ ULONG  *OutSize);
+NTSTATUS RkMppBufLookupIovaLocked(_In_ WDFFILEOBJECT File,
+                                   _In_ UINT64 Cookie,
+                                   _Out_ UINT64 *OutIova,
+                                   _Out_ ULONG  *OutSize);
 
 /* Look up a buffer's MDL by cookie.  Used by RkMppJobSubmit to capture
  * MDLs into the job for later cache-maintenance (KeFlushIoBuffers) at
  * kick + completion time when buffers are mapped cached.
- * STATUS_NOT_FOUND if the cookie is unknown. */
+ * STATUS_NOT_FOUND if the cookie is unknown.
+ *
+ * `Locked` variant: same semantics as RkMppBufLookupIovaLocked above. */
 NTSTATUS RkMppBufLookupMdl(_In_  WDFFILEOBJECT File,
                            _In_  UINT64 Cookie,
                            _Out_ PMDL *OutMdl);
+NTSTATUS RkMppBufLookupMdlLocked(_In_  WDFFILEOBJECT File,
+                                  _In_  UINT64 Cookie,
+                                  _Out_ PMDL *OutMdl);
